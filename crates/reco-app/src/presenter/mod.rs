@@ -178,6 +178,23 @@ pub enum PresenterError {
         reason: String,
     },
 
+    /// The Rust-owned Tauri preview window (separate-window presenter) could not
+    /// be created or converted into a `wgpu::Surface`.
+    ///
+    /// Distinct from [`PresenterError::ChildView`] (an X11 child view) and
+    /// [`PresenterError::Surface`] (a `wgpu::Surface` failure): this is the
+    /// window-creation failure path for PREV-05's separate-window presenter, so
+    /// the chain driver can fall through to readback with a typed reason.
+    // Constructed by the separate-window presenter (Task 2 of plan 02-03); it is
+    // declared here with the other presenter errors so the fall-through set is
+    // complete and the chain driver can match on it.
+    #[allow(dead_code)]
+    #[error("preview window creation failed: {reason}")]
+    Window {
+        /// Human-readable reason, safe to log and display.
+        reason: String,
+    },
+
     /// Building the `wgpu::Surface` from the child handle failed.
     #[error("surface creation failed: {reason}")]
     Surface {
@@ -316,19 +333,22 @@ impl ViewportRect {
 /// `Send`; the worker boxes them as `Box<dyn SurfacePresenter + Send>` and
 /// [`x11::X11Presenter`] carries a compile-time `Send` assertion.
 pub trait SurfacePresenter {
-    /// The presenter's surface, for device creation.
+    /// The presenter's surface, for device creation, or `None` when this
+    /// presenter is **headless** (PREV-05's readback presenter paints no
+    /// surface).
     ///
-    /// The worker calls this **once** to create the shared device through the
-    /// engine's surface-compatible GPU-context constructor; the surface never
-    /// leaves the Rust process and is never exposed across IPC (D-02/D-03).
-    /// Implementors return their own surface; the presenter keeps ownership.
+    /// The worker calls this **once** to create the shared device: `Some(surface)`
+    /// routes through the engine's surface-compatible GPU-context constructor
+    /// (`GpuContext::for_surface`); `None` routes through the headless
+    /// constructor (`GpuContext::with_surface(None)`), which still retains the
+    /// adapter so `configure`/`rebind_instance` keep working.
     ///
-    /// # Errors
+    /// The surface never leaves the Rust process and is never exposed across IPC
+    /// (D-02/D-03). Implementors keep ownership.
     ///
-    /// Returns [`PresenterError::Unsupported`] on a target with no surface
-    /// (the D-05 fallback), so the caller reports the recorded posture rather
-    /// than panicking.
-    fn surface(&self) -> Result<&reco_core::wgpu::Surface<'static>, PresenterError>;
+    /// A presenter that *can* host a surface returns `Some`; only the readback
+    /// presenter returns `None`.
+    fn surface(&self) -> Option<&reco_core::wgpu::Surface<'static>>;
 
     /// Rebuild this presenter's surface on a *fresh* `wgpu::Instance`.
     ///
@@ -370,19 +390,23 @@ pub trait SurfacePresenter {
         device: &reco_core::wgpu::Device,
         queue: &reco_core::wgpu::Queue,
         adapter: &reco_core::wgpu::Adapter,
-        width: u32,
-        height: u32,
+        rect: ViewportRect,
     ) -> Result<(), PresenterError>;
 
     /// Render one stitched frame into this presenter's surface.
     ///
-    /// `left` / `right` are the decoded YUV420P planes and `yaw` / `pitch`
+    /// `left` / `right` are the decoded YUV420P planes; `yaw` / `pitch` / `fov_degrees`
     /// position the panorama. Implementations acquire the next surface texture,
     /// render through the shared [`StitchRenderer`], and present it.
     ///
+    /// `renderer` is taken by `&mut` so the readback path can call
+    /// [`StitchRenderer::render_and_readback_rgba`] (which requires `&mut self`)
+    /// and so FOV can be plumbed uniformly across every impl (PREV-04/PREV-05).
+    ///
     /// The return value follows the FOUND-05 contract:
     ///
-    /// * [`FrameOutcome::Presented`] — a frame reached the swapchain.
+    /// * [`FrameOutcome::Presented`] — a frame reached the swapchain (or, for the
+    ///   readback presenter, a frame was produced for display).
     /// * [`FrameOutcome::Skipped`] — a transient surface error (`Timeout` /
     ///   `OutOfMemory` / `Other`) dropped this frame; retry next tick.
     /// * `Err(`[`PresenterError::SurfaceLost`]`)` — the surface needs a
@@ -396,11 +420,12 @@ pub trait SurfacePresenter {
     /// surface error, or [`PresenterError::Surface`] on a render failure.
     fn render_frame(
         &mut self,
-        renderer: &StitchRenderer,
+        renderer: &mut StitchRenderer,
         left: &YuvData,
         right: &YuvData,
         yaw: f32,
         pitch: f32,
+        fov_degrees: f32,
     ) -> Result<FrameOutcome, PresenterError>;
 
     /// Paint an idle/clear frame into the reserved region (UI-SPEC E3).
@@ -416,7 +441,7 @@ pub trait SurfacePresenter {
     /// configured, or [`PresenterError::Surface`] on a render failure.
     fn render_idle(&mut self) -> Result<(), PresenterError>;
 
-    /// Resize the presenter's surface to `width` × `height`.
+    /// Resize the presenter's surface to the geometry of `rect`.
     ///
     /// # Errors
     ///
@@ -427,7 +452,7 @@ pub trait SurfacePresenter {
     // `run_skeleton` path never resizes; every impl provides it, and the
     // fallback impl's version is covered by this module's tests.
     #[cfg_attr(not(test), allow(dead_code))]
-    fn resize(&mut self, width: u32, height: u32) -> Result<(), PresenterError>;
+    fn resize(&mut self, rect: ViewportRect) -> Result<(), PresenterError>;
 
     /// The current viewport geometry.
     // Part of the presenter contract (D-02); see [`Self::resize`].

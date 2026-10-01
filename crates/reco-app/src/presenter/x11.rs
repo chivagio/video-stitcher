@@ -341,8 +341,8 @@ impl X11Presenter {
 }
 
 impl SurfacePresenter for X11Presenter {
-    fn surface(&self) -> Result<&reco_core::wgpu::Surface<'static>, PresenterError> {
-        Ok(&self.surface)
+    fn surface(&self) -> Option<&reco_core::wgpu::Surface<'static>> {
+        Some(&self.surface)
     }
 
     fn rebind_instance(
@@ -388,8 +388,7 @@ impl SurfacePresenter for X11Presenter {
         device: &reco_core::wgpu::Device,
         queue: &reco_core::wgpu::Queue,
         adapter: &reco_core::wgpu::Adapter,
-        width: u32,
-        height: u32,
+        rect: ViewportRect,
     ) -> Result<(), PresenterError> {
         let caps = self.surface.get_capabilities(adapter);
         let surface_format =
@@ -421,8 +420,8 @@ impl SurfacePresenter for X11Presenter {
             &reco_core::wgpu::SurfaceConfiguration {
                 usage: reco_core::wgpu::TextureUsages::RENDER_ATTACHMENT,
                 format: surface_format,
-                width: width.max(1),
-                height: height.max(1),
+                width: rect.width.max(1),
+                height: rect.height.max(1),
                 present_mode: reco_core::wgpu::PresentMode::Fifo,
                 desired_maximum_frame_latency: 2,
                 alpha_mode,
@@ -437,22 +436,18 @@ impl SurfacePresenter for X11Presenter {
         // so a FOUND-05 device rebuild updates them atomically with the surface.
         self.device = Some(device.clone());
         self.queue = Some(queue.clone());
-        self.viewport = ViewportRect {
-            x: 0,
-            y: 0,
-            width,
-            height,
-        };
+        self.viewport = rect;
         Ok(())
     }
 
     fn render_frame(
         &mut self,
-        renderer: &StitchRenderer,
+        renderer: &mut StitchRenderer,
         left: &YuvData,
         right: &YuvData,
         yaw: f32,
         pitch: f32,
+        fov_degrees: f32,
     ) -> Result<FrameOutcome, PresenterError> {
         let surface_format = self.surface_format.ok_or(PresenterError::NotConfigured)?;
         // Acquire the frame. On a transient error we classify and skip; on
@@ -487,6 +482,10 @@ impl SurfacePresenter for X11Presenter {
                 ..Default::default()
             });
 
+        // FOV is plumbed into the pipeline (which clamps 1..179 internally)
+        // immediately before the draw, uniformly across every presenter impl
+        // (PREV-04/PREV-05).
+        renderer.pipeline_mut().set_fov(fov_degrees);
         let left_planes = left.as_planes();
         let right_planes = right.as_planes();
         renderer
@@ -563,7 +562,7 @@ impl SurfacePresenter for X11Presenter {
         Ok(())
     }
 
-    fn resize(&mut self, width: u32, height: u32) -> Result<(), PresenterError> {
+    fn resize(&mut self, rect: ViewportRect) -> Result<(), PresenterError> {
         // After `release_child_window` there is no window to resize; that is a
         // teardown-time no-op, not an error.
         let Some(child) = self.child_window else {
@@ -573,15 +572,15 @@ impl SurfacePresenter for X11Presenter {
         // (the window is released only in `release_child_window`/`Drop`);
         // XResizeWindow is safe to call with them.
         unsafe {
-            (self.xlib.XResizeWindow)(self.display, child.get(), width.max(1), height.max(1));
+            (self.xlib.XResizeWindow)(
+                self.display,
+                child.get(),
+                rect.width.max(1),
+                rect.height.max(1),
+            );
             (self.xlib.XFlush)(self.display);
         }
-        self.viewport = ViewportRect {
-            x: 0,
-            y: 0,
-            width,
-            height,
-        };
+        self.viewport = rect;
         Ok(())
     }
 

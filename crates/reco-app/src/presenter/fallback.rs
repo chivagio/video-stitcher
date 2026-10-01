@@ -78,8 +78,8 @@ impl FallbackPresenter {
 }
 
 impl SurfacePresenter for FallbackPresenter {
-    fn surface(&self) -> Result<&reco_core::wgpu::Surface<'static>, PresenterError> {
-        Err(self.unsupported())
+    fn surface(&self) -> Option<&reco_core::wgpu::Surface<'static>> {
+        None
     }
 
     fn rebind_instance(
@@ -94,19 +94,19 @@ impl SurfacePresenter for FallbackPresenter {
         _device: &reco_core::wgpu::Device,
         _queue: &reco_core::wgpu::Queue,
         _adapter: &reco_core::wgpu::Adapter,
-        _width: u32,
-        _height: u32,
+        _rect: ViewportRect,
     ) -> Result<(), PresenterError> {
         Err(self.unsupported())
     }
 
     fn render_frame(
         &mut self,
-        _renderer: &StitchRenderer,
+        _renderer: &mut StitchRenderer,
         _left: &YuvData,
         _right: &YuvData,
         _yaw: f32,
         _pitch: f32,
+        _fov_degrees: f32,
     ) -> Result<super::FrameOutcome, PresenterError> {
         Err(self.unsupported())
     }
@@ -115,13 +115,8 @@ impl SurfacePresenter for FallbackPresenter {
         Err(self.unsupported())
     }
 
-    fn resize(&mut self, width: u32, height: u32) -> Result<(), PresenterError> {
-        self.viewport = ViewportRect {
-            x: 0,
-            y: 0,
-            width,
-            height,
-        };
+    fn resize(&mut self, rect: ViewportRect) -> Result<(), PresenterError> {
+        self.viewport = rect;
         Ok(())
     }
 
@@ -141,7 +136,16 @@ mod tests {
             ViewportRect::for_chrome(1280, 800, &crate::presenter::ChromeState::default()),
         );
         // `resize` is allowed to succeed (it is layout only) ...
-        assert!(presenter.resize(1024, 768).is_ok());
+        assert!(
+            presenter
+                .resize(ViewportRect {
+                    x: 0,
+                    y: 0,
+                    width: 1024,
+                    height: 768
+                })
+                .is_ok()
+        );
         assert_eq!(presenter.viewport().width, 1024);
         // ... but every rendering operation reports a typed `Unsupported`.
         assert!(presenter.render_idle().is_err());

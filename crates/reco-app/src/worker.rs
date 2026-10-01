@@ -626,15 +626,27 @@ impl GpuEngineBackend {
         mut presenter: Box<dyn crate::presenter::SurfacePresenter + Send>,
         viewport: crate::presenter::ViewportRect,
     ) -> Result<Self, WorkerError> {
-        // Adapter-retaining `for_surface` path: the presenter needs the adapter
-        // for `get_capabilities`, and the worker needs the device. Never a
-        // second device (D-03).
-        let surface = presenter
-            .surface()
-            .map_err(|e| WorkerError::Engine(e.to_string()))?;
-        let (gpu, surface_info) =
-            pollster::block_on(reco_core::gpu::GpuContext::for_surface(&instance, surface))
-                .map_err(|e| WorkerError::Engine(e.to_string()))?;
+        // Branch on whether the presenter hosts a surface (PREV-05):
+        //   Some(surface) → the surface-compatible `for_surface` constructor,
+        //                   and the surface's negotiated format is the render format.
+        //   None          → the headless `with_surface(None)` constructor, which
+        //                   still retains the adapter so `configure`/`rebind_instance`
+        //                   keep working; the readback presenter renders to an
+        //                   internal target and the shared device is format-agnostic.
+        // Never a second device (D-03).
+        let (gpu, surface_format) = match presenter.surface() {
+            Some(surface) => {
+                let (gpu, surface_info) =
+                    pollster::block_on(reco_core::gpu::GpuContext::for_surface(&instance, surface))
+                        .map_err(|e| WorkerError::Engine(e.to_string()))?;
+                (gpu, surface_info.format)
+            }
+            None => {
+                let gpu = pollster::block_on(reco_core::gpu::GpuContext::with_surface(None))
+                    .map_err(|e| WorkerError::Engine(e.to_string()))?;
+                (gpu, reco_core::wgpu::TextureFormat::Rgba8Unorm)
+            }
+        };
 
         let adapter = gpu
             .adapter()
@@ -648,18 +660,12 @@ impl GpuEngineBackend {
         install_device_lost_handlers(gpu.device(), Arc::clone(&device_lost));
 
         presenter
-            .configure(
-                gpu.device(),
-                gpu.queue(),
-                &adapter,
-                viewport.width,
-                viewport.height,
-            )
+            .configure(gpu.device(), gpu.queue(), &adapter, viewport)
             .map_err(|e| WorkerError::Engine(e.to_string()))?;
 
         Ok(Self {
             gpu,
-            surface_format: surface_info.format,
+            surface_format,
             pose: reco_control::pose_control::PoseControl::with_defaults(),
             viewport,
             blend_width: 0.05,
@@ -691,8 +697,7 @@ impl GpuEngineBackend {
                 self.gpu.device(),
                 self.gpu.queue(),
                 &self.adapter,
-                self.viewport.width,
-                self.viewport.height,
+                self.viewport,
             )
             .map_err(|e| WorkerError::Engine(e.to_string()))
     }
@@ -717,21 +722,29 @@ impl GpuEngineBackend {
             .rebind_instance(&instance)
             .map_err(|e| WorkerError::Engine(e.to_string()))?;
         self.instance = instance;
-        let surface = self
-            .presenter
-            .surface()
-            .map_err(|e| WorkerError::Engine(e.to_string()))?;
-        let (gpu, surface_info) = pollster::block_on(reco_core::gpu::GpuContext::for_surface(
-            &self.instance,
-            surface,
-        ))
-        .map_err(|e| WorkerError::Engine(e.to_string()))?;
+        // Branch device creation on whether the presenter hosts a surface
+        // (PREV-05), exactly as `new` does — a headless (readback) presenter
+        // recovers through `with_surface(None)`. Never a second device (D-03).
+        let (gpu, surface_format) = match self.presenter.surface() {
+            Some(surface) => {
+                let (gpu, surface_info) = pollster::block_on(
+                    reco_core::gpu::GpuContext::for_surface(&self.instance, surface),
+                )
+                .map_err(|e| WorkerError::Engine(e.to_string()))?;
+                (gpu, surface_info.format)
+            }
+            None => {
+                let gpu = pollster::block_on(reco_core::gpu::GpuContext::with_surface(None))
+                    .map_err(|e| WorkerError::Engine(e.to_string()))?;
+                (gpu, reco_core::wgpu::TextureFormat::Rgba8Unorm)
+            }
+        };
         self.adapter = gpu
             .adapter()
             .ok_or_else(|| WorkerError::Engine("rebuilt device retained no adapter".into()))?
             .clone();
         self.gpu = gpu;
-        self.surface_format = surface_info.format;
+        self.surface_format = surface_format;
         // Re-register the callback on the new device: a second loss must be
         // detected too.
         self.device_lost.store(false, Ordering::SeqCst);
@@ -801,15 +814,10 @@ impl GpuEngineBackend {
         }
         let result = self
             .presenter
-            .resize(rect.width, rect.height)
+            .resize(rect)
             .and_then(|()| {
-                self.presenter.configure(
-                    self.gpu.device(),
-                    self.gpu.queue(),
-                    &self.adapter,
-                    rect.width,
-                    rect.height,
-                )
+                self.presenter
+                    .configure(self.gpu.device(), self.gpu.queue(), &self.adapter, rect)
             })
             .map(|()| {
                 if let Some(renderer) = self.renderer.as_mut() {
@@ -1068,20 +1076,36 @@ impl EngineBackend for GpuEngineBackend {
                 .clamp_via_coverage(coverage, aspect, self.rig_tilt);
         }
         let render = self.pose.render_pose(self.rig_tilt);
+        let fov_degrees = self.pose.current_fov_deg();
         events.pose(
             self.pose.current_pose().yaw,
             self.pose.current_pose().pitch,
-            self.pose.current_fov_deg(),
+            fov_degrees,
         );
 
         // 5. Render + present.
+        //
+        // Split-borrow `self` into disjoint fields so the renderer can be taken
+        // `&mut` (the readback path needs `&mut StitchRenderer` for
+        // `render_and_readback_rgba`) while the presenter is borrowed `&mut`
+        // alongside it. `fov_degrees` is passed to every impl uniformly (PREV-04).
+        let Self {
+            renderer,
+            presenter,
+            ..
+        } = self;
         let outcome = {
-            let renderer = self
-                .renderer
-                .as_ref()
+            let renderer = renderer
+                .as_mut()
                 .ok_or_else(|| WorkerError::Engine("renderer missing during session".into()))?;
-            self.presenter
-                .render_frame(renderer, &pair.left, &pair.right, render.yaw, render.pitch)
+            presenter.render_frame(
+                renderer,
+                &pair.left,
+                &pair.right,
+                render.yaw,
+                render.pitch,
+                fov_degrees,
+            )
         };
         match outcome {
             Ok(crate::presenter::FrameOutcome::Presented) => {
