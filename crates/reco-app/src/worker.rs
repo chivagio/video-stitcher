@@ -897,6 +897,12 @@ impl EngineBackend for GpuEngineBackend {
         self.source = None;
         self.renderer_input = None;
         self.renderer = None;
+        // Release the platform child window NOW, while the parent Tauri window
+        // is still alive. `XDestroyWindow` after GTK has torn the parent down
+        // raises a fatal `BadDrawable` X error that aborts the process before
+        // the clean-stop path can report (FOUND-06). Idempotent; `Drop` is a
+        // no-op afterwards.
+        self.presenter.release_presenter_window();
         // `presenter` and `gpu` drop when `self` is dropped, in declaration
         // order (presenter before gpu). Do not `std::process::exit` here — a
         // clean unwind is required while GPU threads may be mid-submit.

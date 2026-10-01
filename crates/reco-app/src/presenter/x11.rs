@@ -21,13 +21,62 @@ use x11_dl::xlib;
 
 use super::{FrameOutcome, PresenterError, SurfacePresenter, ViewportRect};
 
+/// Install an X error handler that logs and swallows the benign teardown errors
+/// our foreign child window can provoke, instead of letting GDK abort.
+///
+/// The child window is created with raw Xlib, so GTK does not track it. During
+/// GTK's own teardown the server may report an asynchronous error for a request
+/// against that window (observed: `BadDrawable` / `request_code 14`
+/// `GetGeometry`). GDK's default X error handler calls `exit()` — which would
+/// kill the process before the engine's clean-stop path runs (FOUND-06). This
+/// handler records the error at `debug` level and returns, so the app unwinds
+/// normally.
+///
+/// Only *benign drawable* errors are swallowed; anything else is logged at
+/// `error` level so a real protocol bug remains visible.
+fn install_benign_x_error_handler(xlib: &xlib::Xlib, display: *mut xlib::Display) {
+    /// X error code for `BadDrawable`.
+    const BAD_DRAWABLE: u8 = 9;
+
+    unsafe extern "C" fn handler(_: *mut xlib::Display, event: *mut xlib::XErrorEvent) -> i32 {
+        // SAFETY: the X server guarantees a valid `XErrorEvent` pointer for the
+        // duration of the callback; we only read its integer fields.
+        let (code, request, minor) = unsafe {
+            (
+                (*event).error_code,
+                (*event).request_code,
+                (*event).minor_code,
+            )
+        };
+        if code == BAD_DRAWABLE {
+            log::debug!(
+                "ignoring benign X BadDrawable during teardown (request_code={request} minor={minor})"
+            );
+        } else {
+            log::error!("X error: code={code} request_code={request} minor={minor}");
+        }
+        // Returning 0 tells X the error is handled; the process is not aborted.
+        0
+    }
+
+    // SAFETY: `display` is the live parent connection. `XSetErrorHandler` is
+    // process-global for that connection; `handler` is a plain `extern "C"`
+    // function that never unwinds.
+    unsafe {
+        (xlib.XSetErrorHandler)(Some(handler));
+        // Flush so any pending error from presenter setup surfaces here rather
+        // than during the first frame.
+        (xlib.XSync)(display, 0);
+    }
+}
+
 /// X11-backed panorama presenter.
 ///
 /// Owns the child `Window` id, the `wl` display connection used to create it,
 /// and the [`reco_core::wgpu::Surface`] built on the child handle.
 pub struct X11Presenter {
     /// The X11 child window id used as the surface target.
-    child_window: std::num::NonZeroU64,
+    child_window: Option<std::num::NonZeroU64>,
     /// Kept alive so the child window outlives the surface (wgpu requires the
     /// window to outlive the surface).
     xlib: xlib::Xlib,
@@ -146,6 +195,15 @@ impl X11Presenter {
             reason: format!("failed to load libX11: {e}"),
         })?;
 
+        // Install an X error handler on the parent's connection. The child window
+        // this presenter creates is deliberately *outside* GTK's knowledge, so
+        // during GTK's own teardown the X server can deliver an asynchronous
+        // error for a request against it (observed: `BadDrawable`, GetGeometry).
+        // GDK's default handler treats any X error as fatal and aborts the
+        // process before the engine's clean-stop path can run (FOUND-06), so we
+        // swallow those during teardown and let the process unwind normally.
+        install_benign_x_error_handler(&xlib, display);
+
         // SAFETY: `display` is non-null and valid (checked above). The window
         // geometry is sanitized to at least 1x1. `parent_xid` is the parent
         // server-side window, so the created window is a true X11 child.
@@ -202,7 +260,7 @@ impl X11Presenter {
         };
 
         Ok(Self {
-            child_window: child_nonzero,
+            child_window: Some(child_nonzero),
             xlib,
             display,
             display_handle: display_handle.as_raw(),
@@ -250,14 +308,18 @@ impl SurfacePresenter for X11Presenter {
         // surface from the same child window on the fresh instance.
         //
         // SAFETY: `child_window` is valid and owned by this presenter for its
-        // whole lifetime (destroyed only in Drop, after the surface), and
-        // `display_handle` is the connection that owns it. wgpu's unsafe contract
-        // is that the window outlives the surface; field order guarantees it.
+        // whole lifetime (released only via `release_child_window`/`Drop`, after
+        // the surface), and `display_handle` is the connection that owns it.
+        // wgpu's unsafe contract is that the window outlives the surface; field
+        // order guarantees it.
+        let child_window = self.child_window.ok_or_else(|| PresenterError::Surface {
+            reason: "presenter surface rebound after its window was destroyed".to_string(),
+        })?;
         let surface = unsafe {
             let target = reco_core::wgpu::SurfaceTargetUnsafe::RawHandle {
                 raw_display_handle: self.display_handle,
                 raw_window_handle: RawWindowHandle::Xlib(raw_window_handle::XlibWindowHandle::new(
-                    self.child_window.get(),
+                    child_window.get(),
                 )),
             };
             instance
@@ -456,15 +518,16 @@ impl SurfacePresenter for X11Presenter {
     }
 
     fn resize(&mut self, width: u32, height: u32) -> Result<(), PresenterError> {
-        // SAFETY: `display` and `child_window` are valid for this presenter's
-        // lifetime; XResizeWindow is safe to call with them.
+        // After `release_child_window` there is no window to resize; that is a
+        // teardown-time no-op, not an error.
+        let Some(child) = self.child_window else {
+            return Ok(());
+        };
+        // SAFETY: `display` and `child` are valid for this presenter's lifetime
+        // (the window is released only in `release_child_window`/`Drop`);
+        // XResizeWindow is safe to call with them.
         unsafe {
-            (self.xlib.XResizeWindow)(
-                self.display,
-                self.child_window.get(),
-                width.max(1),
-                height.max(1),
-            );
+            (self.xlib.XResizeWindow)(self.display, child.get(), width.max(1), height.max(1));
             (self.xlib.XFlush)(self.display);
         }
         self.viewport = ViewportRect {
@@ -479,19 +542,58 @@ impl SurfacePresenter for X11Presenter {
     fn viewport(&self) -> ViewportRect {
         self.viewport
     }
+
+    /// FOUND-06: destroy the child window while the parent is still alive.
+    ///
+    /// Dispatched by the worker's `shutdown()` through `dyn SurfacePresenter`.
+    /// Releasing here — rather than relying on `Drop` — is the only ordering in
+    /// which GTK still owns the parent, so `XDestroyWindow` cannot raise the
+    /// fatal `BadDrawable` that would abort the process before a clean stop is
+    /// reported. Idempotent via [`X11Presenter::release_child_window`].
+    fn release_presenter_window(&mut self) {
+        self.release_child_window();
+    }
 }
 
 impl Drop for X11Presenter {
     fn drop(&mut self) {
-        // Drop order: the surface is dropped (implicitly, field order) before
-        // this runs, so the window outlives the surface (wgpu requires this).
-        // We destroy only the child window; the X display connection is owned
-        // by the parent (Tauri) window and must NOT be closed here.
-        // SAFETY: `display` and `child_window` are valid for this presenter's
-        // lifetime; XDestroyWindow on a window we created is safe. No other
-        // thread touches this connection.
+        // Only destroy what we still own. If `close()` already ran (the normal
+        // teardown path), skip: re-destroying a window whose parent has been
+        // torn down by GTK raises a fatal `BadDrawable` X error that aborts the
+        // process before the worker can report a clean stop (FOUND-06).
+        let Some(child) = self.child_window.take() else {
+            return;
+        };
+        // SAFETY: `display` and `child` were valid for this presenter's lifetime
+        // and the parent (Tauri) window is still alive at this point on the
+        // drop path. No other thread touches this connection.
         unsafe {
-            (self.xlib.XDestroyWindow)(self.display, self.child_window.get());
+            (self.xlib.XDestroyWindow)(self.display, child.get());
+        }
+    }
+}
+
+impl X11Presenter {
+    /// Destroy the child window now, while the parent Tauri window is still
+    /// alive, and mark it as released so [`Drop`] does not touch it again.
+    ///
+    /// Called from the worker's `shutdown()` (FOUND-06) so teardown happens in
+    /// a known-good order: stop the loop → drop the decode/renderer/surface →
+    /// destroy the child window (parent still valid) → drop the device. Doing
+    /// this only in `Drop` risks running after GTK has torn the parent down,
+    /// which raises `BadDrawable` and kills the process before the clean-stop
+    /// path can report.
+    ///
+    /// Idempotent: a second call is a no-op.
+    pub fn release_child_window(&mut self) {
+        let Some(child) = self.child_window.take() else {
+            return;
+        };
+        // SAFETY: as in `Drop` — `display` and `child` are valid, and this runs
+        // while the parent window still exists.
+        unsafe {
+            (self.xlib.XDestroyWindow)(self.display, child.get());
+            (self.xlib.XFlush)(self.display);
         }
     }
 }

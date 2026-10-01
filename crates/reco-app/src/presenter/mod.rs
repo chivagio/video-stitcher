@@ -372,6 +372,17 @@ pub trait SurfacePresenter {
     // Part of the presenter contract (D-02); see [`Self::resize`].
     #[cfg_attr(not(test), allow(dead_code))]
     fn viewport(&self) -> ViewportRect;
+
+    /// Release the platform child window now, while its parent is still alive
+    /// (FOUND-06).
+    ///
+    /// Destroying the child window only from `Drop` risks running after GTK has
+    /// torn the parent down, which raises a fatal `BadDrawable` X error and kills
+    /// the process before a clean stop can be reported. Targets whose presenter
+    /// owns no separate OS window use the default no-op.
+    ///
+    /// Idempotent: a second call must be a no-op.
+    fn release_presenter_window(&mut self) {}
 }
 
 /// Build a [`ViewportConfig`] matching the presenter's panorama viewport.
