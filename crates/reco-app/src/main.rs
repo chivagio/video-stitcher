@@ -94,23 +94,22 @@ fn run_skeleton(app: &mut tauri::App) -> Result<(), SkeletonError> {
     let (worker, events) = worker::spawn_gpu_worker(instance, Box::new(presenter), rect)?;
 
     // The webview bridge: drain typed worker events on an async Tauri task and
-    // forward each one to the frontend. Plan 04 wires the JS `listen` side; the
-    // plumbing lives here.
+    // forward each one to the frontend. The JS `listen("worker-event")` side
+    // renders them (Plan 04).
     install_event_bridge(app.handle().clone(), events);
 
-    // Drive the thin path: import the hardcoded clips, then render the live
-    // stitched frames (D-07). Commands cross the channel — never a direct
-    // engine call (D-06).
-    let handle = worker.handle();
-    handle
-        .send(worker::WorkerCommand::Import)
-        .map_err(SkeletonError::Worker)?;
-    handle
-        .send(worker::WorkerCommand::Preview)
-        .map_err(SkeletonError::Worker)?;
+    // The thin path is driven by the WEBVIEW, not from here: the three
+    // `#[tauri::command]` handlers post Import / Preview / Export when the user
+    // presses the matching button (D-06/D-09). We deliberately do NOT auto-post
+    // Import/Preview at startup — the whole point of Plan 04's UI is that the
+    // user drives the engine without a CLI, and the busy/disabled interaction
+    // contract proves the single-owner boundary as each command is issued.
 
     // Keep the worker (and the window whose child the worker renders into)
     // alive for the app's lifetime; the webview owns the lifetime from here.
+    // The managed worker's `WorkerHandle` is what `State<WorkerHandle>` resolves
+    // in the command handlers.
+    app.manage(worker.handle());
     app.manage(worker);
     app.manage(window);
 

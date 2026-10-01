@@ -444,7 +444,11 @@ impl EngineBackend for GpuEngineBackend {
     }
 
     fn preview(&mut self, events: &EventSink, interrupted: &AtomicBool) -> Result<(), WorkerError> {
-        let (cal, (in_w, in_h)) = match (self.calibration.take(), self.input_size) {
+        // Clone (not `take`) the calibration: the renderer takes it by value,
+        // but a preview must be repeatable without re-importing, so the loaded
+        // calibration stays owned by the backend (Plan 04 re-runs preview from
+        // the UI). `MatchCalibration` is `Clone`.
+        let (cal, (in_w, in_h)) = match (self.calibration.clone(), self.input_size) {
             (Some(cal), Some(size)) => (cal, size),
             _ => return Err(WorkerError::NotImported),
         };
