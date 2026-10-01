@@ -138,7 +138,7 @@ mod tests {
     fn fallback_returns_unsupported_with_non_empty_reason() {
         let mut presenter = FallbackPresenter::new(
             "Wayland has no child-window embedding",
-            ViewportRect::for_window(1280, 800),
+            ViewportRect::for_chrome(1280, 800, &crate::presenter::ChromeState::default()),
         );
         // `resize` is allowed to succeed (it is layout only) ...
         assert!(presenter.resize(1024, 768).is_ok());
@@ -156,7 +156,10 @@ mod tests {
 
     #[test]
     fn fallback_reason_defaults_when_blank() {
-        let presenter = FallbackPresenter::new("   ", ViewportRect::for_window(800, 600));
+        let presenter = FallbackPresenter::new(
+            "   ",
+            ViewportRect::for_chrome(800, 600, &crate::presenter::ChromeState::default()),
+        );
         assert!(!presenter.reason().trim().is_empty());
     }
 }

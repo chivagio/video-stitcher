@@ -7,17 +7,18 @@
 //!
 //! ```text
 //!   one Tauri/tao window
-//!   ├── webview chrome (bottom-anchored: log pane 160px + control row 48px)
-//!   └── native child view (top region) ── owns a wgpu::Surface
-//!                                         render target = stitched panorama
+//!   ├── chrome webview (full window, transparent; opaque panels paint)
+//!   │     bottom transport bar 72px · right controls rail 40/280px · log drawer 240/0px
+//!   └── native child view (top-left region) ── owns a wgpu::Surface
+//!                                               render target = stitched panorama
 //! ```
 //!
-//! The webview leaves the top region uncovered (UI-SPEC Surface Layout
-//! Contract); the presenter renders the panorama into a **native child view**
-//! positioned in that region. The webview and the panorama are independent
-//! layers — the frontend never sizes, moves, or creates the native view, and
-//! no raw handle (`raw-window-handle` / HWND / NSView / X11) is ever exposed
-//! across IPC (D-02).
+//! The webview leaves the top-left preview region uncovered (UI-SPEC Surface
+//! Layout Contract); the presenter renders the panorama into a **native child
+//! view** positioned in that region. The webview and the panorama are
+//! independent layers — the frontend never sizes, moves, or creates the native
+//! view, and no raw handle (`raw-window-handle` / HWND / NSView / X11) is ever
+//! exposed across IPC (D-02).
 //!
 //! # Device sharing, not device ownership
 //!
@@ -72,10 +73,62 @@ pub type PlatformPresenter = x11::X11Presenter;
 #[cfg(not(all(unix, not(target_os = "macos"))))]
 pub type PlatformPresenter = fallback::FallbackPresenter;
 
-/// Height in logical pixels of the webview control row (UI-SPEC).
-pub const CONTROL_ROW_HEIGHT: u32 = 48;
-/// Height in logical pixels of the webview event/status log pane (UI-SPEC).
-pub const LOG_PANE_HEIGHT: u32 = 160;
+/// Height in logical pixels of the webview transport bar (UI-SPEC).
+///
+/// Bottom-anchored, full width: timeline row (24px) + control row (48px).
+pub const TRANSPORT_BAR_HEIGHT: u32 = 72;
+
+/// Width in logical pixels of the expanded right controls panel (UI-SPEC).
+pub const CONTROLS_PANEL_WIDTH: u32 = 280;
+
+/// Width in logical pixels of the collapsed right controls rail (UI-SPEC).
+pub const CONTROLS_PANEL_COLLAPSED_WIDTH: u32 = 40;
+
+/// Height in logical pixels of the expanded event-log drawer (UI-SPEC).
+///
+/// Zero when collapsed (the default).
+pub const LOG_DRAWER_HEIGHT: u32 = 240;
+
+/// The webview chrome's collapsible state (UI-SPEC Surface Layout Contract).
+///
+/// This is the Rust-side source of truth for the *native* viewport geometry;
+/// the frontend reports its chrome state (panel/drawer open/closed) and Rust
+/// recomputes [`ViewportRect::for_chrome`]. The frontend must never compute the
+/// native rect itself (UI-SPEC "Geometry authority").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ChromeState {
+    /// Whether the right controls panel is expanded (vs. the 40px rail).
+    ///
+    /// Defaults to collapsed (`false`), matching the UI-SPEC default panel
+    /// width of 40px — the panel is opt-in so the panorama gets the space by
+    /// default.
+    pub panel_expanded: bool,
+    /// Whether the event-log drawer is expanded.
+    ///
+    /// Defaults to collapsed (`false`), which the UI-SPEC fixes as the drawer's
+    /// default (drawer height 0). Opening it shrinks the native viewport.
+    pub drawer_expanded: bool,
+}
+
+impl ChromeState {
+    /// The right controls panel's width in physical pixels for this state.
+    pub fn panel_width(&self) -> u32 {
+        if self.panel_expanded {
+            CONTROLS_PANEL_WIDTH
+        } else {
+            CONTROLS_PANEL_COLLAPSED_WIDTH
+        }
+    }
+
+    /// The event-log drawer's height in physical pixels for this state.
+    pub fn drawer_height(&self) -> u32 {
+        if self.drawer_expanded {
+            LOG_DRAWER_HEIGHT
+        } else {
+            0
+        }
+    }
+}
 
 /// Ground colour of the idle/clear frame painted before the first stitched
 /// frame (UI-SPEC E3; the `#1e1e1e` app ground).
@@ -215,27 +268,35 @@ pub struct ViewportRect {
 
 impl ViewportRect {
     /// Compute the panorama viewport for a window of `width` × `height`
-    /// physical pixels.
+    /// physical pixels given the webview chrome's collapsible [`ChromeState`].
     ///
-    /// Reserves [`LOG_PANE_HEIGHT`] + [`CONTROL_ROW_HEIGHT`] at the bottom for
-    /// the webview chrome. Saturates to zero rather than underflowing when the
-    /// window is smaller than the chrome (a minimum window size is enforced by
+    /// The rect is **top-left anchored** and is the L-shaped complement of the
+    /// chrome (UI-SPEC Surface Layout Contract):
+    ///
+    /// ```text
+    ///   width  = window_w − chrome.panel_width()          (right rail/panel)
+    ///   height = window_h − TRANSPORT_BAR_HEIGHT − drawer_height()  (bottom bar + drawer)
+    /// ```
+    ///
+    /// Saturates at every step rather than underflowing when the window is
+    /// smaller than the chrome (a minimum window size is enforced by
     /// `tauri.conf.json`, but the computation must still be total).
-    pub fn for_window(width: u32, height: u32) -> Self {
-        let reserved = LOG_PANE_HEIGHT + CONTROL_ROW_HEIGHT;
+    pub fn for_chrome(window_w: u32, window_h: u32, chrome: &ChromeState) -> Self {
         Self {
             x: 0,
             y: 0,
-            width,
-            height: height.saturating_sub(reserved),
+            width: window_w.saturating_sub(chrome.panel_width()),
+            height: window_h
+                .saturating_sub(TRANSPORT_BAR_HEIGHT)
+                .saturating_sub(chrome.drawer_height()),
         }
     }
 
     /// Whether the viewport has a drawable (non-zero) area.
     ///
-    /// A window can legitimately shrink below the 208px chrome reservation, in
-    /// which case the panorama region is empty. Exercised by this module's
-    /// tests; the Phase 1 binary path always passes a 1280x800 viewport.
+    /// A window can legitimately shrink below the chrome reservation, in which
+    /// case the panorama region is empty. Exercised by this module's tests; the
+    /// binary path always passes a 1280x800 viewport.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn is_drawable(&self) -> bool {
         self.width > 0 && self.height > 0
@@ -426,20 +487,55 @@ mod tests {
     }
 
     #[test]
-    fn viewport_height_is_window_minus_chrome() {
-        let rect = ViewportRect::for_window(1280, 800);
-        assert_eq!(rect.width, 1280);
-        assert_eq!(rect.height, 800 - 208);
+    fn for_chrome_uses_saturating_l_shaped_geometry() {
+        // Default chrome: collapsed 40px right rail + 72px bottom transport bar,
+        // drawer collapsed (0). UI-SPEC Surface Layout Contract.
+        let rect = ViewportRect::for_chrome(1280, 800, &ChromeState::default());
         assert_eq!(rect.x, 0);
         assert_eq!(rect.y, 0);
+        assert_eq!(rect.width, 1280 - 40);
+        assert_eq!(rect.height, 800 - 72);
     }
 
     #[test]
-    fn viewport_saturates_on_tiny_window() {
-        let rect = ViewportRect::for_window(100, 100);
-        assert_eq!(rect.width, 100);
+    fn for_chrome_expanded_panel_and_drawer_shrink_the_viewport() {
+        let chrome = ChromeState {
+            panel_expanded: true,
+            drawer_expanded: true,
+        };
+        let rect = ViewportRect::for_chrome(1280, 800, &chrome);
+        assert_eq!(rect.width, 1280 - 280);
+        assert_eq!(rect.height, 800 - 72 - 240);
+    }
+
+    #[test]
+    fn for_chrome_saturates_and_never_underflows() {
+        // A window smaller than the chrome must yield a non-drawable rect, not
+        // an underflow panic (both dimensions saturate independently).
+        let expanded = ChromeState {
+            panel_expanded: true,
+            drawer_expanded: true,
+        };
+        let rect = ViewportRect::for_chrome(100, 100, &expanded);
+        assert_eq!(rect.width, 0);
         assert_eq!(rect.height, 0);
         assert!(!rect.is_drawable());
+
+        // A window wide enough but too short: width survives, height saturates.
+        let rect = ViewportRect::for_chrome(1280, 50, &ChromeState::default());
+        assert_eq!(rect.width, 1280 - 40);
+        assert_eq!(rect.height, 0);
+        assert!(!rect.is_drawable());
+    }
+
+    #[test]
+    fn chrome_state_defaults_are_collapsed() {
+        // UI-SPEC fixes the collapsed default for both the panel and the drawer.
+        let chrome = ChromeState::default();
+        assert!(!chrome.panel_expanded);
+        assert!(!chrome.drawer_expanded);
+        assert_eq!(chrome.panel_width(), CONTROLS_PANEL_COLLAPSED_WIDTH);
+        assert_eq!(chrome.drawer_height(), 0);
     }
 
     #[test]
