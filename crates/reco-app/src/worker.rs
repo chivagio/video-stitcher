@@ -1012,13 +1012,19 @@ impl GpuEngineBackend {
             }
         })?;
         // Configure the incoming presenter against the EXISTING device/adapter.
-        incoming.configure(
+        // If this fails, put the incoming presenter back in its slot so the chain
+        // is not corrupted.
+        if let Err(e) = incoming.configure(
             self.gpu.device(),
             self.gpu.queue(),
             &self.adapter,
             self.viewport,
-        )?;
-        // Release the outgoing presenter's window, then park it back in its slot.
+        ) {
+            self.presenters[idx] = Some(incoming);
+            return Err(e);
+        }
+        // Only release the outgoing presenter's window AFTER the incoming one
+        // is successfully configured.
         self.presenter.release_presenter_window();
         let outgoing = std::mem::replace(&mut self.presenter, incoming);
         let old_idx = crate::presenter::PRESENTER_CHAIN
