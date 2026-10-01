@@ -1,0 +1,231 @@
+//! Readback presenter — the throttled, visibly-degraded fallback (PREV-05).
+//!
+//! This is the **last resort** in the presenter chain and the **only** mode
+//! where frame pixels cross IPC. It has **no surface**: the worker creates a
+//! headless device (`GpuContext::with_surface(None)`) and the presenter renders
+//! through the renderer's own RGBA readback path
+//! ([`StitchRenderer::render_and_readback_rgba`]), pushing copied frames to the
+//! webview over a Tauri [`Channel`](tauri::ipc::Channel) where they are painted
+//! onto a canvas. The webview owns the preview region in this mode and shows the
+//! locked degraded banner + badge (UI-SPEC Presenter & Degradation Contract).
+//!
+//! # Throttle
+//!
+//! Readback copies frames GPU→CPU and then Rust→webview, so it is capped at
+//! [`READBACK_FPS`] frames per second by wall-clock (independent of the clip
+//! fps). A single throttle bounds the IPC volume (T-02-10); the worker never
+//! blocks on the channel send.
+//!
+//! # Never a second device
+//!
+//! The presenter builds no `GpuContext` and no `RgbaReadback` of its own — it
+//! drives the worker's shared [`StitchRenderer`] (D-03). The readback staging
+//! buffers live inside the renderer.
+
+use std::time::{Duration, Instant};
+
+use reco_core::render::stitch_renderer::StitchRenderer;
+use reco_core::source::YuvData;
+
+use super::{FrameOutcome, PresenterError, SurfacePresenter, ViewportRect};
+
+/// Readback frame-rate cap (frames per second). Surfaced in the WARN line so
+/// the degradation is honest about its cadence.
+pub const READBACK_FPS: u32 = 10;
+
+/// Headless presenter that renders to CPU pixels and pushes them over IPC.
+pub struct ReadbackPresenter {
+    /// The webview channel the frames are pushed to, once the UI attaches one.
+    ///
+    /// `None` until the UI calls `preview_attach_readback`; frames are rendered
+    /// (to keep the transport advancing) but not sent until a channel exists.
+    channel: Option<tauri::ipc::Channel<tauri::ipc::Response>>,
+    /// Current geometry (tracked for the worker's reconfigure path; there is no
+    /// surface to configure).
+    viewport: ViewportRect,
+    /// Wall-clock of the last frame actually sent, for the [`READBACK_FPS`]
+    /// throttle.
+    last_send: Option<Instant>,
+    /// Drop count of frames elided by the throttle (diagnostic).
+    throttled: u64,
+}
+
+impl ReadbackPresenter {
+    /// Build a headless readback presenter for `rect`.
+    pub fn new(rect: ViewportRect) -> Self {
+        Self {
+            channel: None,
+            viewport: rect,
+            last_send: None,
+            throttled: 0,
+        }
+    }
+
+    /// Attach (or replace) the webview channel frames are pushed to.
+    ///
+    /// Called by the thin `preview_attach_readback` Tauri command; the presenter
+    /// itself never names an engine type.
+    pub fn attach_channel(&mut self, channel: tauri::ipc::Channel<tauri::ipc::Response>) {
+        self.channel = Some(channel);
+        // A fresh attachment should send its first frame immediately rather than
+        // waiting out a throttle window from a previous attachment.
+        self.last_send = None;
+    }
+
+    /// Whether a webview channel is currently attached.
+    pub fn has_channel(&self) -> bool {
+        self.channel.is_some()
+    }
+
+    /// The throttle window between sent frames.
+    fn send_interval() -> Duration {
+        Duration::from_secs_f64(1.0 / f64::from(READBACK_FPS.max(1)))
+    }
+
+    /// Whether a frame may be sent now, updating the throttle clock if so.
+    fn should_send(&mut self) -> bool {
+        let now = Instant::now();
+        match self.last_send {
+            Some(last) if now.duration_since(last) < Self::send_interval() => {
+                self.throttled += 1;
+                false
+            }
+            _ => {
+                self.last_send = Some(now);
+                true
+            }
+        }
+    }
+}
+
+impl SurfacePresenter for ReadbackPresenter {
+    fn surface(&self) -> Option<&reco_core::wgpu::Surface<'static>> {
+        // Headless: the worker creates the device via
+        // `GpuContext::with_surface(None)` for this presenter.
+        None
+    }
+
+    fn rebind_instance(
+        &mut self,
+        _instance: &reco_core::wgpu::Instance,
+    ) -> Result<(), PresenterError> {
+        // No surface to rebind; the device is rebuilt by the worker and the
+        // renderer is recreated against it, so there is nothing surface-bound
+        // here to refresh.
+        Ok(())
+    }
+
+    fn configure(
+        &mut self,
+        _device: &reco_core::wgpu::Device,
+        _queue: &reco_core::wgpu::Queue,
+        _adapter: &reco_core::wgpu::Adapter,
+        rect: ViewportRect,
+    ) -> Result<(), PresenterError> {
+        // Headless: track geometry only. The renderer is built/configured by the
+        // worker against the shared device.
+        self.viewport = rect;
+        Ok(())
+    }
+
+    fn render_frame(
+        &mut self,
+        renderer: &mut StitchRenderer,
+        left: &YuvData,
+        right: &YuvData,
+        yaw: f32,
+        pitch: f32,
+        fov_degrees: f32,
+    ) -> Result<FrameOutcome, PresenterError> {
+        // FOV is plumbed uniformly across impls (PREV-04); the pipeline clamps
+        // 1..179 internally.
+        renderer.pipeline_mut().set_fov(fov_degrees);
+        let left_planes = left.as_planes();
+        let right_planes = right.as_planes();
+        // The renderer owns the triple-buffered `RgbaReadback`; `None` on the
+        // first two calls during warmup, `Some` from the third onward.
+        let rgba = renderer
+            .render_and_readback_rgba(&left_planes, &right_planes, yaw, pitch)
+            .map_err(|e| PresenterError::Surface {
+                reason: format!("render_and_readback_rgba failed: {e}"),
+            })?;
+        if let Some(bytes) = rgba
+            && self.should_send()
+            && let Some(channel) = self.channel.as_ref()
+        {
+            // Never block the worker on the send: a closed webview just drops the
+            // frame (T-02-10).
+            let _ = channel.send(tauri::ipc::Response::new(bytes.to_vec()));
+        }
+        // The readback path has no swapchain; "presented" here means a frame was
+        // produced (and, subject to the throttle, delivered) this tick.
+        Ok(FrameOutcome::Presented)
+    }
+
+    fn render_idle(&mut self) -> Result<(), PresenterError> {
+        // No-op: the webview owns the region in readback mode and paints its
+        // degraded banner/idle state itself; there is no surface to clear.
+        Ok(())
+    }
+
+    fn resize(&mut self, rect: ViewportRect) -> Result<(), PresenterError> {
+        self.viewport = rect;
+        Ok(())
+    }
+
+    fn viewport(&self) -> ViewportRect {
+        self.viewport
+    }
+
+    // `release_presenter_window` uses the default no-op: there is no window.
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn readback_fps_is_the_locked_cadence() {
+        // The cadence is surfaced in the WARN line, so it is a contract value.
+        assert_eq!(READBACK_FPS, 10);
+        assert_eq!(
+            ReadbackPresenter::send_interval(),
+            Duration::from_millis(100)
+        );
+    }
+
+    #[test]
+    fn readback_has_no_surface_and_tracks_geometry() {
+        let mut p = ReadbackPresenter::new(ViewportRect {
+            x: 0,
+            y: 0,
+            width: 1280,
+            height: 728,
+        });
+        assert!(p.surface().is_none());
+        assert!(!p.has_channel());
+        p.resize(ViewportRect {
+            x: 0,
+            y: 0,
+            width: 1024,
+            height: 600,
+        })
+        .unwrap();
+        assert_eq!(p.viewport().width, 1024);
+        assert_eq!(p.viewport().height, 600);
+    }
+
+    #[test]
+    fn throttle_elides_frames_inside_the_window() {
+        let mut p = ReadbackPresenter::new(ViewportRect {
+            x: 0,
+            y: 0,
+            width: 64,
+            height: 64,
+        });
+        // The first frame is always allowed; an immediate second is throttled.
+        assert!(p.should_send());
+        assert!(!p.should_send());
+        assert_eq!(p.throttled, 1);
+    }
+}

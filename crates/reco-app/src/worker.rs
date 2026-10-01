@@ -588,6 +588,16 @@ pub struct GpuEngineBackend {
     /// the renderer but before the device, so its surface outlives the device
     /// that configured it.
     presenter: Box<dyn crate::presenter::SurfacePresenter + Send>,
+    /// The not-yet-active presenters in the PREV-05 chain, strongest-first,
+    /// pre-built on the setup thread. Held so a manual override (Task 3) can
+    /// swap one in at a tick boundary without constructing anything on the
+    /// worker thread.
+    presenters: std::collections::VecDeque<(
+        crate::presenter::PresenterKind,
+        Box<dyn crate::presenter::SurfacePresenter + Send>,
+    )>,
+    /// Which chain entry [`Self::presenter`] currently is.
+    active_kind: crate::presenter::PresenterKind,
     /// The wgpu `Instance`, retained so a `Lost` surface can rebuild the device
     /// (FOUND-05). Creating the instance once keeps recovery on the same backend.
     instance: reco_core::wgpu::Instance,
@@ -623,9 +633,22 @@ impl GpuEngineBackend {
     /// surface cannot be configured against it.
     pub fn new(
         instance: reco_core::wgpu::Instance,
-        mut presenter: Box<dyn crate::presenter::SurfacePresenter + Send>,
+        presenters: Vec<(
+            crate::presenter::PresenterKind,
+            Box<dyn crate::presenter::SurfacePresenter + Send>,
+        )>,
         viewport: crate::presenter::ViewportRect,
     ) -> Result<Self, WorkerError> {
+        // The presenter chain (PREV-05), strongest-first, pre-built on the setup
+        // thread. The first entry is the initial active presenter; the rest are
+        // held for a runtime swap. An empty chain is a programmer error.
+        let mut chain = presenters
+            .into_iter()
+            .collect::<std::collections::VecDeque<_>>();
+        let (active_kind, mut presenter) = chain
+            .pop_front()
+            .ok_or_else(|| WorkerError::Engine("engine got an empty presenter chain".into()))?;
+
         // Branch on whether the presenter hosts a surface (PREV-05):
         //   Some(surface) → the surface-compatible `for_surface` constructor,
         //                   and the surface's negotiated format is the render format.
@@ -680,6 +703,8 @@ impl GpuEngineBackend {
             source: None,
             input_size: None,
             presenter,
+            presenters: chain,
+            active_kind,
             instance,
             adapter,
             device_lost,
@@ -1337,10 +1362,13 @@ impl GpuEngineBackend {
 /// [`WorkerError::Engine`] if device creation or surface configuration fails.
 pub fn spawn_gpu_worker(
     instance: reco_core::wgpu::Instance,
-    presenter: Box<dyn crate::presenter::SurfacePresenter + Send>,
+    presenters: Vec<(
+        crate::presenter::PresenterKind,
+        Box<dyn crate::presenter::SurfacePresenter + Send>,
+    )>,
     viewport: crate::presenter::ViewportRect,
 ) -> Result<(EngineWorker, Receiver<WorkerEvent>), WorkerError> {
-    let backend = GpuEngineBackend::new(instance, presenter, viewport)?;
+    let backend = GpuEngineBackend::new(instance, presenters, viewport)?;
     Ok(EngineWorker::spawn(backend))
 }
 

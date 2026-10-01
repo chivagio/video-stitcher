@@ -41,6 +41,8 @@ use reco_core::source::YuvData;
 pub mod x11;
 
 pub mod fallback;
+pub mod readback;
+pub mod separate_window;
 
 /// Compile-time check that the presenter can be moved to the engine worker
 /// thread.
@@ -49,10 +51,13 @@ pub mod fallback;
 /// `Send` bound is mandatory because the presenter is moved onto the worker
 /// thread (D-03), which is the only thread that draws into its surface. This
 /// assertion fails the build if a platform impl ever stops being `Send`.
-#[cfg(all(unix, not(target_os = "macos")))]
 const _: fn() = || {
     fn assert_send<T: Send>() {}
+    #[cfg(all(unix, not(target_os = "macos")))]
     assert_send::<x11::X11Presenter>();
+    assert_send::<fallback::FallbackPresenter>();
+    assert_send::<separate_window::SeparateWindowPresenter>();
+    assert_send::<readback::ReadbackPresenter>();
 };
 
 /// The platform-native presenter selected at compile time.
@@ -88,6 +93,45 @@ pub const CONTROLS_PANEL_COLLAPSED_WIDTH: u32 = 40;
 ///
 /// Zero when collapsed (the default).
 pub const LOG_DRAWER_HEIGHT: u32 = 240;
+
+/// Which presenter in the PREV-05 chain is active or requested.
+///
+/// The chain is fixed and ordered strong→weak:
+/// `Native` (zero-copy child view) → `SeparateWindow` (zero-copy Rust window) →
+/// `Readback` (throttled, the only mode where frame pixels cross IPC). Serde
+/// snake_case so it round-trips through the typed `set_presenter` command and
+/// the `Presenter` event without stringly-typed handling (T-02-07).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum PresenterKind {
+    /// Native child-view compositing (zero-copy; the PREV-01 default).
+    Native,
+    /// A separate, Rust-owned, webview-less preview window (zero-copy).
+    SeparateWindow,
+    /// Throttled CPU readback pushed to the webview (degraded fallback).
+    Readback,
+}
+
+impl PresenterKind {
+    /// The locked UI-SPEC badge label for this presenter.
+    pub fn label(&self) -> &'static str {
+        match self {
+            PresenterKind::Native => "Presenter: Native",
+            PresenterKind::SeparateWindow => "Presenter: Separate window",
+            PresenterKind::Readback => "Presenter: Readback",
+        }
+    }
+
+    /// The short human name used in log lines ("Separate window" / "Readback").
+    pub fn name(&self) -> &'static str {
+        match self {
+            PresenterKind::Native => "Native",
+            PresenterKind::SeparateWindow => "Separate window",
+            PresenterKind::Readback => "Readback",
+        }
+    }
+}
 
 /// The webview chrome's collapsible state (UI-SPEC Surface Layout Contract).
 ///

@@ -108,16 +108,46 @@ fn run_skeleton(app: &mut tauri::App) -> Result<(), SkeletonError> {
     let mut presenter = X11Presenter::new(&window, &instance, rect)?;
     presenter.lower();
 
+    // Pre-create the Rust-owned, webview-less preview window on the SETUP thread
+    // (PREV-05 / RESEARCH Pattern 5): it starts hidden, and the separate-window
+    // presenter is built from it here. Creating windows and wgpu surfaces off the
+    // setup thread is forbidden (macOS surface panic; Tauri's Windows
+    // window-creation deadlock), so the worker only ever *installs* a
+    // pre-built presenter, never constructs one. The presenter chain (Task 3)
+    // selects among these; here they are prepared and handed to the app.
+    let preview_window = build_preview_window(app)?;
+    let separate_window_presenter =
+        presenter::separate_window::SeparateWindowPresenter::new(preview_window, &instance, rect)?;
+
     // Full-window transparent chrome webview: it is an absolutely positioned set
     // of opaque panels that tiles around the transparent preview hole. Pointer
     // events over the preview region land on this webview (it is above).
     add_chrome_webview(app, &window)?;
 
+    // The presenter chain (PREV-05): native → separate window → readback. All
+    // three are pre-created here on the setup thread; the worker installs the
+    // active one and can swap at a tick boundary on a manual override (Task 3).
+    // Readback is trivially cheap (no surface; it shares the worker's device).
+    let presenter_chain: Vec<(
+        presenter::PresenterKind,
+        Box<dyn presenter::SurfacePresenter + Send>,
+    )> = vec![
+        (presenter::PresenterKind::Native, Box::new(presenter)),
+        (
+            presenter::PresenterKind::SeparateWindow,
+            Box::new(separate_window_presenter),
+        ),
+        (
+            presenter::PresenterKind::Readback,
+            Box::new(presenter::readback::ReadbackPresenter::new(rect)),
+        ),
+    ];
+
     // Ownership handoff (FOUND-03): the device is created *inside* the worker
     // from the presenter's surface, so the worker is the sole device owner.
     // Nothing on this (the setup) thread holds a device handle or renders
     // directly.
-    let (worker, events) = worker::spawn_gpu_worker(instance, Box::new(presenter), rect)?;
+    let (worker, events) = worker::spawn_gpu_worker(instance, presenter_chain, rect)?;
 
     // The webview bridge: drain typed worker events on an async Tauri task and
     // forward each one to the frontend. The JS `listen("worker-event")` side
@@ -330,6 +360,22 @@ fn add_chrome_webview(
         .map_err(|e| SkeletonError::Window(e.to_string()))?;
 
     Ok(())
+}
+
+/// Create the hidden, webview-less preview window used by the separate-window
+/// presenter (PREV-05).
+///
+/// Built on the setup thread because Tauri forbids synchronous window creation
+/// off it (Windows deadlock) and wgpu forbids non-main-thread surface creation on
+/// macOS. It starts hidden (`visible(false)`) and is shown by the separate-window
+/// presenter's `show` action.
+fn build_preview_window(app: &tauri::App) -> Result<tauri::window::Window, SkeletonError> {
+    tauri::window::WindowBuilder::new(app, presenter::separate_window::PREVIEW_WINDOW_LABEL)
+        .title("Reco Preview")
+        .inner_size(1280.0, 720.0)
+        .visible(false)
+        .build()
+        .map_err(|e| SkeletonError::Window(e.to_string()))
 }
 
 /// Typed errors at the binary edge.
