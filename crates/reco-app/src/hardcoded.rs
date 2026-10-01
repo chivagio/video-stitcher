@@ -150,8 +150,21 @@ fn absolute(path: &Path) -> PathBuf {
 mod tests {
     use super::*;
 
+    /// Serializes the env-mutating tests in this module.
+    ///
+    /// `set_var`/`remove_var` mutate process-global state, so a test that reads
+    /// the media-dir env (`media_paths_use_default_dir_when_env_unset`) must not
+    /// run concurrently with one that writes it
+    /// (`empty_media_dir_env_is_rejected`). Cargo runs tests in parallel
+    /// threads within a binary, so the two raced and the reader observed the
+    /// writer's transient `"   "` value. This lock makes the reader and writer
+    /// mutually exclusive. (The prior comment claimed a guard that did not
+    /// exist; this is that guard.)
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn media_paths_use_default_dir_when_env_unset() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // The test process is expected not to set RECO_TEST_MEDIA_DIR; if it
         // is, this test still asserts the shape rather than a fixed value.
         let paths = media_paths().expect("default media dir resolves");
@@ -163,8 +176,9 @@ mod tests {
 
     #[test]
     fn empty_media_dir_env_is_rejected() {
-        // SAFETY (env): tests run single-threaded per module below; see the
-        // guard test `env_var_guard_*`. Set then immediately unset.
+        // SAFETY (env): serialized against the other env-touching test by
+        // `ENV_LOCK`; set then immediately unset.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe { std::env::set_var(TEST_MEDIA_DIR_ENV, "   ") };
         let result = media_dir();
         unsafe { std::env::remove_var(TEST_MEDIA_DIR_ENV) };
@@ -173,6 +187,7 @@ mod tests {
 
     #[test]
     fn debug_device_loss_flag_defaults_off_and_enables_on_non_empty() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe { std::env::remove_var(DEBUG_DEVICE_LOSS_ENV) };
         assert!(!debug_device_loss_enabled());
         unsafe { std::env::set_var(DEBUG_DEVICE_LOSS_ENV, "1") };

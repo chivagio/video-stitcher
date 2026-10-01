@@ -82,16 +82,101 @@ pub async fn export(state: tauri::State<'_, WorkerHandle>) -> Result<(), WorkerE
     state.send(WorkerCommand::Export)
 }
 
+/// Begin/continue playing the preview session (PREV-02).
+///
+/// Thin, same contract as [`import`]: post `Play` and return. The worker owns
+/// the paced session loop; the webview only sees the `Transport`/`Position`
+/// events it emits.
+///
+/// # Errors
+///
+/// Returns [`WorkerError::ChannelClosed`] if the worker has already exited.
+#[tauri::command]
+pub async fn play(state: tauri::State<'_, WorkerHandle>) -> Result<(), WorkerError> {
+    state.send(WorkerCommand::Play)
+}
+
+/// Pause the preview session at the current position (PREV-02).
+///
+/// Thin, same contract as [`play`].
+///
+/// # Errors
+///
+/// Returns [`WorkerError::ChannelClosed`] if the worker has already exited.
+#[tauri::command]
+pub async fn pause(state: tauri::State<'_, WorkerHandle>) -> Result<(), WorkerError> {
+    state.send(WorkerCommand::Pause)
+}
+
+/// Coalesced-seek to an absolute frame index (PREV-02).
+///
+/// Thin, same contract as [`play`]. The frame is typed `u64` (no strings) and
+/// clamped inside the worker against the loaded source (T-02-04).
+///
+/// # Errors
+///
+/// Returns [`WorkerError::ChannelClosed`] if the worker has already exited.
+#[tauri::command]
+pub async fn seek(state: tauri::State<'_, WorkerHandle>, frame: u64) -> Result<(), WorkerError> {
+    state.send(WorkerCommand::Seek { frame })
+}
+
+/// Validate a `StepFrame` direction at the command boundary.
+///
+/// Only `-1` and `+1` are valid; anything else is rejected before it can reach
+/// the decoder (T-02-04). Extracted as a pure function so the boundary check is
+/// unit-testable without a Tauri `State`.
+fn validate_step_direction(direction: i32) -> Result<(), WorkerError> {
+    if direction == 1 || direction == -1 {
+        Ok(())
+    } else {
+        Err(WorkerError::Unsupported {
+            operation: format!("step_frame direction {direction} (expected -1 or +1)"),
+        })
+    }
+}
+
+/// Step exactly `direction` frames (expected `-1` or `+1`; PREV-02).
+///
+/// Validates `direction` at the command boundary — any value other than ±1 is
+/// rejected with [`WorkerError::Unsupported`] rather than reaching the decoder
+/// (T-02-04) — then posts a `StepFrame`. Thin: names no engine type.
+///
+/// # Errors
+///
+/// Returns [`WorkerError::Unsupported`] for a direction other than ±1, or
+/// [`WorkerError::ChannelClosed`] if the worker has already exited.
+#[tauri::command]
+pub async fn step_frame(
+    state: tauri::State<'_, WorkerHandle>,
+    direction: i32,
+) -> Result<(), WorkerError> {
+    validate_step_direction(direction)?;
+    state.send(WorkerCommand::StepFrame { direction })
+}
+
+/// Enable/disable full-clip looping (PREV-02).
+///
+/// Thin, same contract as [`play`].
+///
+/// # Errors
+///
+/// Returns [`WorkerError::ChannelClosed`] if the worker has already exited.
+#[tauri::command]
+pub async fn set_loop(
+    state: tauri::State<'_, WorkerHandle>,
+    enabled: bool,
+) -> Result<(), WorkerError> {
+    state.send(WorkerCommand::SetLoop(enabled))
+}
+
 /// A command from the UI to the engine worker.
 ///
 /// `Clone + Send + 'static` — the compile-time assertion in `events.rs`
 /// enforces it, because a command is moved through the worker channel.
-// The Tauri command handlers that construct these variants land in Plan 04
-// (they need the webview), and the worker loop that consumes them lands in
-// Task 2 of this plan. A subset of variants has no constructor until then, so
-// dead-code analysis flags them even in test builds (the tests exercise only
-// Import/Preview/Shutdown). The suppression is narrowly scoped to this enum
-// with this justification and disappears once the worker and handlers exist.
+// The Tauri command handlers construct these variants; the worker loop consumes
+// them. A subset is still dead-code-flagged in test builds that do not exercise
+// the binary path, so the suppression stays narrowly scoped to this enum.
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
@@ -117,6 +202,28 @@ pub enum WorkerCommand {
     /// means the UI never invents a parallel input vocabulary and there is no
     /// direct pose-control call from a command handler.
     Intent(reco_control::ControlIntent),
+
+    /// Begin/continue playing the preview session (PREV-02).
+    Play,
+
+    /// Pause the preview session at the current position (PREV-02).
+    Pause,
+
+    /// Coalesced seek to `frame` (PREV-02). The worker stores this as the single
+    /// pending seek and executes at most one `source.seek` per session tick.
+    Seek {
+        /// Target frame index (0-based). Clamped to the loaded source's total.
+        frame: u64,
+    },
+
+    /// Step exactly `direction` frames (expected `-1` or `+1`; PREV-02).
+    StepFrame {
+        /// Frame delta; only `-1` and `+1` are accepted (T-02-04).
+        direction: i32,
+    },
+
+    /// Enable/disable full-clip looping (PREV-02).
+    SetLoop(bool),
 
     /// Stop the worker loop and return.
     Shutdown,
@@ -200,5 +307,40 @@ mod tests {
         // `State<WorkerHandle>` requires it be `Send + Sync`.
         fn assert_send_sync<T: Send + Sync + Clone>() {}
         assert_send_sync::<WorkerHandle>();
+    }
+
+    #[test]
+    fn new_transport_commands_round_trip_through_the_channel() {
+        let (tx, rx) = mpsc::channel();
+        let handle = WorkerHandle::new(tx);
+        handle.send(WorkerCommand::Play).unwrap();
+        handle.send(WorkerCommand::Pause).unwrap();
+        handle.send(WorkerCommand::Seek { frame: 42 }).unwrap();
+        handle
+            .send(WorkerCommand::StepFrame { direction: 1 })
+            .unwrap();
+        handle.send(WorkerCommand::SetLoop(true)).unwrap();
+        assert_eq!(rx.recv().unwrap(), WorkerCommand::Play);
+        assert_eq!(rx.recv().unwrap(), WorkerCommand::Pause);
+        assert_eq!(rx.recv().unwrap(), WorkerCommand::Seek { frame: 42 });
+        assert_eq!(
+            rx.recv().unwrap(),
+            WorkerCommand::StepFrame { direction: 1 }
+        );
+        assert_eq!(rx.recv().unwrap(), WorkerCommand::SetLoop(true));
+    }
+
+    #[test]
+    fn step_direction_validation_accepts_only_plus_minus_one() {
+        assert!(validate_step_direction(1).is_ok());
+        assert!(validate_step_direction(-1).is_ok());
+        for bad in [0, 2, -2, 30, i32::MAX, i32::MIN] {
+            match validate_step_direction(bad) {
+                Err(WorkerError::Unsupported { operation }) => {
+                    assert!(operation.contains("expected -1 or +1"), "op: {operation}");
+                }
+                other => panic!("expected Unsupported for {bad}, got {other:?}"),
+            }
+        }
     }
 }

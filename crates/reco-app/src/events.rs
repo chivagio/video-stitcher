@@ -71,6 +71,29 @@ pub enum WorkerEvent {
     /// renders `error.to_string()`, preserving the typed value for any other
     /// consumer.
     Failed(WorkerError),
+
+    /// The worker's authoritative playback position changed (PREV-02).
+    ///
+    /// Emitted after each advanced frame and on every completed seek. The UI
+    /// mirrors this; it never owns the position (UI-SPEC Interaction rule 1).
+    Position {
+        /// Current frame index (0-based).
+        frame: u64,
+        /// Total frames in the source, if known (drives the timeline extent).
+        total: Option<u64>,
+        /// Exact frame-rate rational, if the source reported one.
+        fps_rational: Option<(i32, i32)>,
+    },
+
+    /// The worker's authoritative transport state changed (PREV-02).
+    ///
+    /// Emitted on play / pause / loop toggle / end-of-source.
+    Transport {
+        /// Playing / paused / ended.
+        state: crate::transport::TransportState,
+        /// Whether full-clip looping is enabled.
+        loop_enabled: bool,
+    },
 }
 
 /// The UI-facing shape of an event-log line (UI-SPEC Event Log Contract).
@@ -106,6 +129,26 @@ impl WorkerEvent {
             WorkerEvent::Failed(error) => LogLine {
                 level: Level::Error,
                 message: error.to_string(),
+            },
+            // The state-carrying variants are not log lines; project them to a
+            // concise INFO summary so a log-only consumer (or a headless gate
+            // report) still sees them without inventing text on the JS side.
+            WorkerEvent::Position { frame, total, .. } => LogLine {
+                level: Level::Info,
+                message: match total {
+                    Some(total) => format!("position: frame {frame}/{total}"),
+                    None => format!("position: frame {frame}"),
+                },
+            },
+            WorkerEvent::Transport {
+                state,
+                loop_enabled,
+            } => LogLine {
+                level: Level::Info,
+                message: format!(
+                    "transport: {state:?}, loop {}",
+                    if *loop_enabled { "on" } else { "off" }
+                ),
             },
         }
     }
@@ -280,5 +323,58 @@ mod tests {
         );
         let back: LogLine = serde_json::from_str(&json).unwrap();
         assert_eq!(line, back);
+    }
+
+    #[test]
+    fn position_event_roundtrips_through_serde() {
+        let event = WorkerEvent::Position {
+            frame: 42,
+            total: Some(300),
+            fps_rational: Some((30000, 1001)),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(
+            json.contains("\"kind\":\"position\""),
+            "unexpected json: {json}"
+        );
+        let back: WorkerEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(event, back);
+    }
+
+    #[test]
+    fn transport_event_roundtrips_with_snake_case_state() {
+        let event = WorkerEvent::Transport {
+            state: crate::transport::TransportState::Playing,
+            loop_enabled: true,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(
+            json.contains("\"kind\":\"transport\""),
+            "unexpected json: {json}"
+        );
+        assert!(
+            json.contains("\"state\":\"playing\""),
+            "unexpected json: {json}"
+        );
+        let back: WorkerEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(event, back);
+    }
+
+    #[test]
+    fn state_events_project_to_neutral_log_lines() {
+        let pos = WorkerEvent::Position {
+            frame: 5,
+            total: Some(100),
+            fps_rational: None,
+        };
+        assert_eq!(pos.to_log_line().level, Level::Info);
+        assert_eq!(pos.to_log_line().message, "position: frame 5/100");
+
+        let tr = WorkerEvent::Transport {
+            state: crate::transport::TransportState::Paused,
+            loop_enabled: false,
+        };
+        assert_eq!(tr.to_log_line().level, Level::Info);
+        assert!(tr.to_log_line().message.contains("transport"));
     }
 }

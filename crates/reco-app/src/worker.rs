@@ -113,6 +113,23 @@ impl EventSink {
         log::error!("worker failure: {error}");
         let _ = self.tx.send(WorkerEvent::Failed(error));
     }
+
+    /// Emit the authoritative playback position (PREV-02).
+    fn position(&self, frame: u64, total: Option<u64>, fps_rational: Option<(i32, i32)>) {
+        let _ = self.tx.send(WorkerEvent::Position {
+            frame,
+            total,
+            fps_rational,
+        });
+    }
+
+    /// Emit the authoritative transport state (PREV-02).
+    fn transport(&self, state: crate::transport::TransportState, loop_enabled: bool) {
+        let _ = self.tx.send(WorkerEvent::Transport {
+            state,
+            loop_enabled,
+        });
+    }
 }
 
 /// The recovery action a classified surface error demands (FOUND-05).
@@ -156,9 +173,30 @@ pub trait EngineBackend: Send {
     /// Load the hardcoded clips and calibration into the session.
     fn import(&mut self, events: &EventSink) -> Result<(), WorkerError>;
 
-    /// Run the live stitched-frame loop until `interrupted` is set or the
-    /// source is exhausted.
-    fn preview(&mut self, events: &EventSink, interrupted: &AtomicBool) -> Result<(), WorkerError>;
+    /// Begin a preview **session**: build/ensure the renderer, paint the idle
+    /// frame, and start the transport, but do NOT run a frame loop.
+    ///
+    /// Replaces Phase 1's one-shot [`preview`](Self::preview) job: the worker
+    /// loop then drives [`tick_session`](Self::tick_session) once per iteration
+    /// so commands queued during a session are drained at the top of every tick
+    /// (RESEARCH Pattern 3).
+    fn begin_preview(&mut self, events: &EventSink) -> Result<(), WorkerError>;
+
+    /// Advance the active session by one tick: coalesced seek, paced decode,
+    /// pose tick + FOV, present, and events.
+    ///
+    /// Must be a no-op when [`session_active`](Self::session_active) is false.
+    fn tick_session(&mut self, events: &EventSink) -> Result<(), WorkerError>;
+
+    /// End the active session and return to idle.
+    fn end_preview(&mut self, events: &EventSink);
+
+    /// Whether a preview session is currently active.
+    fn session_active(&self) -> bool;
+
+    /// The session's transport state machine (authoritative playback position,
+    /// state, loop, and coalesced seek).
+    fn transport(&mut self) -> &mut crate::transport::Transport;
 
     /// Run the hardcoded file→file export until `interrupted` is set.
     fn export(&mut self, events: &EventSink, interrupted: &AtomicBool) -> Result<(), WorkerError>;
@@ -200,11 +238,42 @@ fn handle_command<B: EngineBackend>(
             Err(e) => events.failed(e),
         },
         WorkerCommand::Preview => {
-            interrupted.store(false, Ordering::SeqCst);
-            match backend.preview(events, interrupted) {
-                Ok(()) => events.info("preview stopped"),
-                Err(e) => events.failed(e),
+            // "Start preview": begin a session and start playing. The worker
+            // loop drives ticks from here (Pattern 3); no frame loop runs inside
+            // this handler.
+            if let Err(e) = backend.begin_preview(events) {
+                events.failed(e);
+                return true;
             }
+            backend.transport().play();
+            emit_transport(backend, events);
+        }
+        WorkerCommand::Play => {
+            if !backend.session_active()
+                && let Err(e) = backend.begin_preview(events)
+            {
+                events.failed(e);
+                return true;
+            }
+            backend.transport().play();
+            emit_transport(backend, events);
+        }
+        WorkerCommand::Pause => {
+            backend.transport().pause();
+            emit_transport(backend, events);
+        }
+        WorkerCommand::Seek { frame } => {
+            // Coalesced: store the pending target; the tick performs one seek.
+            backend.transport().request_seek(frame);
+        }
+        WorkerCommand::StepFrame { direction } => {
+            backend.transport().step(direction);
+            let frame = backend.transport().frame();
+            backend.transport().request_seek(frame);
+        }
+        WorkerCommand::SetLoop(enabled) => {
+            backend.transport().set_loop(enabled);
+            emit_transport(backend, events);
         }
         WorkerCommand::Export => {
             interrupted.store(false, Ordering::SeqCst);
@@ -234,10 +303,27 @@ fn handle_command<B: EngineBackend>(
     true
 }
 
-/// The worker loop: drain pending commands (FIFO), then block when idle.
+/// Emit a [`WorkerEvent::Transport`] from the backend's current transport.
+fn emit_transport<B: EngineBackend>(backend: &mut B, events: &EventSink) {
+    let transport = backend.transport();
+    let state = transport.state();
+    let loop_enabled = transport.loop_enabled();
+    events.transport(state, loop_enabled);
+}
+
+/// The worker loop: drain pending commands (FIFO), tick an active session, then
+/// block when idle.
 ///
 /// Generic over the backend and driven only by a receiver + an event sink, so
 /// it is unit-testable with a mock backend and no GPU.
+///
+/// # Session ticking (RESEARCH Pattern 3)
+///
+/// When a preview session is active the loop **never blocks on `recv`** — it
+/// drains every iteration and then advances one session tick, so a transport or
+/// pose command issued mid-playback is observed BETWEEN two ticks (the test
+/// `command_is_seen_between_ticks` pins this). Only when no session is active
+/// does the loop block, so an idle worker never spins.
 fn worker_loop<B: EngineBackend>(
     rx: Receiver<WorkerCommand>,
     events: EventSink,
@@ -281,6 +367,19 @@ fn worker_loop<B: EngineBackend>(
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => return,
             }
+        }
+
+        // An active session is paced by the loop: advance exactly one tick,
+        // then loop again to re-drain (never block — that is what lets a
+        // Pause/Seek/Intent land between frames).
+        if backend.session_active() {
+            if let Err(e) = backend.tick_session(&events) {
+                events.failed(e);
+                // A failed tick must not leave the loop spinning on a session
+                // that cannot advance: end it and return to the idle path.
+                backend.end_preview(&events);
+            }
+            continue;
         }
 
         // A job just ran; loop again to pick up any Shutdown queued during it
@@ -419,6 +518,15 @@ pub struct GpuEngineBackend {
     blend_width: f32,
     /// Rig tilt in radians (from the loaded calibration).
     rig_tilt: f32,
+    /// The active preview session's transport, or `None` when idle.
+    ///
+    /// `Some` while a session is active; [`Self::session_active`] keys off it.
+    session: Option<crate::transport::Transport>,
+    /// Whether the first presented frame of the current session still owes the
+    /// A1 marker line (and the one-shot debug device-loss affordance).
+    first_frame_marker_pending: bool,
+    /// Wall-clock time of the last presented frame, for pacing the tick.
+    last_frame_time: std::time::Instant,
     /// The loaded calibration, if `Import` has run.
     calibration: Option<reco_core::calibration::MatchCalibration>,
     /// The open decode source, if `Import` has run.
@@ -518,6 +626,9 @@ impl GpuEngineBackend {
             viewport,
             blend_width: 0.05,
             rig_tilt: 0.0,
+            session: None,
+            first_frame_marker_pending: true,
+            last_frame_time: std::time::Instant::now(),
             calibration: None,
             source: None,
             input_size: None,
@@ -613,6 +724,16 @@ impl GpuEngineBackend {
         )
         .map_err(|e| WorkerError::Engine(e.to_string()))
     }
+
+    /// The active session's total frame count, if any.
+    fn session_total(&self) -> Option<u64> {
+        self.session.as_ref().and_then(|t| t.total_frames())
+    }
+
+    /// The active session's frame-rate rational, if any.
+    fn session_fps_rational(&self) -> Option<(i32, i32)> {
+        self.session.as_ref().and_then(|t| t.fps_rational())
+    }
 }
 
 /// Install the FOUND-05 device-lost callback and uncaptured-error handler.
@@ -671,23 +792,39 @@ impl EngineBackend for GpuEngineBackend {
         Ok(())
     }
 
-    fn preview(&mut self, events: &EventSink, interrupted: &AtomicBool) -> Result<(), WorkerError> {
+    fn begin_preview(&mut self, events: &EventSink) -> Result<(), WorkerError> {
         // Clone (not `take`) the calibration: the renderer takes it by value,
         // but a preview must be repeatable without re-importing, so the loaded
-        // calibration stays owned by the backend (Plan 04 re-runs preview from
-        // the UI). `MatchCalibration` is `Clone`.
+        // calibration stays owned by the backend.
         let (cal, (in_w, in_h)) = match (self.calibration.clone(), self.input_size) {
             (Some(cal), Some(size)) => (cal, size),
             _ => return Err(WorkerError::NotImported),
         };
 
         // Build the renderer if recovery has not already done so, and cache the
-        // inputs so a device loss during preview can rebuild it without
+        // inputs so a device loss during the session can rebuild it without
         // re-importing (FOUND-05).
         if self.renderer.is_none() {
             self.renderer = Some(self.build_renderer(cal.clone(), in_w, in_h)?);
         }
         self.renderer_input = Some((cal, in_w, in_h));
+
+        // Build the transport from the loaded source's timing metadata.
+        let (fps, fps_rational, total_frames) = {
+            let source = self.source.as_ref().ok_or(WorkerError::NotImported)?;
+            let info = source.info();
+            (info.fps, info.fps_rational, source.total_frames())
+        };
+        let transport = crate::transport::Transport::new(fps, fps_rational, total_frames);
+        events.position(
+            transport.frame(),
+            transport.total_frames(),
+            transport.fps_rational(),
+        );
+        events.transport(transport.state(), transport.loop_enabled());
+        self.session = Some(transport);
+        self.first_frame_marker_pending = true;
+        self.last_frame_time = std::time::Instant::now();
 
         // UI-SPEC E3: paint the idle/clear frame in the reserved region before
         // the first stitched frame, so the region is never a black hole.
@@ -703,112 +840,204 @@ impl EngineBackend for GpuEngineBackend {
             Err(e) => events.info(format!("idle frame skipped: {e}")),
         }
 
-        events.info("preview started");
-        let mut frames: u64 = 0;
-        // Frame loop: decode → render into the presenter's surface → present.
-        // The loop checks `interrupted` every frame so a `Shutdown` queued by
-        // the drain-at-top-of-loop is honored promptly (D-07).
-        while !interrupted.load(Ordering::SeqCst) {
-            // A device loss flagged mid-preview is recovered here, between
-            // frames (never while a SurfaceTexture is alive — we are before the
-            // acquire).
-            if self.recovery_pending() {
-                self.recover(events)?;
-            }
-            let pair = match self
-                .source
-                .as_mut()
-                .ok_or(WorkerError::NotImported)?
-                .next_frame()
-                .map_err(|e| WorkerError::Engine(e.to_string()))?
-            {
-                Some(reco_core::source::StereoFrame::Yuv420p(pair)) => pair,
-                Some(_) => continue,
-                None => {
-                    events.info("preview reached end of source");
-                    break;
-                }
-            };
+        events.info("preview session started");
+        Ok(())
+    }
 
-            let render = self.pose.render_pose(self.rig_tilt);
-            // Compute the outcome first so the `renderer` borrow (of
-            // `self.renderer`) ends before any arm takes `&mut self`
-            // (recovery / device-loss simulation).
-            let outcome = {
-                let renderer = self
-                    .renderer
-                    .as_ref()
-                    .ok_or_else(|| WorkerError::Engine("renderer missing during preview".into()))?;
-                self.presenter.render_frame(
-                    renderer,
-                    &pair.left,
-                    &pair.right,
-                    render.yaw,
-                    render.pitch,
-                )
+    fn tick_session(&mut self, events: &EventSink) -> Result<(), WorkerError> {
+        if self.session.is_none() {
+            return Ok(());
+        }
+
+        // A device loss flagged mid-session is recovered here, between frames
+        // (never while a SurfaceTexture is alive — we are before the acquire).
+        if self.recovery_pending() {
+            self.recover(events)?;
+        }
+
+        // 1. Execute at most one coalesced seek per tick (the
+        //    `FfmpegFileSource::seek` caller-coalescing contract).
+        let pending = self.session.as_mut().and_then(|t| t.take_pending_seek());
+        if let Some(target) = pending {
+            let source = self.source.as_mut().ok_or(WorkerError::NotImported)?;
+            source
+                .seek(target)
+                .map_err(|e| WorkerError::Engine(e.to_string()))?;
+            // The seek may have re-armed the transport; reflect it.
+            if let Some(t) = self.session.as_mut() {
+                t.mark_seeking_done(target);
+            }
+            self.last_frame_time = std::time::Instant::now();
+            // A seek positions the playhead; present the frame at the new
+            // position on this same tick below.
+        }
+
+        let (playing, duration, frame) = {
+            let t = self.session.as_ref().ok_or(WorkerError::NotImported)?;
+            (
+                t.state() == crate::transport::TransportState::Playing,
+                t.frame_duration(),
+                t.frame(),
+            )
+        };
+
+        // 2. Pace: when playing, sleep the remainder of the frame budget before
+        //    decoding, so playback runs at the clip's fps (mirrors the CLI's
+        //    about_to_wait).
+        if playing {
+            let elapsed = self.last_frame_time.elapsed();
+            if elapsed < duration {
+                std::thread::sleep(duration - elapsed);
+            }
+        }
+
+        // 3. Decode the next frame. When playing, use the non-blocking
+        //    try_next_frame so a not-ready decode channel is a no-op; when
+        //    paused-at-a-seek, do a blocking next_frame so the seek shows a
+        //    frame immediately.
+        let seeking = pending.is_some();
+        let pair = {
+            let source = self.source.as_mut().ok_or(WorkerError::NotImported)?;
+            let frame_result = if playing || seeking {
+                if playing {
+                    source
+                        .try_next_frame()
+                        .map_err(|e| WorkerError::Engine(e.to_string()))?
+                } else {
+                    source
+                        .next_frame()
+                        .map_err(|e| WorkerError::Engine(e.to_string()))?
+                }
+            } else {
+                None
             };
-            match outcome {
-                Ok(crate::presenter::FrameOutcome::Presented) => {
-                    frames += 1;
-                    if frames == 1 {
-                        // The A1 marker: reaching this line proves the worker
-                        // decoded a real frame pair, rendered through the shared
-                        // device, and presented it into the native child view
-                        // (Plan 05's gate report keys on this).
-                        events.info(
-                            "A1 verdict: engine worker presented a stitched frame \
-                             into the native child view",
-                        );
-                        // FOUND-05 debug affordance: when enabled, force a
-                        // device loss right after the first real frame so a
-                        // gate run can observe recovery. Off unless the env var
-                        // is set; never wired to the UI (UI-SPEC rule 4).
-                        if crate::hardcoded::debug_device_loss_enabled() {
-                            events.info("debug device-loss simulation enabled — destroying device");
-                            self.simulate_device_loss(events)?;
-                            // Recover explicitly here rather than relying on the
-                            // loop's next recovery check: the simulation may be
-                            // the last thing that happens before the worker blocks
-                            // on `recv()`, in which case the device-lost flag
-                            // would stay set and recovery would never be observed
-                            // (nor the device rebuilt). `recover` is a no-op when
-                            // the flag is clear, and `destroy()` guarantees it is
-                            // set by the time this returns.
-                            self.device_lost.store(true, Ordering::SeqCst);
-                            self.recover(events)?;
+            match frame_result {
+                Some(reco_core::source::StereoFrame::Yuv420p(pair)) => Some(pair),
+                Some(_) => None,
+                None => None,
+            }
+        };
+
+        // End-of-source handling: a `None` from a playing source that has
+        // exhausted (or a decode that produced no Yuv pair) ends the session
+        // unless looping.
+        let at_end = playing && pair.is_none();
+        let pair = match pair {
+            Some(p) => p,
+            None => {
+                if at_end {
+                    if self.session.as_ref().is_some_and(|t| t.loop_enabled()) {
+                        // Wrap: request a seek to 0 and keep playing.
+                        if let Some(t) = self.session.as_mut() {
+                            t.request_seek(0);
                         }
+                        return Ok(());
+                    }
+                    events.info("preview reached end of source");
+                    if let Some(t) = self.session.as_mut() {
+                        t.mark_ended();
+                        events.transport(t.state(), t.loop_enabled());
+                    }
+                    self.end_preview(events);
+                }
+                return Ok(());
+            }
+        };
+
+        // 4. Resolve the pose the renderer uses this frame. (Task 02-02/2 adds
+        //    the per-tick pose easing and FOV plumbing; here the pose is the
+        //    rest pose until that lands.)
+        let render = self.pose.render_pose(self.rig_tilt);
+
+        // 5. Render + present.
+        let outcome = {
+            let renderer = self
+                .renderer
+                .as_ref()
+                .ok_or_else(|| WorkerError::Engine("renderer missing during session".into()))?;
+            self.presenter
+                .render_frame(renderer, &pair.left, &pair.right, render.yaw, render.pitch)
+        };
+        match outcome {
+            Ok(crate::presenter::FrameOutcome::Presented) => {
+                self.last_frame_time = std::time::Instant::now();
+                if self.first_frame_marker_pending {
+                    self.first_frame_marker_pending = false;
+                    // The A1 marker: reaching this line proves the worker
+                    // decoded a real frame pair, rendered through the shared
+                    // device, and presented it into the native child view.
+                    events.info(
+                        "A1 verdict: engine worker presented a stitched frame \
+                         into the native child view",
+                    );
+                    if crate::hardcoded::debug_device_loss_enabled() {
+                        events.info("debug device-loss simulation enabled — destroying device");
+                        self.simulate_device_loss(events)?;
+                        self.device_lost.store(true, Ordering::SeqCst);
+                        self.recover(events)?;
                     }
                 }
-                Ok(crate::presenter::FrameOutcome::Skipped { kind }) => {
-                    // Transient: drop this frame, retry next tick (FOUND-05).
-                    debug_assert_eq!(recovery_action(kind), RecoveryAction::SkipFrame);
-                    log::debug!("frame skipped on transient surface error: {kind:?}");
-                }
-                Err(crate::presenter::PresenterError::SurfaceLost { kind }) => {
-                    // Outdated/Lost: recover (drop-frame-before-reconfigure is
-                    // guaranteed because render_frame returns only after the
-                    // failed acquire — no SurfaceTexture is alive).
-                    events.info(format!("surface error ({kind:?}); recovering"));
-                    self.handle_recovery(kind, events)?;
-                }
-                Err(crate::presenter::PresenterError::NotConfigured) => {
-                    return Err(WorkerError::Engine(
-                        "presenter is not configured during preview".to_string(),
-                    ));
-                }
-                Err(e) => {
-                    // Other render failure: surface the typed error (do not
-                    // present a black frame, do not panic).
-                    return Err(WorkerError::Engine(e.to_string()));
+                // Advance the transport and emit the new position.
+                if playing {
+                    if let Some(t) = self.session.as_mut() {
+                        t.on_frame_advanced();
+                        let frame = t.frame();
+                        let total = t.total_frames();
+                        let fps_rational = t.fps_rational();
+                        let ended = t.state() == crate::transport::TransportState::Ended;
+                        if ended {
+                            events.transport(t.state(), t.loop_enabled());
+                        }
+                        events.position(frame, total, fps_rational);
+                        if ended {
+                            self.session = None;
+                        }
+                    }
+                } else {
+                    events.position(frame, self.session_total(), self.session_fps_rational());
                 }
             }
-        }
-        if interrupted.load(Ordering::SeqCst) {
-            events.info("preview interrupted");
-        } else {
-            events.info(format!("preview presented {frames} frame(s)"));
+            Ok(crate::presenter::FrameOutcome::Skipped { kind }) => {
+                // Transient: drop this frame, retry next tick (FOUND-05).
+                debug_assert_eq!(recovery_action(kind), RecoveryAction::SkipFrame);
+                log::debug!("frame skipped on transient surface error: {kind:?}");
+            }
+            Err(crate::presenter::PresenterError::SurfaceLost { kind }) => {
+                // Outdated/Lost: recover (drop-frame-before-reconfigure is
+                // guaranteed because render_frame returns only after the
+                // failed acquire — no SurfaceTexture is alive).
+                events.info(format!("surface error ({kind:?}); recovering"));
+                self.handle_recovery(kind, events)?;
+            }
+            Err(crate::presenter::PresenterError::NotConfigured) => {
+                return Err(WorkerError::Engine(
+                    "presenter is not configured during session".to_string(),
+                ));
+            }
+            Err(e) => {
+                // Other render failure: surface the typed error (do not
+                // present a black frame, do not panic).
+                return Err(WorkerError::Engine(e.to_string()));
+            }
         }
         Ok(())
+    }
+
+    fn end_preview(&mut self, _events: &EventSink) {
+        self.session = None;
+    }
+
+    fn session_active(&self) -> bool {
+        self.session.is_some()
+    }
+
+    fn transport(&mut self) -> &mut crate::transport::Transport {
+        // The caller (`handle_command`) only reaches this for transport
+        // commands, which are only meaningful with a session. Lazily create a
+        // session-less transport so the borrow is total; it is replaced by
+        // `begin_preview` when a real session starts.
+        self.session
+            .get_or_insert_with(|| crate::transport::Transport::new(30.0, None, None))
     }
 
     fn export(&mut self, events: &EventSink, interrupted: &AtomicBool) -> Result<(), WorkerError> {
@@ -968,9 +1197,18 @@ mod tests {
     use std::sync::mpsc::RecvTimeoutError;
 
     /// A GPU-free backend that records the order of the operations it saw.
+    ///
+    /// It models the session as: `session_active` while a transport exists;
+    /// each `tick_session` advances one tick, and (for the mock) a fabricated
+    /// total frame count so `on_frame_advanced` reaches `Ended`
+    /// deterministically.
     struct MockBackend {
         ops: Arc<std::sync::Mutex<Vec<&'static str>>>,
         pose: Arc<std::sync::Mutex<reco_control::pose_control::PoseControl>>,
+        /// The mock session transport, when a session is active.
+        session: Option<crate::transport::Transport>,
+        /// Total frames the mock source reports (drives the end transition).
+        total_frames: Option<u64>,
         import_fails: bool,
         /// Mirrors the real backend's device-lost flag (FOUND-05).
         lost: Arc<AtomicBool>,
@@ -983,6 +1221,8 @@ mod tests {
                 pose: Arc::new(std::sync::Mutex::new(
                     reco_control::pose_control::PoseControl::with_defaults(),
                 )),
+                session: None,
+                total_frames: Some(5),
                 import_fails: false,
                 lost: Arc::new(AtomicBool::new(false)),
             }
@@ -1003,14 +1243,44 @@ mod tests {
             Ok(())
         }
 
-        fn preview(
-            &mut self,
-            _events: &EventSink,
-            interrupted: &AtomicBool,
-        ) -> Result<(), WorkerError> {
-            self.record("preview");
-            interrupted.store(true, Ordering::SeqCst);
+        fn begin_preview(&mut self, events: &EventSink) -> Result<(), WorkerError> {
+            self.record("begin_preview");
+            let t = crate::transport::Transport::new(30.0, Some((30, 1)), self.total_frames);
+            events.position(t.frame(), t.total_frames(), t.fps_rational());
+            events.transport(t.state(), t.loop_enabled());
+            self.session = Some(t);
             Ok(())
+        }
+
+        fn tick_session(&mut self, _events: &EventSink) -> Result<(), WorkerError> {
+            self.record("tick");
+            let Some(t) = self.session.as_mut() else {
+                return Ok(());
+            };
+            // Advance the transport; if it reaches Ended (loop off), the session
+            // ends so the worker loop returns to a blocking recv.
+            if t.state() == crate::transport::TransportState::Playing {
+                t.on_frame_advanced();
+                let ended = t.state() == crate::transport::TransportState::Ended;
+                if ended {
+                    self.session = None;
+                }
+            }
+            Ok(())
+        }
+
+        fn end_preview(&mut self, _events: &EventSink) {
+            self.record("end_preview");
+            self.session = None;
+        }
+
+        fn session_active(&self) -> bool {
+            self.session.is_some()
+        }
+
+        fn transport(&mut self) -> &mut crate::transport::Transport {
+            self.session
+                .get_or_insert_with(|| crate::transport::Transport::new(30.0, None, None))
         }
 
         fn export(
@@ -1301,6 +1571,95 @@ mod tests {
             &*ops.lock().unwrap(),
             &["import", "intent", "export", "shutdown"]
         );
+    }
+
+    #[test]
+    fn command_is_seen_between_ticks() {
+        // RESEARCH Pattern 3: a command issued while a session is active must be
+        // observed by the backend BETWEEN two session ticks, not after the
+        // session ends. We start a session, inject an Intent mid-session, and
+        // assert the recorded op sequence shows a "tick" after the "intent".
+        let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut mock = MockBackend::new(Arc::clone(&ops));
+        mock.total_frames = Some(1_000_000); // effectively never ends during the test
+        let (worker, _events) = EngineWorker::spawn(mock);
+        let handle = worker.handle();
+        handle.send(WorkerCommand::Import).unwrap();
+        handle.send(WorkerCommand::Preview).unwrap();
+
+        // Wait until at least two ticks have run.
+        let start = std::time::Instant::now();
+        while start.elapsed() < Duration::from_secs(2) {
+            let recorded = ops.lock().unwrap().clone();
+            if recorded.iter().filter(|o| **o == "tick").count() >= 2 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        // Inject the command mid-session.
+        handle
+            .send(WorkerCommand::Intent(reco_control::ControlIntent::Pose(
+                reco_control::PoseIntent::DeltaYawRad(0.1),
+            )))
+            .unwrap();
+        // Wait until it is observed, with at least one more tick after it.
+        let mut saw_between = false;
+        let start = std::time::Instant::now();
+        while start.elapsed() < Duration::from_secs(2) {
+            let recorded = ops.lock().unwrap().clone();
+            if let Some(idx) = recorded.iter().position(|o| *o == "intent") {
+                let after = recorded[idx + 1..].contains(&"tick");
+                if after {
+                    saw_between = true;
+                    break;
+                }
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        handle.send(WorkerCommand::Shutdown).unwrap();
+        let _ = worker.join(Duration::from_secs(2));
+        assert!(
+            saw_between,
+            "a command must be observed between ticks, not after the session: {:?}",
+            ops.lock().unwrap()
+        );
+    }
+
+    #[test]
+    fn ended_session_returns_to_blocking_recv() {
+        // A session that reaches end-of-source (loop off) must end, so the
+        // worker loop returns to the blocking recv path (no spin). We assert the
+        // session ran to the end, then a Shutdown still joins promptly.
+        let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut mock = MockBackend::new(Arc::clone(&ops));
+        mock.total_frames = Some(3); // ends after a few ticks
+        let (worker, _events) = EngineWorker::spawn(mock);
+        let handle = worker.handle();
+        handle.send(WorkerCommand::Import).unwrap();
+        handle.send(WorkerCommand::Preview).unwrap();
+
+        let start = std::time::Instant::now();
+        let mut ended = false;
+        while start.elapsed() < Duration::from_secs(2) {
+            let recorded = ops.lock().unwrap().clone();
+            if recorded.iter().filter(|o| **o == "tick").count() >= 3 {
+                ended = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert!(
+            ended,
+            "session did not reach the end: {:?}",
+            ops.lock().unwrap()
+        );
+        // The worker is now idle (blocked on recv); Shutdown must join promptly.
+        handle.send(WorkerCommand::Shutdown).unwrap();
+        let t0 = std::time::Instant::now();
+        worker
+            .join(Duration::from_secs(2))
+            .expect("worker joins after an ended session");
+        assert!(t0.elapsed() < Duration::from_secs(2));
     }
 
     #[test]

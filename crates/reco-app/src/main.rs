@@ -27,6 +27,7 @@ mod commands;
 mod events;
 mod hardcoded;
 mod presenter;
+mod transport;
 mod worker;
 
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -58,7 +59,12 @@ fn main() -> anyhow::Result<()> {
         .invoke_handler(tauri::generate_handler![
             commands::import,
             commands::preview,
-            commands::export
+            commands::export,
+            commands::play,
+            commands::pause,
+            commands::seek,
+            commands::step_frame,
+            commands::set_loop
         ])
         .setup(|app| {
             if let Err(e) = run_skeleton(app) {
