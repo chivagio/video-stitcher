@@ -1510,8 +1510,8 @@ impl EngineBackend for GpuEngineBackend {
                 events.info(format!("presenter switched to {}", chosen.name()));
                 events.presenter(chosen, None);
             }
-            // Selected a different presenter than requested without a typed error
-            // (e.g. the requested step was already the active one's weaker peer).
+            // The requested kind failed with fall-through but a weaker kind
+            // succeeded: report the fallback without a WARN.
             None => {
                 events.info(format!(
                     "presenter override to {} resolved to {}",
