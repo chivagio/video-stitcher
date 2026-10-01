@@ -1480,10 +1480,8 @@ impl EngineBackend for GpuEngineBackend {
         // Try the requested step and every weaker step after it. A non-fall-through
         // error is fatal to the attempt and is reported as-is.
         for candidate in &crate::presenter::PRESENTER_CHAIN[start..] {
-            if *candidate == self.active_presenter() {
-                attempts.push((*candidate, Ok(())));
-                break;
-            }
+            // install_presenter already returns Ok(()) when the candidate is
+            // already active, so no explicit check is needed here.
             let result = self.install_presenter(*candidate);
             let fallthrough = result
                 .as_ref()
