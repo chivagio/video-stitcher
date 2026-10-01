@@ -52,8 +52,22 @@ impl FallbackPresenter {
     }
 
     /// The viewport config for consumers that still want geometry.
-    pub fn viewport_config(&self, blend_width: f32, rig_tilt: f32) -> reco_core::render::viewport::ViewportConfig {
+    pub fn viewport_config(
+        &self,
+        blend_width: f32,
+        rig_tilt: f32,
+    ) -> reco_core::render::viewport::ViewportConfig {
         viewport_config(self.viewport, blend_width, rig_tilt)
+    }
+
+    /// The typed error every rendering operation returns on this target.
+    ///
+    /// GPU-free, so it is unit-testable without a device (the trait methods
+    /// delegate here).
+    pub fn unsupported(&self) -> PresenterError {
+        PresenterError::Unsupported {
+            reason: self.reason.clone(),
+        }
     }
 }
 
@@ -65,9 +79,7 @@ impl SurfacePresenter for FallbackPresenter {
         _width: u32,
         _height: u32,
     ) -> Result<(), PresenterError> {
-        Err(PresenterError::Unsupported {
-            reason: self.reason.clone(),
-        })
+        Err(self.unsupported())
     }
 
     fn render_frame(
@@ -78,9 +90,7 @@ impl SurfacePresenter for FallbackPresenter {
         _yaw: f32,
         _pitch: f32,
     ) -> Result<(), PresenterError> {
-        Err(PresenterError::Unsupported {
-            reason: self.reason.clone(),
-        })
+        Err(self.unsupported())
     }
 
     fn resize(&mut self, width: u32, height: u32) -> Result<(), PresenterError> {
@@ -111,8 +121,14 @@ mod tests {
         // `resize` is allowed to succeed (it is layout only) ...
         assert!(presenter.resize(1024, 768).is_ok());
         assert_eq!(presenter.viewport().width, 1024);
-        // ... but every rendering operation reports Unsupported.
-        assert!(!presenter.reason().is_empty());
+        // ... but every rendering operation reports a typed `Unsupported`.
+        match presenter.unsupported() {
+            PresenterError::Unsupported { reason } => {
+                assert!(!reason.is_empty());
+                assert!(reason.contains("Wayland"));
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
     }
 
     #[test]

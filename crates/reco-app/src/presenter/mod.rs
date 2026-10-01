@@ -43,6 +43,19 @@ pub mod x11;
 
 pub mod fallback;
 
+/// The platform-native presenter selected at compile time.
+///
+/// `#[cfg]`-gated by target — never a runtime `match target_os`
+/// (CONVENTIONS.md / ARCHITECTURE.md). Windows/macOS arm in as those impls
+/// land; targets without a native child-view impl fall back to
+/// [`fallback::FallbackPresenter`] (D-05).
+#[cfg(all(unix, not(target_os = "macos")))]
+pub type PlatformPresenter = x11::X11Presenter;
+
+/// The platform-native presenter on targets with no native child-view impl.
+#[cfg(not(all(unix, not(target_os = "macos"))))]
+pub type PlatformPresenter = fallback::FallbackPresenter;
+
 /// Height in logical pixels of the webview control row (UI-SPEC).
 pub const CONTROL_ROW_HEIGHT: u32 = 48;
 /// Height in logical pixels of the webview event/status log pane (UI-SPEC).
