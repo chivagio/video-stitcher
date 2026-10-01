@@ -53,6 +53,11 @@ fn main() -> anyhow::Result<()> {
     init_tracing();
 
     tauri::Builder::default()
+        .invoke_handler(tauri::generate_handler![
+            commands::import,
+            commands::preview,
+            commands::export
+        ])
         .setup(|app| {
             if let Err(e) = run_skeleton(app) {
                 // Surface the exact A1/A3 outcome rather than masking it: this
@@ -115,8 +120,15 @@ fn run_skeleton(app: &mut tauri::App) -> Result<(), SkeletonError> {
 /// Forward typed [`worker::WorkerEvent`]s to the webview on an async task.
 ///
 /// Drains the worker's event channel on Tauri's async runtime and emits each
-/// event under the `"worker-event"` event name. The frontend (Plan 04) listens
-/// with `listen("worker-event", ...)` and appends log lines.
+/// event, projected to the UI-facing [`events::LogLine`] shape, under the
+/// `"worker-event"` event name. The frontend (`ui/main.ts`) listens with
+/// `listen("worker-event", ...)` and appends log lines.
+///
+/// The projection to [`events::LogLine`] keeps the frontend from reaching into
+/// the internally-tagged `WorkerEvent` enum: it reads a flat
+/// `{ level, message }` and never invents text. The bridge never blocks the
+/// event loop — `spawn_blocking` runs the blocking `recv` off the async
+/// scheduler, and `emit` is a non-blocking fan-out.
 #[cfg(all(unix, not(target_os = "macos")))]
 fn install_event_bridge(
     app: tauri::AppHandle,
@@ -126,7 +138,8 @@ fn install_event_bridge(
         // `recv` blocks until an event arrives or the worker drops the sender
         // (at shutdown); both cases end the loop cleanly.
         while let Ok(event) = events.recv() {
-            if let Err(e) = tauri::Emitter::emit(&app, "worker-event", &event) {
+            let line = event.to_log_line();
+            if let Err(e) = tauri::Emitter::emit(&app, "worker-event", &line) {
                 log::warn!("failed to emit worker event: {e}");
             }
         }

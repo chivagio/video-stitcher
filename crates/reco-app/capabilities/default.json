@@ -1,0 +1,8 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Minimal Phase 1 capability. It grants only Tauri's core defaults (needed by the webview to run and to listen for worker events) and deliberately enables NO plugin — no shell, fs, http, dialog, or opener. The webview reaches the engine only through the three thin commands (import/preview/export), which are always callable because they are app commands, not plugin permissions (D-06; security: Elevation of Privilege).",
+  "windows": ["main"],
+  "webviews": ["chrome"],
+  "permissions": ["core:default"]
+}

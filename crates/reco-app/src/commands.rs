@@ -5,9 +5,9 @@
 //! Every UI→engine interaction crosses an [`std::sync::mpsc`](std::sync::mpsc)
 //! channel as a typed [`WorkerCommand`]. The `#[tauri::command]` handlers (Plan
 //! 04) are **thin**: they validate their arguments, build a [`WorkerCommand`],
-//! and call [`WorkerHandle::send`]. They never call `StitchJob` or any other
-//! engine API directly — that is the whole point of D-06 and of FOUND-03's
-//! "all UI↔engine communication is message passing".
+//! and call [`WorkerHandle::send`]. They never call an engine entry point or
+//! any other engine API directly — that is the whole point of D-06 and of
+//! FOUND-03's "all UI↔engine communication is message passing".
 //!
 //! ```text
 //!   #[tauri::command] import/preview/export        engine worker thread
@@ -33,6 +33,54 @@
 use std::sync::mpsc::{SendError, Sender};
 
 use crate::events::WorkerError;
+
+/// Load the hardcoded clips and match profile into the engine worker (D-08).
+///
+/// # The thin-command contract (D-06)
+///
+/// This handler **only** posts a typed [`WorkerCommand`] to the worker's
+/// channel and returns. It performs no engine work, imports no engine type
+/// (see the module header), and therefore cannot hold a lock across a render
+/// tick or block the webview. On Windows a synchronous command that did work
+/// here would deadlock window/webview creation (wry #583 — RESEARCH Pitfall 2);
+/// the handler is declared `async` and the posting is a non-blocking
+/// `mpsc::send` (the channel is unbounded).
+///
+/// # Errors
+///
+/// Returns [`WorkerError::ChannelClosed`] if the worker has already exited; the
+/// frontend renders that as an ERROR log line rather than hanging.
+#[tauri::command]
+pub async fn import(state: tauri::State<'_, WorkerHandle>) -> Result<(), WorkerError> {
+    state.send(WorkerCommand::Import)
+}
+
+/// Start the live stitched-frame preview loop (D-07).
+///
+/// Thin, same contract as [`import`]: post `Preview` and return. The worker
+/// owns the decode/render loop; the webview only sees the events it emits.
+///
+/// # Errors
+///
+/// Returns [`WorkerError::ChannelClosed`] if the worker has already exited.
+#[tauri::command]
+pub async fn preview(state: tauri::State<'_, WorkerHandle>) -> Result<(), WorkerError> {
+    state.send(WorkerCommand::Preview)
+}
+
+/// Run the hardcoded file→file export to the fixed output path (D-08).
+///
+/// Thin, same contract as [`import`]: post `Export` and return. Export runs on
+/// the worker thread (the engine's one-shot file→file job), never on the
+/// webview/main thread.
+///
+/// # Errors
+///
+/// Returns [`WorkerError::ChannelClosed`] if the worker has already exited.
+#[tauri::command]
+pub async fn export(state: tauri::State<'_, WorkerHandle>) -> Result<(), WorkerError> {
+    state.send(WorkerCommand::Export)
+}
 
 /// A command from the UI to the engine worker.
 ///

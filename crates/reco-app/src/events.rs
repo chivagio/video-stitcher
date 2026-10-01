@@ -73,6 +73,44 @@ pub enum WorkerEvent {
     Failed(WorkerError),
 }
 
+/// The UI-facing shape of an event-log line (UI-SPEC Event Log Contract).
+///
+/// The webview's `listen("worker-event", ...)` handler consumes this shape and
+/// renders `[HH:MM:SS] LEVEL  message`. Keeping the projection explicit (rather
+/// than letting the frontend reach into the internally-tagged `WorkerEvent`)
+/// means the JS side never invents text or branches on a Rust enum: it reads
+/// `level` for the colour and `message` for the body.
+///
+/// Produced by [`WorkerEvent::to_log_line`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LogLine {
+    /// Severity, driving the level colour (`info` / `warn` / `error`).
+    pub level: Level,
+    /// The message body — already user-facing text.
+    pub message: String,
+}
+
+impl WorkerEvent {
+    /// Project this event into the [`LogLine`] the webview renders.
+    ///
+    /// * [`WorkerEvent::Log`] carries its own level and message.
+    /// * [`WorkerEvent::Failed`] is an ERROR line whose message is the typed
+    ///   error's `Display` text — the frontend never invents error copy
+    ///   (UI-SPEC Error state); it wraps the worker's typed message.
+    pub fn to_log_line(&self) -> LogLine {
+        match self {
+            WorkerEvent::Log { level, message } => LogLine {
+                level: *level,
+                message: message.clone(),
+            },
+            WorkerEvent::Failed(error) => LogLine {
+                level: Level::Error,
+                message: error.to_string(),
+            },
+        }
+    }
+}
+
 /// A typed worker failure that crosses the command/event channel.
 ///
 /// `Clone + Send + Sync` (enforced by the assertion below) because it is moved
@@ -195,5 +233,52 @@ mod tests {
             }
             other => panic!("expected Failed, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn log_event_projects_to_a_log_line_verbatim() {
+        let event = WorkerEvent::Log {
+            level: Level::Warn,
+            message: "software encoder fallback".to_string(),
+        };
+        assert_eq!(
+            event.to_log_line(),
+            LogLine {
+                level: Level::Warn,
+                message: "software encoder fallback".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn failed_event_projects_to_an_error_line_with_the_typed_message() {
+        // The message the webview renders comes from the typed error, never
+        // from JS-side string invention (UI-SPEC Error state).
+        let event = WorkerEvent::Failed(WorkerError::NotImported);
+        let line = event.to_log_line();
+        assert_eq!(line.level, Level::Error);
+        assert_eq!(
+            line.message,
+            "no clips are imported yet — press Import first"
+        );
+    }
+
+    #[test]
+    fn log_line_serializes_with_snake_case_level() {
+        let line = LogLine {
+            level: Level::Info,
+            message: "import started".to_string(),
+        };
+        let json = serde_json::to_string(&line).unwrap();
+        assert!(
+            json.contains("\"level\":\"info\""),
+            "unexpected json: {json}"
+        );
+        assert!(
+            json.contains("\"message\":\"import started\""),
+            "unexpected json: {json}"
+        );
+        let back: LogLine = serde_json::from_str(&json).unwrap();
+        assert_eq!(line, back);
     }
 }
