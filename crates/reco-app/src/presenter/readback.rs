@@ -73,6 +73,7 @@ impl ReadbackPresenter {
     }
 
     /// Whether a webview channel is currently attached.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn has_channel(&self) -> bool {
         self.channel.is_some()
     }
@@ -177,6 +178,16 @@ impl SurfacePresenter for ReadbackPresenter {
         self.viewport
     }
 
+    fn attach_readback_channel(&mut self, channel: tauri::ipc::Channel<tauri::ipc::Response>) {
+        self.attach_channel(channel);
+    }
+
+    fn configured_format(&self) -> Option<reco_core::wgpu::TextureFormat> {
+        // The readback path renders into the renderer's internal target, which
+        // is created in `Rgba8Unorm`.
+        Some(reco_core::wgpu::TextureFormat::Rgba8Unorm)
+    }
+
     // `release_presenter_window` uses the default no-op: there is no window.
 }
 
@@ -227,5 +238,19 @@ mod tests {
         assert!(p.should_send());
         assert!(!p.should_send());
         assert_eq!(p.throttled, 1);
+    }
+
+    #[test]
+    fn attaching_a_channel_marks_the_presenter_as_attached() {
+        let mut p = ReadbackPresenter::new(ViewportRect {
+            x: 0,
+            y: 0,
+            width: 64,
+            height: 64,
+        });
+        assert!(!p.has_channel());
+        let channel = tauri::ipc::Channel::<tauri::ipc::Response>::new(|_body| Ok(()));
+        p.attach_readback_channel(channel);
+        assert!(p.has_channel());
     }
 }

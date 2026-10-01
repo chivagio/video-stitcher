@@ -107,6 +107,19 @@ pub enum WorkerEvent {
         /// Current vertical FOV in degrees.
         fov_degrees: f32,
     },
+
+    /// The active presenter changed (PREV-05).
+    ///
+    /// Carries only the [`PresenterKind`](crate::presenter::PresenterKind) and
+    /// an owned reason string — never a window/surface handle (T-02-09). The
+    /// badge renders `kind`; a `Some(reason)` is present when the activation was
+    /// a fallback (the matching WARN line carries the remediation).
+    Presenter {
+        /// Which presenter in the chain is now active.
+        kind: crate::presenter::PresenterKind,
+        /// Why the active presenter was chosen, when it was a fallback.
+        reason: Option<String>,
+    },
 }
 
 /// The UI-facing shape of an event-log line (UI-SPEC Event Log Contract).
@@ -173,6 +186,17 @@ impl WorkerEvent {
                     "pose: yaw {:.3}, pitch {:.3}, fov {:.1}",
                     yaw, pitch, fov_degrees
                 ),
+            },
+            WorkerEvent::Presenter { kind, reason } => LogLine {
+                level: if reason.is_some() {
+                    Level::Warn
+                } else {
+                    Level::Info
+                },
+                message: match reason {
+                    Some(reason) => crate::presenter::fallback_warn_line(*kind, reason),
+                    None => format!("presenter: {}", kind.name()),
+                },
             },
         }
     }
@@ -382,6 +406,40 @@ mod tests {
         );
         let back: WorkerEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(event, back);
+    }
+
+    #[test]
+    fn presenter_event_roundtrips_and_projects_to_a_warn_line_on_fallback() {
+        let event = WorkerEvent::Presenter {
+            kind: crate::presenter::PresenterKind::Readback,
+            reason: Some("native unavailable".to_string()),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(
+            json.contains("\"kind\":\"presenter\""),
+            "unexpected json: {json}"
+        );
+        assert!(
+            json.contains("\"kind\":\"readback\""),
+            "unexpected json: {json}"
+        );
+        let back: WorkerEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(event, back);
+
+        // A fallback projects to exactly one WARN line carrying reason +
+        // remediation.
+        let line = event.to_log_line();
+        assert_eq!(line.level, Level::Warn);
+        assert!(line.message.starts_with("Presenter fallback to Readback:"));
+        assert!(line.message.contains("throttled"));
+
+        // A successful selection projects to an INFO line.
+        let active = WorkerEvent::Presenter {
+            kind: crate::presenter::PresenterKind::Native,
+            reason: None,
+        };
+        assert_eq!(active.to_log_line().level, Level::Info);
+        assert_eq!(active.to_log_line().message, "presenter: Native");
     }
 
     #[test]

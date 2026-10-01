@@ -588,6 +588,10 @@ impl SurfacePresenter for X11Presenter {
         self.viewport
     }
 
+    fn configured_format(&self) -> Option<reco_core::wgpu::TextureFormat> {
+        self.surface_format
+    }
+
     /// FOUND-06: destroy the child window while the parent is still alive.
     ///
     /// Dispatched by the worker's `shutdown()` through `dyn SurfacePresenter`.

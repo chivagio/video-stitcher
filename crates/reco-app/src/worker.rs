@@ -78,6 +78,28 @@ use reco_core::source::FrameSource as _;
 pub use crate::commands::{WorkerCommand, WorkerHandle};
 pub use crate::events::{Level, WorkerError, WorkerEvent};
 
+/// Newtype wrapper for the readback channel sender, so it can be managed as
+/// Tauri app state (PREV-05).
+///
+/// Managed with `app.manage(ReadbackSender(tx))`; `preview_attach_readback`
+/// resolves it via `State<ReadbackSender>` and forwards a webview
+/// `Channel<Response>` to the worker.
+pub struct ReadbackSender(pub Sender<tauri::ipc::Channel<tauri::ipc::Response>>);
+
+/// The webview readback channel type (raw frame bytes as an `ArrayBuffer`).
+pub type ReadbackChannel = tauri::ipc::Channel<tauri::ipc::Response>;
+
+/// The presenter chain handed from the setup thread to the worker (PREV-05):
+/// strongest-first `(kind, pre-built presenter)` pairs.
+pub type PresenterChain = Vec<(
+    crate::presenter::PresenterKind,
+    Box<dyn crate::presenter::SurfacePresenter + Send>,
+)>;
+
+/// The result of [`spawn_gpu_worker`]: the worker, its event receiver, and the
+/// readback channel sender.
+pub type SpawnedWorker = (EngineWorker, Receiver<WorkerEvent>, Sender<ReadbackChannel>);
+
 /// A sink the worker uses to emit [`WorkerEvent`]s to the UI.
 ///
 /// Emitting is infallible from the worker's point of view: if the UI has gone
@@ -138,6 +160,11 @@ impl EventSink {
             pitch,
             fov_degrees,
         });
+    }
+
+    /// Emit the active presenter (PREV-05). `reason` is `Some` only on fallback.
+    fn presenter(&self, kind: crate::presenter::PresenterKind, reason: Option<String>) {
+        let _ = self.tx.send(WorkerEvent::Presenter { kind, reason });
     }
 }
 
@@ -220,6 +247,21 @@ pub trait EngineBackend: Send {
 
     /// Dispatch a transport-agnostic input intent to the worker's pose state.
     fn dispatch_intent(&mut self, intent: reco_control::ControlIntent);
+
+    /// Swap the active presenter to `kind` at a command boundary (PREV-05).
+    ///
+    /// Reuses the existing device (never a second one), releases the outgoing
+    /// presenter's window, configures the incoming presenter against the shared
+    /// device, and emits the `Presenter` event plus exactly one WARN/INFO line.
+    /// Preserves transport position and pose. A `kind` the platform cannot host
+    /// falls through the chain and reports the reason.
+    fn set_presenter(&mut self, kind: crate::presenter::PresenterKind, events: &EventSink);
+
+    /// Which presenter in the chain is currently active (PREV-05).
+    fn active_presenter(&self) -> crate::presenter::PresenterKind;
+
+    /// Show the separate preview window (PREV-05 "Show preview window" action).
+    fn show_preview_window(&mut self, events: &EventSink);
 
     /// Whether the GPU device was lost and needs recovery (FOUND-05).
     ///
@@ -306,6 +348,12 @@ fn handle_command<B: EngineBackend>(
         }
         WorkerCommand::ResizeViewport { width, height } => {
             backend.resize_viewport(width, height, events);
+        }
+        WorkerCommand::SetPresenter(kind) => {
+            backend.set_presenter(kind, events);
+        }
+        WorkerCommand::ShowPreviewWindow => {
+            backend.show_preview_window(events);
         }
         WorkerCommand::Export => {
             interrupted.store(false, Ordering::SeqCst);
@@ -588,16 +636,21 @@ pub struct GpuEngineBackend {
     /// the renderer but before the device, so its surface outlives the device
     /// that configured it.
     presenter: Box<dyn crate::presenter::SurfacePresenter + Send>,
-    /// The not-yet-active presenters in the PREV-05 chain, strongest-first,
-    /// pre-built on the setup thread. Held so a manual override (Task 3) can
-    /// swap one in at a tick boundary without constructing anything on the
-    /// worker thread.
-    presenters: std::collections::VecDeque<(
-        crate::presenter::PresenterKind,
-        Box<dyn crate::presenter::SurfacePresenter + Send>,
-    )>,
+    /// The **inactive** presenters in the PREV-05 chain, indexed by their position
+    /// in [`crate::presenter::PRESENTER_CHAIN`]. The active presenter lives in
+    /// [`Self::presenter`] and its slot here is `None`. Pre-built on the setup
+    /// thread so a manual override swaps one in at a tick boundary without
+    /// constructing anything on the worker thread.
+    presenters: [Option<Box<dyn crate::presenter::SurfacePresenter + Send>>; 3],
     /// Which chain entry [`Self::presenter`] currently is.
     active_kind: crate::presenter::PresenterKind,
+    /// Receives webview readback channels attached by `preview_attach_readback`
+    /// (PREV-05). The channel is a Tauri IPC type, not an engine type, so it
+    /// travels on its own path rather than the typed `WorkerCommand` enum.
+    readback_rx: std::sync::mpsc::Receiver<tauri::ipc::Channel<tauri::ipc::Response>>,
+    /// The sending half of [`Self::readback_rx`], exposed so the Tauri command
+    /// layer can attach a channel.
+    readback_tx: std::sync::mpsc::Sender<tauri::ipc::Channel<tauri::ipc::Response>>,
     /// The wgpu `Instance`, retained so a `Lost` surface can rebuild the device
     /// (FOUND-05). Creating the instance once keeps recovery on the same backend.
     instance: reco_core::wgpu::Instance,
@@ -633,20 +686,33 @@ impl GpuEngineBackend {
     /// surface cannot be configured against it.
     pub fn new(
         instance: reco_core::wgpu::Instance,
-        presenters: Vec<(
-            crate::presenter::PresenterKind,
-            Box<dyn crate::presenter::SurfacePresenter + Send>,
-        )>,
+        presenters: PresenterChain,
         viewport: crate::presenter::ViewportRect,
     ) -> Result<Self, WorkerError> {
         // The presenter chain (PREV-05), strongest-first, pre-built on the setup
-        // thread. The first entry is the initial active presenter; the rest are
-        // held for a runtime swap. An empty chain is a programmer error.
-        let mut chain = presenters
-            .into_iter()
-            .collect::<std::collections::VecDeque<_>>();
-        let (active_kind, mut presenter) = chain
-            .pop_front()
+        // thread. Index each presenter into its fixed chain slot; the first entry
+        // (Native) becomes the initial active presenter. An empty chain is a
+        // programmer error.
+        let mut slots: [Option<Box<dyn crate::presenter::SurfacePresenter + Send>>; 3] =
+            [None, None, None];
+        let mut active: Option<(
+            crate::presenter::PresenterKind,
+            Box<dyn crate::presenter::SurfacePresenter + Send>,
+        )> = None;
+        for (kind, p) in presenters {
+            let idx = crate::presenter::PRESENTER_CHAIN
+                .iter()
+                .position(|k| *k == kind)
+                .ok_or_else(|| {
+                    WorkerError::Engine("engine got a presenter not in the chain".into())
+                })?;
+            if active.is_none() {
+                active = Some((kind, p));
+            } else {
+                slots[idx] = Some(p);
+            }
+        }
+        let (active_kind, mut presenter) = active
             .ok_or_else(|| WorkerError::Engine("engine got an empty presenter chain".into()))?;
 
         // Branch on whether the presenter hosts a surface (PREV-05):
@@ -682,6 +748,11 @@ impl GpuEngineBackend {
         let device_lost = Arc::new(AtomicBool::new(false));
         install_device_lost_handlers(gpu.device(), Arc::clone(&device_lost));
 
+        // The readback channel path (PREV-05): the webview attaches a
+        // `Channel<Response>` via `preview_attach_readback`; the worker drains it
+        // on its next tick and stores it in the readback presenter.
+        let (readback_tx, readback_rx) = std::sync::mpsc::channel();
+
         presenter
             .configure(gpu.device(), gpu.queue(), &adapter, viewport)
             .map_err(|e| WorkerError::Engine(e.to_string()))?;
@@ -703,8 +774,10 @@ impl GpuEngineBackend {
             source: None,
             input_size: None,
             presenter,
-            presenters: chain,
+            presenters: slots,
             active_kind,
+            readback_rx,
+            readback_tx,
             instance,
             adapter,
             device_lost,
@@ -857,6 +930,96 @@ impl GpuEngineBackend {
             Err(e) => events.failed(WorkerError::Engine(e.to_string())),
         }
     }
+
+    /// The sending half of the readback channel path (PREV-05).
+    ///
+    /// Handed to the Tauri command layer so `preview_attach_readback` can attach
+    /// a webview `Channel<Response>`.
+    pub fn readback_sender(
+        &self,
+    ) -> std::sync::mpsc::Sender<tauri::ipc::Channel<tauri::ipc::Response>> {
+        self.readback_tx.clone()
+    }
+
+    /// Drain any webview readback channels attached since the last tick and
+    /// store the newest into the readback presenter (PREV-05).
+    ///
+    /// A no-op when nothing is pending. Called at the top of every session tick
+    /// and on `SetPresenter`, so the channel is attached without a second thread.
+    fn drain_readback_channels(&mut self) {
+        while let Ok(channel) = self.readback_rx.try_recv() {
+            // Hand the channel to whichever inactive presenter is the readback
+            // one; every other impl's `attach_readback_channel` is a no-op
+            // (PREV-05). If readback is currently active, its forwarding happens
+            // through the same trait method on the active presenter.
+            let mut attached = false;
+            for slot in self.presenters.iter_mut().flatten() {
+                slot.attach_readback_channel(channel.clone());
+                attached = true;
+            }
+            self.presenter.attach_readback_channel(channel);
+            let _ = attached;
+        }
+    }
+
+    /// Activate the presenter for `kind`, configuring it against the shared
+    /// device (PREV-05 swap). Never creates a second device.
+    ///
+    /// On success the incoming presenter becomes active, the outgoing one is
+    /// released and returned to its chain slot, and the new `Surface` (if any)
+    /// drives the renderer's format. Returns the typed error on failure so the
+    /// caller can fall through the chain.
+    fn install_presenter(
+        &mut self,
+        kind: crate::presenter::PresenterKind,
+    ) -> Result<(), crate::presenter::PresenterError> {
+        if kind == self.active_kind {
+            return Ok(());
+        }
+        let idx = crate::presenter::PRESENTER_CHAIN
+            .iter()
+            .position(|k| *k == kind)
+            .ok_or_else(|| crate::presenter::PresenterError::Unsupported {
+                reason: format!("{kind:?} is not in the presenter chain"),
+            })?;
+        let mut incoming = self.presenters[idx].take().ok_or_else(|| {
+            crate::presenter::PresenterError::Unsupported {
+                reason: format!("{kind:?} presenter is unavailable"),
+            }
+        })?;
+        // Configure the incoming presenter against the EXISTING device/adapter.
+        incoming.configure(
+            self.gpu.device(),
+            self.gpu.queue(),
+            &self.adapter,
+            self.viewport,
+        )?;
+        // Release the outgoing presenter's window, then park it back in its slot.
+        self.presenter.release_presenter_window();
+        let outgoing = std::mem::replace(&mut self.presenter, incoming);
+        let old_idx = crate::presenter::PRESENTER_CHAIN
+            .iter()
+            .position(|k| *k == self.active_kind)
+            .expect("active kind is in the chain");
+        self.presenters[old_idx] = Some(outgoing);
+        self.active_kind = kind;
+        // The renderer's target format follows the presenter: a surface-backed
+        // presenter renders in its negotiated format, readback in `Rgba8Unorm`.
+        // Rebuild a live renderer so the swap preserves the picture.
+        if let Some(format) = self.presenter.configured_format()
+            && format != self.surface_format
+        {
+            self.surface_format = format;
+            if let Some((cal, in_w, in_h)) = self.renderer_input.clone() {
+                self.renderer = Some(self.build_renderer(cal, in_w, in_h).map_err(|e| {
+                    crate::presenter::PresenterError::Surface {
+                        reason: e.to_string(),
+                    }
+                })?);
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Install the FOUND-05 device-lost callback and uncaptured-error handler.
@@ -985,6 +1148,10 @@ impl EngineBackend for GpuEngineBackend {
         if self.session.is_none() {
             return Ok(());
         }
+
+        // Pick up any webview readback channel attached since the last tick
+        // (PREV-05) at a tick boundary, before a frame is produced.
+        self.drain_readback_channels();
 
         // A device loss flagged mid-session is recovered here, between frames
         // (never while a SurfaceTexture is alive — we are before the acquire).
@@ -1246,6 +1413,104 @@ impl EngineBackend for GpuEngineBackend {
         dispatch_intent(&mut self.pose, intent);
     }
 
+    fn set_presenter(&mut self, kind: crate::presenter::PresenterKind, events: &EventSink) {
+        // A manual override re-runs the chain from the requested step: attempt it,
+        // and on a fall-through error continue to the next weaker presenter. The
+        // override cannot inject a new surface — it only selects an
+        // already-built presenter (T-02-07).
+        self.drain_readback_channels();
+
+        // Already active: report success without a churn (position/pose are
+        // untouched either way; a swap happens only at this command boundary).
+        if kind == self.active_presenter() {
+            events.info(format!("presenter: {} (already active)", kind.name()));
+            events.presenter(kind, None);
+            return;
+        }
+
+        let start = crate::presenter::PRESENTER_CHAIN
+            .iter()
+            .position(|k| *k == kind)
+            .unwrap_or(crate::presenter::PRESENTER_CHAIN.len());
+        let mut attempts: Vec<(
+            crate::presenter::PresenterKind,
+            Result<(), crate::presenter::PresenterError>,
+        )> = Vec::new();
+        // Try the requested step and every weaker step after it. A non-fall-through
+        // error is fatal to the attempt and is reported as-is.
+        for candidate in &crate::presenter::PRESENTER_CHAIN[start.min(2)..] {
+            if *candidate == self.active_presenter() {
+                attempts.push((*candidate, Ok(())));
+                break;
+            }
+            let result = self.install_presenter(*candidate);
+            let fallthrough = result
+                .as_ref()
+                .err()
+                .is_some_and(crate::presenter::is_fallthrough);
+            let ok = result.is_ok();
+            attempts.push((*candidate, result));
+            if ok || !fallthrough {
+                break;
+            }
+        }
+
+        let (chosen, reason) = crate::presenter::choose_presenter(&attempts);
+        match reason {
+            // Fallback to a weaker presenter: exactly one WARN line carrying the
+            // reason and the remediation (Phase 1 D-05; never silent).
+            Some(err) => {
+                events.presenter(chosen, Some(err.to_string()));
+                events.log(
+                    Level::Warn,
+                    crate::presenter::fallback_warn_line(chosen, &err.to_string()),
+                );
+            }
+            // Successful manual selection: an INFO line, no WARN.
+            None if chosen == kind => {
+                events.info(format!("presenter switched to {}", chosen.name()));
+                events.presenter(chosen, None);
+            }
+            // Selected a different presenter than requested without a typed error
+            // (e.g. the requested step was already the active one's weaker peer).
+            None => {
+                events.info(format!(
+                    "presenter override to {} resolved to {}",
+                    kind.name(),
+                    chosen.name()
+                ));
+                events.presenter(chosen, None);
+            }
+        }
+    }
+
+    fn active_presenter(&self) -> crate::presenter::PresenterKind {
+        self.active_kind
+    }
+
+    fn show_preview_window(&mut self, events: &EventSink) {
+        // Show the separate window wherever it lives in the chain (the active
+        // presenter or its parked slot). Every other presenter's impl is a no-op
+        // default, so this routes to the separate-window presenter without a
+        // downcast (PREV-05).
+        let attempt = if self.active_kind == crate::presenter::PresenterKind::SeparateWindow {
+            self.presenter.show_preview_window()
+        } else {
+            let idx = crate::presenter::PRESENTER_CHAIN
+                .iter()
+                .position(|k| *k == crate::presenter::PresenterKind::SeparateWindow)
+                .expect("separate window is in the chain");
+            match self.presenters[idx].as_mut() {
+                Some(p) => p.show_preview_window(),
+                None => Ok(()),
+            }
+        };
+        match attempt {
+            Ok(()) => events.info("preview window shown"),
+            Err(e) => events.failed(WorkerError::Engine(e.to_string())),
+        }
+    }
+
     fn recovery_pending(&self) -> bool {
         self.device_lost.load(Ordering::SeqCst)
     }
@@ -1355,21 +1620,24 @@ impl GpuEngineBackend {
 /// The worker creates the single [`reco_core::gpu::GpuContext`] from the
 /// presenter's surface **on the worker thread** (FOUND-03), so no device is
 /// created outside the worker. The caller supplies the `Instance` and the
-/// presenter (which owns the render target).
+/// pre-built presenter chain (which owns the render targets).
+///
+/// Returns the worker, the event receiver, and the **readback channel sender**
+/// (PREV-05): the Tauri command layer hands a webview `Channel<Response>` to the
+/// worker through it, which then attaches it to the readback presenter.
 ///
 /// # Errors
 ///
 /// [`WorkerError::Engine`] if device creation or surface configuration fails.
 pub fn spawn_gpu_worker(
     instance: reco_core::wgpu::Instance,
-    presenters: Vec<(
-        crate::presenter::PresenterKind,
-        Box<dyn crate::presenter::SurfacePresenter + Send>,
-    )>,
+    presenters: PresenterChain,
     viewport: crate::presenter::ViewportRect,
-) -> Result<(EngineWorker, Receiver<WorkerEvent>), WorkerError> {
+) -> Result<SpawnedWorker, WorkerError> {
     let backend = GpuEngineBackend::new(instance, presenters, viewport)?;
-    Ok(EngineWorker::spawn(backend))
+    let readback_tx = backend.readback_sender();
+    let (worker, events) = EngineWorker::spawn(backend);
+    Ok((worker, events, readback_tx))
 }
 
 // `Arc<AtomicBool>` is the shape the CLI preview uses for its Ctrl-C flag; the
@@ -1402,6 +1670,8 @@ mod tests {
         import_fails: bool,
         /// Mirrors the real backend's device-lost flag (FOUND-05).
         lost: Arc<AtomicBool>,
+        /// The mock's active presenter (PREV-05).
+        active_kind: crate::presenter::PresenterKind,
     }
 
     impl MockBackend {
@@ -1416,6 +1686,7 @@ mod tests {
                 last_pushed_fov: Arc::new(std::sync::Mutex::new(None)),
                 import_fails: false,
                 lost: Arc::new(AtomicBool::new(false)),
+                active_kind: crate::presenter::PresenterKind::Native,
             }
         }
 
@@ -1511,6 +1782,20 @@ mod tests {
             self.record("intent");
             let mut pose = self.pose.lock().unwrap();
             dispatch_intent(&mut pose, intent);
+        }
+
+        fn set_presenter(&mut self, kind: crate::presenter::PresenterKind, events: &EventSink) {
+            self.record("set_presenter");
+            self.active_kind = kind;
+            events.presenter(kind, None);
+        }
+
+        fn active_presenter(&self) -> crate::presenter::PresenterKind {
+            self.active_kind
+        }
+
+        fn show_preview_window(&mut self, _events: &EventSink) {
+            self.record("show_preview_window");
         }
 
         fn recovery_pending(&self) -> bool {
@@ -1987,6 +2272,58 @@ mod tests {
         handle.send(WorkerCommand::Shutdown).unwrap();
         let _ = worker.join(Duration::from_secs(2));
         assert!(saw_pose, "no Pose event was emitted");
+    }
+
+    #[test]
+    fn set_presenter_command_swaps_and_emits_a_presenter_event() {
+        // Task 3: SetPresenter reaches the backend, swaps the active presenter,
+        // and emits a Presenter event (no WARN for a successful manual swap).
+        let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (worker, events) = EngineWorker::spawn(MockBackend::new(Arc::clone(&ops)));
+        let handle = worker.handle();
+        handle
+            .send(WorkerCommand::SetPresenter(
+                crate::presenter::PresenterKind::Readback,
+            ))
+            .unwrap();
+
+        let mut saw_presenter = false;
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            match events.recv_timeout(Duration::from_millis(100)) {
+                Ok(WorkerEvent::Presenter { kind, reason }) => {
+                    assert_eq!(kind, crate::presenter::PresenterKind::Readback);
+                    assert!(reason.is_none(), "manual swap must not report a fallback");
+                    saw_presenter = true;
+                    break;
+                }
+                Ok(_) => continue,
+                Err(_) => continue,
+            }
+        }
+        handle.send(WorkerCommand::Shutdown).unwrap();
+        let _ = worker.join(Duration::from_secs(2));
+        assert!(saw_presenter, "no Presenter event was emitted");
+        assert!(ops.lock().unwrap().contains(&"set_presenter"));
+    }
+
+    #[test]
+    fn show_preview_window_command_reaches_the_backend() {
+        // Task 3: ShowPreviewWindow reaches the backend.
+        let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (worker, _events) = EngineWorker::spawn(MockBackend::new(Arc::clone(&ops)));
+        let handle = worker.handle();
+        handle.send(WorkerCommand::ShowPreviewWindow).unwrap();
+        handle.send(WorkerCommand::Shutdown).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            if ops.lock().unwrap().contains(&"shutdown") {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        let _ = worker.join(Duration::from_secs(2));
+        assert!(ops.lock().unwrap().contains(&"show_preview_window"));
     }
 
     #[test]

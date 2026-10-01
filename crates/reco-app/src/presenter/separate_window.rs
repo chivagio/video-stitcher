@@ -344,15 +344,21 @@ impl SurfacePresenter for SeparateWindowPresenter {
         self.viewport
     }
 
-    /// Hide the separate preview window now, while the app is still alive.
-    ///
+    fn configured_format(&self) -> Option<reco_core::wgpu::TextureFormat> {
+        self.surface_format
+    }
+
+    fn show_preview_window(&self) -> Result<(), PresenterError> {
+        self.show()
+    }
+
+    /// Hide the separate preview window now, while the app is still alive.    ///
     /// Unlike the X11 presenter this owns a *top-level* Tauri window, not a raw
     /// child window, so teardown is a `hide` (Tauri owns the window's lifetime);
     /// dropping the handle is handled by [`Drop`]. Idempotent.
     fn release_presenter_window(&mut self) {
-        if let Some(window) = self.window.as_ref() {
-            let _ = window.hide();
-        }
+        // Idempotent hide of the preview window while the app is still alive.
+        let _ = self.hide();
     }
 }
 

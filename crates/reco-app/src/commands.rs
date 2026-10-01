@@ -190,6 +190,56 @@ pub async fn set_chrome(
     })
 }
 
+/// Swap the active presenter to `kind` (PREV-05).
+///
+/// Thin: posts `SetPresenter`; the worker re-runs the chain and reports the
+/// outcome. Typed [`PresenterKind`](crate::presenter::PresenterKind) — never a
+/// string (T-02-07); the override cannot inject a new surface.
+///
+/// # Errors
+///
+/// Returns [`WorkerError::ChannelClosed`] if the worker has already exited.
+#[tauri::command]
+pub async fn set_presenter(
+    state: tauri::State<'_, WorkerHandle>,
+    kind: crate::presenter::PresenterKind,
+) -> Result<(), WorkerError> {
+    state.send(WorkerCommand::SetPresenter(kind))
+}
+
+/// Attach the webview readback channel to the readback presenter (PREV-05).
+///
+/// Thin: forwards the `Channel<Response>` to the worker through its readback
+/// channel path; the worker stores it in the readback presenter. Names no engine
+/// type. The channel receives raw RGBA frames as `ArrayBuffer`s.
+///
+/// # Errors
+///
+/// Returns [`WorkerError::ChannelClosed`] if the worker has already exited.
+#[tauri::command]
+pub async fn preview_attach_readback(
+    sender: tauri::State<'_, crate::worker::ReadbackSender>,
+    on_frame: tauri::ipc::Channel<tauri::ipc::Response>,
+) -> Result<(), WorkerError> {
+    sender
+        .0
+        .send(on_frame)
+        .map_err(|_| WorkerError::ChannelClosed)
+}
+
+/// Show the separate preview window (PREV-05 "Show preview window" action).
+///
+/// Thin: posts `ShowPreviewWindow`; the worker shows the Rust-owned preview
+/// window.
+///
+/// # Errors
+///
+/// Returns [`WorkerError::ChannelClosed`] if the worker has already exited.
+#[tauri::command]
+pub async fn show_preview_window(state: tauri::State<'_, WorkerHandle>) -> Result<(), WorkerError> {
+    state.send(WorkerCommand::ShowPreviewWindow)
+}
+
 /// A command from the UI to the engine worker.
 ///
 /// `Clone + Send + 'static` — the compile-time assertion in `events.rs`
@@ -264,6 +314,16 @@ pub enum WorkerCommand {
         /// New window height in physical pixels.
         height: u32,
     },
+
+    /// Swap the active presenter to `kind` (PREV-05).
+    ///
+    /// Typed [`PresenterKind`](crate::presenter::PresenterKind) — never a string
+    /// (T-02-07). The worker re-runs the chain from `kind` and reports the
+    /// outcome; the override cannot inject a new surface.
+    SetPresenter(crate::presenter::PresenterKind),
+
+    /// Show the separate preview window (PREV-05).
+    ShowPreviewWindow,
 
     /// Stop the worker loop and return.
     Shutdown,
@@ -372,6 +432,12 @@ mod tests {
                 height: 800,
             })
             .unwrap();
+        handle
+            .send(WorkerCommand::SetPresenter(
+                crate::presenter::PresenterKind::SeparateWindow,
+            ))
+            .unwrap();
+        handle.send(WorkerCommand::ShowPreviewWindow).unwrap();
         assert_eq!(rx.recv().unwrap(), WorkerCommand::Play);
         assert_eq!(rx.recv().unwrap(), WorkerCommand::Pause);
         assert_eq!(rx.recv().unwrap(), WorkerCommand::Seek { frame: 42 });
@@ -394,6 +460,11 @@ mod tests {
                 height: 800
             }
         );
+        assert_eq!(
+            rx.recv().unwrap(),
+            WorkerCommand::SetPresenter(crate::presenter::PresenterKind::SeparateWindow)
+        );
+        assert_eq!(rx.recv().unwrap(), WorkerCommand::ShowPreviewWindow);
     }
 
     #[test]

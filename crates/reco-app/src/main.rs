@@ -65,7 +65,10 @@ fn main() -> anyhow::Result<()> {
             commands::seek,
             commands::step_frame,
             commands::set_loop,
-            commands::set_chrome
+            commands::set_chrome,
+            commands::set_presenter,
+            commands::preview_attach_readback,
+            commands::show_preview_window
         ])
         .setup(|app| {
             if let Err(e) = run_skeleton(app) {
@@ -128,10 +131,7 @@ fn run_skeleton(app: &mut tauri::App) -> Result<(), SkeletonError> {
     // three are pre-created here on the setup thread; the worker installs the
     // active one and can swap at a tick boundary on a manual override (Task 3).
     // Readback is trivially cheap (no surface; it shares the worker's device).
-    let presenter_chain: Vec<(
-        presenter::PresenterKind,
-        Box<dyn presenter::SurfacePresenter + Send>,
-    )> = vec![
+    let presenter_chain: worker::PresenterChain = vec![
         (presenter::PresenterKind::Native, Box::new(presenter)),
         (
             presenter::PresenterKind::SeparateWindow,
@@ -146,8 +146,9 @@ fn run_skeleton(app: &mut tauri::App) -> Result<(), SkeletonError> {
     // Ownership handoff (FOUND-03): the device is created *inside* the worker
     // from the presenter's surface, so the worker is the sole device owner.
     // Nothing on this (the setup) thread holds a device handle or renders
-    // directly.
-    let (worker, events) = worker::spawn_gpu_worker(instance, presenter_chain, rect)?;
+    // directly. The readback sender is the worker's channel path for
+    // `preview_attach_readback` (PREV-05).
+    let (worker, events, readback_tx) = worker::spawn_gpu_worker(instance, presenter_chain, rect)?;
 
     // The webview bridge: drain typed worker events on an async Tauri task and
     // forward each one to the frontend. The JS `listen("worker-event")` side
@@ -178,6 +179,7 @@ fn run_skeleton(app: &mut tauri::App) -> Result<(), SkeletonError> {
     // Keep the window (whose child the worker renders into) alive for the app's
     // lifetime; the webview owns the lifetime from here.
     app.manage(handle);
+    app.manage(worker::ReadbackSender(readback_tx));
     app.manage(window);
 
     Ok(())

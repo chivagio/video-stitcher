@@ -115,6 +115,10 @@ pub enum PresenterKind {
 
 impl PresenterKind {
     /// The locked UI-SPEC badge label for this presenter.
+    ///
+    /// Consumed by the UI (through the serialized `kind`) and asserted by this
+    /// module's tests to lock the copy.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn label(&self) -> &'static str {
         match self {
             PresenterKind::Native => "Presenter: Native",
@@ -131,6 +135,88 @@ impl PresenterKind {
             PresenterKind::Readback => "Readback",
         }
     }
+}
+
+/// The fixed PREV-05 presenter chain order, strongest-first.
+///
+/// [`choose_presenter`] walks this order; the chain fall-through set is
+/// [`PresenterError::Unsupported`] `|` [`PresenterError::ChildView`] `|`
+/// [`PresenterError::Surface`] `|` [`PresenterError::Window`].
+pub const PRESENTER_CHAIN: [PresenterKind; 3] = [
+    PresenterKind::Native,
+    PresenterKind::SeparateWindow,
+    PresenterKind::Readback,
+];
+
+/// Whether a presenter-construction error forces the chain to fall through to
+/// the next step.
+///
+/// The fall-through set (per the plan's PREV-05 assumption):
+/// `Unsupported` (no child embedding), `ChildView` (child creation failed),
+/// `Surface` (surface build failed), `Window` (preview-window build failed).
+/// The remaining variants are runtime state (`NotConfigured`, `SurfaceLost`)
+/// and never occur during construction, so they do not participate.
+pub fn is_fallthrough(error: &PresenterError) -> bool {
+    matches!(
+        error,
+        PresenterError::Unsupported { .. }
+            | PresenterError::ChildView { .. }
+            | PresenterError::Surface { .. }
+            | PresenterError::Window { .. }
+    )
+}
+
+/// Decide which presenter the chain should activate from a sequence of attempts.
+///
+/// `attempts` is the chain walked in order; each entry records whether that step
+/// succeeded. The decision is **pure** (no GPU, no window): it returns the first
+/// step that succeeded, or — if every step failed — the last step's kind (the
+/// weakest) so the caller always has a definite presenter to report. This is the
+/// unit-testable core of the probe-by-attempt protocol (RESEARCH Pattern 2):
+/// the platform is never pre-selected by `WAYLAND_DISPLAY`/`XDG_SESSION_TYPE`.
+pub fn choose_presenter(
+    attempts: &[(PresenterKind, Result<(), PresenterError>)],
+) -> (PresenterKind, Option<PresenterError>) {
+    // First success wins.
+    for (kind, result) in attempts {
+        if result.is_ok() {
+            return (*kind, None);
+        }
+    }
+    // Every step failed: report the last (weakest) kind with its reason.
+    match attempts.last() {
+        Some((kind, Err(e))) => (*kind, Some(e.clone())),
+        // An empty attempt list is a programmer error; default to the weakest
+        // presenter rather than panicking.
+        _ => (PresenterKind::Readback, None),
+    }
+}
+
+/// The UI-SPEC-locked remediation clause for a fallback to `kind`.
+///
+/// Exact copy shape (Presenter & Degradation Contract):
+/// `Presenter fallback to <Separate window|Readback>: <reason>. <remediation>.`
+pub fn fallback_remediation(kind: PresenterKind) -> &'static str {
+    match kind {
+        PresenterKind::Native => "Native compositing is active.",
+        PresenterKind::SeparateWindow => "The panorama is shown in a separate preview window.",
+        PresenterKind::Readback => {
+            "Preview is throttled. Use a separate preview window for smoother playback."
+        }
+    }
+}
+
+/// Build the locked WARN line for a fallback to `kind` with `reason`.
+///
+/// A single, exact-shape line so degradation is never silent and the copy is
+/// identical wherever a fallback is reported (UI-SPEC; Phase 1 D-05).
+pub fn fallback_warn_line(kind: PresenterKind, reason: &str) -> String {
+    format!(
+        "Presenter fallback to {}: {}. {}",
+        kind.name(),
+        reason.trim_end_matches('.'),
+        fallback_remediation(kind)
+    )
 }
 
 /// The webview chrome's collapsible state (UI-SPEC Surface Layout Contract).
@@ -229,10 +315,6 @@ pub enum PresenterError {
     /// [`PresenterError::Surface`] (a `wgpu::Surface` failure): this is the
     /// window-creation failure path for PREV-05's separate-window presenter, so
     /// the chain driver can fall through to readback with a typed reason.
-    // Constructed by the separate-window presenter (Task 2 of plan 02-03); it is
-    // declared here with the other presenter errors so the fall-through set is
-    // complete and the chain driver can match on it.
-    #[allow(dead_code)]
     #[error("preview window creation failed: {reason}")]
     Window {
         /// Human-readable reason, safe to log and display.
@@ -513,6 +595,32 @@ pub trait SurfacePresenter {
     ///
     /// Idempotent: a second call must be a no-op.
     fn release_presenter_window(&mut self) {}
+
+    /// Attach a webview readback channel (PREV-05).
+    ///
+    /// Only the readback presenter stores it; every other impl uses the default
+    /// no-op, so the worker can hand a channel to whichever inactive presenter is
+    /// the readback one without a downcast.
+    fn attach_readback_channel(&mut self, _channel: tauri::ipc::Channel<tauri::ipc::Response>) {}
+
+    /// The texture format this presenter renders its target in, once configured.
+    ///
+    /// `Some` for a surface-backed presenter (its negotiated format) and for the
+    /// readback presenter (`Rgba8Unorm`, its internal target); `None` before
+    /// `configure` or for a presenter with no render target. Used when swapping
+    /// presenters so the shared renderer is rebuilt in the right format.
+    fn configured_format(&self) -> Option<reco_core::wgpu::TextureFormat> {
+        None
+    }
+
+    /// Show this presenter's own preview window (PREV-05).
+    ///
+    /// Only the separate-window presenter has one; every other impl uses the
+    /// default no-op, so the worker can route the "Show preview window" action
+    /// without a downcast.
+    fn show_preview_window(&self) -> Result<(), PresenterError> {
+        Ok(())
+    }
 }
 
 /// Build a [`ViewportConfig`] matching the presenter's panorama viewport.
@@ -657,5 +765,118 @@ mod tests {
             IDLE_CLEAR_COLOR,
             [30.0 / 255.0, 30.0 / 255.0, 30.0 / 255.0, 1.0]
         );
+    }
+
+    #[test]
+    fn presenter_kind_serializes_snake_case_and_carries_locked_labels() {
+        // The typed command/event vocabulary (T-02-07) and the locked UI-SPEC
+        // badge labels.
+        assert_eq!(
+            serde_json::to_string(&PresenterKind::Native).unwrap(),
+            "\"native\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PresenterKind::SeparateWindow).unwrap(),
+            "\"separate_window\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PresenterKind::Readback).unwrap(),
+            "\"readback\""
+        );
+        assert_eq!(PresenterKind::Native.label(), "Presenter: Native");
+        assert_eq!(
+            PresenterKind::SeparateWindow.label(),
+            "Presenter: Separate window"
+        );
+        assert_eq!(PresenterKind::Readback.label(), "Presenter: Readback");
+    }
+
+    #[test]
+    fn chain_is_ordered_strongest_first() {
+        assert_eq!(
+            PRESENTER_CHAIN,
+            [
+                PresenterKind::Native,
+                PresenterKind::SeparateWindow,
+                PresenterKind::Readback
+            ]
+        );
+    }
+
+    #[test]
+    fn is_fallthrough_covers_the_four_construction_errors() {
+        let u = PresenterError::Unsupported { reason: "x".into() };
+        let c = PresenterError::ChildView { reason: "x".into() };
+        let s = PresenterError::Surface { reason: "x".into() };
+        let w = PresenterError::Window { reason: "x".into() };
+        assert!(is_fallthrough(&u));
+        assert!(is_fallthrough(&c));
+        assert!(is_fallthrough(&s));
+        assert!(is_fallthrough(&w));
+        // Runtime-state variants never occur during construction.
+        assert!(!is_fallthrough(&PresenterError::NotConfigured));
+        assert!(!is_fallthrough(&PresenterError::SurfaceLost {
+            kind: SurfaceErrorKind::Lost
+        }));
+    }
+
+    #[test]
+    fn choose_presenter_returns_first_success() {
+        let attempts = [
+            (
+                PresenterKind::Native,
+                Err(PresenterError::Unsupported {
+                    reason: "wayland".into(),
+                }),
+            ),
+            (PresenterKind::SeparateWindow, Ok(())),
+            (PresenterKind::Readback, Ok(())),
+        ];
+        let (kind, reason) = choose_presenter(&attempts);
+        assert_eq!(kind, PresenterKind::SeparateWindow);
+        assert!(reason.is_none());
+    }
+
+    #[test]
+    fn choose_presenter_reports_weakest_with_reason_when_all_fail() {
+        let attempts = [
+            (
+                PresenterKind::Native,
+                Err(PresenterError::Unsupported {
+                    reason: "wayland".into(),
+                }),
+            ),
+            (
+                PresenterKind::SeparateWindow,
+                Err(PresenterError::Window {
+                    reason: "no window".into(),
+                }),
+            ),
+            (
+                PresenterKind::Readback,
+                Err(PresenterError::Surface {
+                    reason: "no device".into(),
+                }),
+            ),
+        ];
+        let (kind, reason) = choose_presenter(&attempts);
+        assert_eq!(kind, PresenterKind::Readback);
+        assert!(matches!(reason, Some(PresenterError::Surface { .. })));
+    }
+
+    #[test]
+    fn fallback_warn_line_matches_the_locked_shape() {
+        let line = fallback_warn_line(
+            PresenterKind::Readback,
+            "native compositing unavailable on this display server (Wayland)",
+        );
+        assert_eq!(
+            line,
+            "Presenter fallback to Readback: native compositing unavailable on this display \
+             server (Wayland). Preview is throttled. Use a separate preview window for smoother \
+             playback."
+        );
+        // Exactly one trailing period after the reason (punct trimmed once).
+        assert!(!line.contains(".."));
     }
 }
