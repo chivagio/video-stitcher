@@ -23,11 +23,14 @@
 //! `crates/reco-gui/FRICTION.md` records the hazard this boundary exists to
 //! avoid: a UI thread that holds a lock on engine state across a render tick
 //! stalls the compositor and, worse, can poison a `Mutex` if a render panics
-//! while the guard is held (CONCERNS.md "mutex-poisoning panics"). The worker
-//! makes that impossible by construction — **no engine object is shared**; the
-//! only cross-thread objects are the `mpsc` endpoints carrying `Clone + Send`
-//! values. There is no `Mutex<Engine>` anywhere, so there is no lock to hold
-//! across a tick and none to poison.
+//! while the guard is held. CONCERNS.md ("Mutex-poisoning panics", files listed
+//! at `crates/reco-gui/src/main.rs:798` etc.) is the concrete prior art: those
+//! `lock().unwrap()` sites propagate a panic and take the app down. The worker
+//! makes that class of bug impossible by construction — **no engine object is
+//! shared**; the only cross-thread objects are the `mpsc` endpoints carrying
+//! `Clone + Send` values. There is no `Mutex<Engine>` anywhere, so there is no
+//! lock to hold across a tick and none to poison. The `protocol_payloads_are_send`
+//! test below asserts the bound that keeps this true.
 //!
 //! # Loop shape (the FOUND-03 adjacency / empty assumptions)
 //!
@@ -561,7 +564,6 @@ const _: fn() = || {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicUsize;
     use std::sync::mpsc::RecvTimeoutError;
 
     /// A GPU-free backend that records the order of the operations it saw.
@@ -812,10 +814,22 @@ mod tests {
         );
     }
 
-    /// Counts invocations; used to assert the drain loop visits every command.
-    #[allow(dead_code)]
-    fn count_calls(counter: &AtomicUsize) -> usize {
-        counter.load(Ordering::SeqCst)
+    #[test]
+    fn protocol_payloads_are_send_and_clone() {
+        // FOUND-03's "no shared engine lock across a tick" invariant, checked
+        // structurally: every value that crosses the worker boundary is
+        // `Clone + Send`, so no engine object (which is not `Send`-sharable)
+        // can travel with it and no lock needs to be held across a tick.
+        // CONCERNS.md ("Mutex-poisoning panics") is the prior art this avoids:
+        // a UI-held engine lock could poison a `Mutex` on a render panic; here
+        // there is no shared engine lock at all.
+        fn assert_clone_send<T: Clone + Send + 'static>() {}
+        assert_clone_send::<WorkerCommand>();
+        assert_clone_send::<WorkerEvent>();
+        assert_clone_send::<WorkerError>();
+        // The intent variant's payload is itself `Clone + Send` (asserted in
+        // `reco-control`), so it travels the same path as the other commands.
+        assert_clone_send::<reco_control::ControlIntent>();
     }
 }
 
