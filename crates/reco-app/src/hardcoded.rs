@@ -43,6 +43,29 @@ pub const EXPORT_OUTPUT_FILE: &str = "reco-app-export.mp4";
 #[allow(dead_code)]
 pub const EXPORT_PRESET: &str = "h264-software";
 
+/// Environment variable that enables the FOUND-05 debug device-loss simulation.
+///
+/// Set to a non-empty value (e.g. `RECO_DEBUG_DEVICE_LOSS=1`) to post a
+/// [`crate::commands::WorkerCommand::SimulateDeviceLoss`] once after the first
+/// successful preview frame, so a gate run can observe recovery end to end.
+///
+/// This is a **debug/test affordance, not a UI control**: wgpu 28 exposes no
+/// public "lose the device" API, so this is how success criterion 3 is
+/// demonstrated. It is off unless the env var is set, and it is never wired to a
+/// button (UI-SPEC Interaction rule 4: recovery is surfaced only through the log
+/// and the panorama).
+pub const DEBUG_DEVICE_LOSS_ENV: &str = "RECO_DEBUG_DEVICE_LOSS";
+
+/// Whether the debug device-loss simulation is enabled for this run.
+///
+/// Reads [`DEBUG_DEVICE_LOSS_ENV`]; any non-empty value (after trimming) enables
+/// it. Documented as a debug-only path (see [`DEBUG_DEVICE_LOSS_ENV`]).
+pub fn debug_device_loss_enabled() -> bool {
+    std::env::var(DEBUG_DEVICE_LOSS_ENV)
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false)
+}
+
 /// Typed error for hardcoded-path resolution.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum HardcodedError {
@@ -146,5 +169,16 @@ mod tests {
         let result = media_dir();
         unsafe { std::env::remove_var(TEST_MEDIA_DIR_ENV) };
         assert_eq!(result, Err(HardcodedError::EmptyMediaDir));
+    }
+
+    #[test]
+    fn debug_device_loss_flag_defaults_off_and_enables_on_non_empty() {
+        unsafe { std::env::remove_var(DEBUG_DEVICE_LOSS_ENV) };
+        assert!(!debug_device_loss_enabled());
+        unsafe { std::env::set_var(DEBUG_DEVICE_LOSS_ENV, "1") };
+        assert!(debug_device_loss_enabled());
+        unsafe { std::env::set_var(DEBUG_DEVICE_LOSS_ENV, "   ") };
+        assert!(!debug_device_loss_enabled());
+        unsafe { std::env::remove_var(DEBUG_DEVICE_LOSS_ENV) };
     }
 }

@@ -19,7 +19,7 @@ use reco_core::render::stitch_renderer::StitchRenderer;
 use reco_core::source::YuvData;
 use x11_dl::xlib;
 
-use super::{PresenterError, SurfacePresenter, ViewportRect};
+use super::{FrameOutcome, PresenterError, SurfacePresenter, ViewportRect};
 
 /// X11-backed panorama presenter.
 ///
@@ -34,6 +34,10 @@ pub struct X11Presenter {
     /// The X connection the child window belongs to. Closed on drop *after*
     /// the surface (field order = drop order).
     display: *mut xlib::Display,
+    /// The parent's raw display handle, retained so the surface can be rebuilt
+    /// on a fresh `Instance` during `Lost` recovery (FOUND-05) without
+    /// re-deriving it from the (possibly-gone) Tauri window handle.
+    display_handle: raw_window_handle::RawDisplayHandle,
     /// The wgpu surface built on the child window.
     surface: reco_core::wgpu::Surface<'static>,
     /// The child window's current geometry.
@@ -42,6 +46,14 @@ pub struct X11Presenter {
     surface_format: Option<reco_core::wgpu::TextureFormat>,
     /// Supported alpha compositing modes for this surface.
     alpha_mode: reco_core::wgpu::CompositeAlphaMode,
+    /// The shared device/queue the surface was configured against (D-03).
+    ///
+    /// Cheap `Arc`-backed clones; re-set on every `configure`, so a device
+    /// rebuild (FOUND-05) updates them together with the surface. The presenter
+    /// needs them to submit its own idle/clear pass (`render_idle`).
+    device: Option<reco_core::wgpu::Device>,
+    /// The shared command queue (see [`Self::device`]).
+    queue: Option<reco_core::wgpu::Queue>,
 }
 
 // SAFETY: the Xlib `Display*` is only touched from the thread that creates the
@@ -193,11 +205,34 @@ impl X11Presenter {
             child_window: child_nonzero,
             xlib,
             display,
+            display_handle: display_handle.as_raw(),
             surface,
             viewport: rect,
             surface_format: None,
             alpha_mode: reco_core::wgpu::CompositeAlphaMode::Auto,
+            device: None,
+            queue: None,
         })
+    }
+
+    /// The shared device this surface is configured against.
+    ///
+    /// # Panics
+    ///
+    /// Never in practice: callers only reach this after a successful
+    /// [`SurfacePresenter::configure`], which sets it. The `expect` documents
+    /// the invariant rather than guessing.
+    fn device(&self) -> &reco_core::wgpu::Device {
+        self.device
+            .as_ref()
+            .expect("presenter device is set by configure()")
+    }
+
+    /// The shared command queue (see [`Self::device`]).
+    fn queue(&self) -> &reco_core::wgpu::Queue {
+        self.queue
+            .as_ref()
+            .expect("presenter queue is set by configure()")
     }
 }
 
@@ -206,9 +241,44 @@ impl SurfacePresenter for X11Presenter {
         Ok(&self.surface)
     }
 
+    fn rebind_instance(
+        &mut self,
+        instance: &reco_core::wgpu::Instance,
+    ) -> Result<(), PresenterError> {
+        // The child window and its X connection survive a device loss; only the
+        // Instance/Surface are bound to the lost parent device. Recreate the
+        // surface from the same child window on the fresh instance.
+        //
+        // SAFETY: `child_window` is valid and owned by this presenter for its
+        // whole lifetime (destroyed only in Drop, after the surface), and
+        // `display_handle` is the connection that owns it. wgpu's unsafe contract
+        // is that the window outlives the surface; field order guarantees it.
+        let surface = unsafe {
+            let target = reco_core::wgpu::SurfaceTargetUnsafe::RawHandle {
+                raw_display_handle: self.display_handle,
+                raw_window_handle: RawWindowHandle::Xlib(raw_window_handle::XlibWindowHandle::new(
+                    self.child_window.get(),
+                )),
+            };
+            instance
+                .create_surface_unsafe(target)
+                .map_err(|e| PresenterError::Surface {
+                    reason: format!("create_surface_unsafe on rebind failed: {e}"),
+                })?
+        };
+        self.surface = surface;
+        // Force the next `configure` to re-negotiate: capabilities are a property
+        // of the (device, surface) pair, and the device changed.
+        self.surface_format = None;
+        self.device = None;
+        self.queue = None;
+        Ok(())
+    }
+
     fn configure(
         &mut self,
         device: &reco_core::wgpu::Device,
+        queue: &reco_core::wgpu::Queue,
         adapter: &reco_core::wgpu::Adapter,
         width: u32,
         height: u32,
@@ -253,6 +323,12 @@ impl SurfacePresenter for X11Presenter {
         );
         self.surface_format = Some(surface_format);
         self.alpha_mode = alpha_mode;
+        // Retain the shared device/queue alongside the surface so idle-frame
+        // painting and any future internal pass submit on the SAME device the
+        // surface is configured against (D-03). Re-set here on every configure,
+        // so a FOUND-05 device rebuild updates them atomically with the surface.
+        self.device = Some(device.clone());
+        self.queue = Some(queue.clone());
         self.viewport = ViewportRect {
             x: 0,
             y: 0,
@@ -269,14 +345,30 @@ impl SurfacePresenter for X11Presenter {
         right: &YuvData,
         yaw: f32,
         pitch: f32,
-    ) -> Result<(), PresenterError> {
+    ) -> Result<FrameOutcome, PresenterError> {
         let surface_format = self.surface_format.ok_or(PresenterError::NotConfigured)?;
+        // Acquire the frame. On a transient error we classify and skip; on
+        // Outdated/Lost we return a recovery error. Critically, no
+        // `SurfaceTexture` is ever held past this point — the frame (if any)
+        // is dropped before the caller can reconfigure (Pitfall 3).
         let frame = match self.surface.get_current_texture() {
             Ok(f) => f,
             Err(e) => {
-                return Err(PresenterError::Surface {
-                    reason: format!("get_current_texture failed: {e:?}"),
-                });
+                let kind = super::classify_surface_error(&e);
+                return match kind {
+                    // Recovery actions: the worker reconfigure/rebuilds before
+                    // the next frame. No frame is alive here (acquire failed).
+                    crate::presenter::SurfaceErrorKind::Outdated
+                    | crate::presenter::SurfaceErrorKind::Lost => {
+                        Err(PresenterError::SurfaceLost { kind })
+                    }
+                    // Transient: drop this frame and retry next tick.
+                    crate::presenter::SurfaceErrorKind::Timeout
+                    | crate::presenter::SurfaceErrorKind::OutOfMemory
+                    | crate::presenter::SurfaceErrorKind::Other => {
+                        Ok(FrameOutcome::Skipped { kind })
+                    }
+                };
             }
         };
         let render_format = StitchRenderer::strip_srgb(surface_format);
@@ -297,6 +389,68 @@ impl SurfacePresenter for X11Presenter {
 
         // Present, then the frame is dropped before any future reconfigure
         // (wgpu panics if a SurfaceTexture is alive during configure).
+        frame.present();
+        Ok(FrameOutcome::Presented)
+    }
+
+    fn render_idle(&mut self) -> Result<(), PresenterError> {
+        // UI-SPEC E3: paint the reserved region with the app ground colour
+        // before the first stitched frame so it is never an undefined/black
+        // hole at startup. A `LoadOp::Clear` render pass with no draw is the
+        // thinnest way to do this — no shader, no vertex buffer.
+        let surface_format = self.surface_format.ok_or(PresenterError::NotConfigured)?;
+        let frame = match self.surface.get_current_texture() {
+            Ok(f) => f,
+            Err(e) => {
+                let kind = super::classify_surface_error(&e);
+                return match kind {
+                    crate::presenter::SurfaceErrorKind::Outdated
+                    | crate::presenter::SurfaceErrorKind::Lost => {
+                        Err(PresenterError::SurfaceLost { kind })
+                    }
+                    // A transient failure at startup is not fatal: the region
+                    // simply stays as it was; the first stitched frame paints
+                    // it as soon as the surface recovers.
+                    _ => Ok(()),
+                };
+            }
+        };
+        let render_format = StitchRenderer::strip_srgb(surface_format);
+        let view = frame
+            .texture
+            .create_view(&reco_core::wgpu::TextureViewDescriptor {
+                format: Some(render_format),
+                ..Default::default()
+            });
+        let mut encoder =
+            self.device()
+                .create_command_encoder(&reco_core::wgpu::CommandEncoderDescriptor {
+                    label: Some("reco-idle-clear"),
+                });
+        {
+            let _pass = encoder.begin_render_pass(&reco_core::wgpu::RenderPassDescriptor {
+                label: Some("reco-idle-pass"),
+                color_attachments: &[Some(reco_core::wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: reco_core::wgpu::Operations {
+                        load: reco_core::wgpu::LoadOp::Clear(reco_core::wgpu::Color {
+                            r: super::IDLE_CLEAR_COLOR[0],
+                            g: super::IDLE_CLEAR_COLOR[1],
+                            b: super::IDLE_CLEAR_COLOR[2],
+                            a: super::IDLE_CLEAR_COLOR[3],
+                        }),
+                        store: reco_core::wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+        }
+        self.queue().submit([encoder.finish()]);
         frame.present();
         Ok(())
     }

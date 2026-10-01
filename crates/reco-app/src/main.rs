@@ -98,6 +98,15 @@ fn run_skeleton(app: &mut tauri::App) -> Result<(), SkeletonError> {
     // renders them (Plan 04).
     install_event_bridge(app.handle().clone(), events);
 
+    // The managed `WorkerHandle` is what `State<WorkerHandle>` resolves in the
+    // command handlers. Capture it before moving the worker into teardown.
+    let handle = worker.handle();
+
+    // FOUND-06: register the clean-teardown path on the window. A close request
+    // must stop the worker, join it within a timeout, and drop the engine in the
+    // documented order — never hang, never `std::process::exit`.
+    install_close_handler(&window, worker);
+
     // The thin path is driven by the WEBVIEW, not from here: the three
     // `#[tauri::command]` handlers post Import / Preview / Export when the user
     // presses the matching button (D-06/D-09). We deliberately do NOT auto-post
@@ -105,15 +114,61 @@ fn run_skeleton(app: &mut tauri::App) -> Result<(), SkeletonError> {
     // user drives the engine without a CLI, and the busy/disabled interaction
     // contract proves the single-owner boundary as each command is issued.
 
-    // Keep the worker (and the window whose child the worker renders into)
-    // alive for the app's lifetime; the webview owns the lifetime from here.
-    // The managed worker's `WorkerHandle` is what `State<WorkerHandle>` resolves
-    // in the command handlers.
-    app.manage(worker.handle());
-    app.manage(worker);
+    // Keep the window (whose child the worker renders into) alive for the app's
+    // lifetime; the webview owns the lifetime from here.
+    app.manage(handle);
     app.manage(window);
 
     Ok(())
+}
+
+/// FOUND-06 teardown state: owns the worker's `JoinHandle` until close.
+///
+/// The app lives for the webview's lifetime; this state exists so the close
+/// handler can take ownership of the worker and join it. Held in a `Mutex` (the
+/// only lock in `reco-app`, and it is never held across a render tick — it only
+/// guards the one-shot close path, so it cannot poison a hot path).
+#[cfg(all(unix, not(target_os = "macos")))]
+struct TeardownState {
+    worker: std::sync::Mutex<Option<worker::EngineWorker>>,
+}
+
+/// How long to wait for the worker to stop before giving up (FOUND-06).
+const SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Register the window-close handler that performs clean teardown (FOUND-06).
+///
+/// On [`tauri::WindowEvent::CloseRequested`] / `Destroyed`, the worker is asked
+/// to stop and joined within [`SHUTDOWN_TIMEOUT`]. The drop order is enforced by
+/// the worker's field order and `shutdown()` (stop loop → drop decode → drop
+/// renderer → drop surface → drop device) — see `worker.rs` for the NVDEC/wgpu
+/// hazard citation. The event bridge task ends when the worker drops its event
+/// sender, so the process can exit.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn install_close_handler(window: &tauri::window::Window, worker: worker::EngineWorker) {
+    let state = TeardownState {
+        worker: std::sync::Mutex::new(Some(worker)),
+    };
+    // The state is moved into the handler and returned to Tauri via `manage` so
+    // it is not dropped before the event fires.
+    let shared = std::sync::Arc::new(state);
+    window.app_handle().manage(shared.clone());
+
+    window.on_window_event(move |event| {
+        if matches!(
+            event,
+            tauri::WindowEvent::CloseRequested { .. } | tauri::WindowEvent::Destroyed
+        ) {
+            // Take the worker once; a second close event is a no-op.
+            let taken = shared.worker.lock().ok().and_then(|mut guard| guard.take());
+            if let Some(worker) = taken {
+                match worker.shutdown(SHUTDOWN_TIMEOUT) {
+                    Ok(()) => log::info!("engine worker stopped cleanly"),
+                    Err(e) => log::warn!("engine worker shutdown: {e}"),
+                }
+            }
+        }
+    });
 }
 
 /// Forward typed [`worker::WorkerEvent`]s to the webview on an async task.

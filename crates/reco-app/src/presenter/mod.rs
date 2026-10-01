@@ -77,6 +77,29 @@ pub const CONTROL_ROW_HEIGHT: u32 = 48;
 /// Height in logical pixels of the webview event/status log pane (UI-SPEC).
 pub const LOG_PANE_HEIGHT: u32 = 160;
 
+/// Ground colour of the idle/clear frame painted before the first stitched
+/// frame (UI-SPEC E3; the `#1e1e1e` app ground).
+///
+/// Kept as a linear-ish 0..1 RGBA tuple so the presenter can clear its surface
+/// without a shader pass.
+pub const IDLE_CLEAR_COLOR: [f64; 4] = [30.0 / 255.0, 30.0 / 255.0, 30.0 / 255.0, 1.0];
+
+/// Classify a `wgpu::SurfaceError` into the FOUND-05 recovery vocabulary.
+///
+/// `wgpu::SurfaceError` is not `Clone`, so the presenter classifies it at its
+/// boundary and the worker branches on the resulting [`SurfaceErrorKind`].
+/// This is the single mapping point shared by every platform presenter impl.
+pub fn classify_surface_error(error: &reco_core::wgpu::SurfaceError) -> SurfaceErrorKind {
+    use reco_core::wgpu::SurfaceError;
+    match error {
+        SurfaceError::Outdated => SurfaceErrorKind::Outdated,
+        SurfaceError::Lost => SurfaceErrorKind::Lost,
+        SurfaceError::Timeout => SurfaceErrorKind::Timeout,
+        SurfaceError::OutOfMemory => SurfaceErrorKind::OutOfMemory,
+        _ => SurfaceErrorKind::Other,
+    }
+}
+
 /// Typed presenter error.
 ///
 /// `Clone + Send + Sync` so it can cross the worker channel and be rendered by
@@ -112,6 +135,65 @@ pub enum PresenterError {
     /// The presenter had no surface configured yet.
     #[error("presenter is not configured")]
     NotConfigured,
+
+    /// The surface is no longer usable and requires a recovery action
+    /// (reconfigure for `Outdated`, device rebuild for `Lost`).
+    ///
+    /// FOUND-05: the frame path branches on [`SurfaceErrorKind`] rather than
+    /// panicking or presenting a black frame. See
+    /// `crates/reco-cli/src/preview.rs:806-883` for the in-repo precedent.
+    #[error("surface error ({kind:?}) — recovery required")]
+    SurfaceLost {
+        /// Which `wgpu::SurfaceError` variant triggered the recovery.
+        kind: SurfaceErrorKind,
+    },
+}
+
+/// The recovery-relevant classification of a `wgpu::SurfaceError`.
+///
+/// FOUND-05 requires the frame path to branch **per variant**, so the raw
+/// `wgpu::SurfaceError` (which is not `Clone`) is classified at the presenter
+/// boundary into a `Clone + Send + Sync` value the worker can act on:
+///
+/// * [`SurfaceErrorKind::Outdated`] → reconfigure the existing device's surface.
+/// * [`SurfaceErrorKind::Lost`] → rebuild the device, then reconfigure.
+/// * [`SurfaceErrorKind::Timeout`] → skip the frame (transient; retry next tick).
+/// * [`SurfaceErrorKind::OutOfMemory`] → log and skip the frame.
+/// * [`SurfaceErrorKind::Other`] → log and skip the frame.
+///
+/// Mirrors the CLI preview's handling (`crates/reco-cli/src/preview.rs:806-883`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum SurfaceErrorKind {
+    /// The swapchain is out of date (e.g. the window resized): reconfigure.
+    Outdated,
+    /// The surface was lost (device lost / window invalidated): rebuild.
+    Lost,
+    /// Acquiring the next frame timed out: skip this frame.
+    Timeout,
+    /// The surface ran out of memory: log and skip this frame.
+    OutOfMemory,
+    /// Any other surface error: log and skip this frame.
+    Other,
+}
+
+/// How the frame path should treat a non-presented frame.
+///
+/// A [`FrameOutcome::Skipped`] is the FOUND-05 contract for the transient
+/// surface errors: the frame is dropped (never presented, never black) and the
+/// caller simply continues the loop. Recovery actions (`Outdated`/`Lost`) are
+/// *not* skips — they surface as [`PresenterError::SurfaceLost`] so the worker
+/// performs the reconfigure/rebuild.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameOutcome {
+    /// The frame was rendered and presented.
+    Presented,
+    /// The frame was dropped with no recovery action (retry next tick).
+    Skipped {
+        /// The classified surface error that caused the skip.
+        kind: SurfaceErrorKind,
+    },
 }
 
 /// Geometry of the native panorama viewport within the window.
@@ -187,10 +269,36 @@ pub trait SurfacePresenter {
     /// than panicking.
     fn surface(&self) -> Result<&reco_core::wgpu::Surface<'static>, PresenterError>;
 
+    /// Rebuild this presenter's surface on a *fresh* `wgpu::Instance`.
+    ///
+    /// Called during `Lost` recovery (FOUND-05) with the **resolved
+    /// `rebuild-reconfigure` contract**: the window-derived child view survives
+    /// a device loss, but both the `Instance` and the `Surface` created from it
+    /// are bound to the lost parent device and cannot be reused — a fresh
+    /// `Instance` cannot adopt a surface created by another instance, and
+    /// requesting an adapter from the stale instance fails with
+    /// "Parent device is lost". So the presenter recreates the surface from the
+    /// still-valid child window onto the new instance. The window is NOT
+    /// recreated (no flicker, no second window — D-01/D-02 hold).
+    ///
+    /// Implementors keep ownership of the new surface.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PresenterError::Surface`] if the surface cannot be rebuilt, or
+    /// [`PresenterError::Unsupported`] on a target with no surface (D-05).
+    fn rebind_instance(
+        &mut self,
+        instance: &reco_core::wgpu::Instance,
+    ) -> Result<(), PresenterError>;
+
     /// Configure (or reconfigure) the surface against the shared device.
     ///
-    /// Must be called with the **worker's** device and retained adapter — never
-    /// a freshly-created second device or adapter (D-03).
+    /// Must be called with the **worker's** device/queue and retained adapter —
+    /// never a freshly-created second device or adapter (D-03).
+    ///
+    /// Called again after [`PresenterError::SurfaceLost`] recovery: for
+    /// `Outdated` with the same device, for `Lost` with the rebuilt device.
     ///
     /// # Errors
     ///
@@ -199,6 +307,7 @@ pub trait SurfacePresenter {
     fn configure(
         &mut self,
         device: &reco_core::wgpu::Device,
+        queue: &reco_core::wgpu::Queue,
         adapter: &reco_core::wgpu::Adapter,
         width: u32,
         height: u32,
@@ -210,11 +319,20 @@ pub trait SurfacePresenter {
     /// position the panorama. Implementations acquire the next surface texture,
     /// render through the shared [`StitchRenderer`], and present it.
     ///
+    /// The return value follows the FOUND-05 contract:
+    ///
+    /// * [`FrameOutcome::Presented`] — a frame reached the swapchain.
+    /// * [`FrameOutcome::Skipped`] — a transient surface error (`Timeout` /
+    ///   `OutOfMemory` / `Other`) dropped this frame; retry next tick.
+    /// * `Err(`[`PresenterError::SurfaceLost`]`)` — the surface needs a
+    ///   recovery action; the caller reconfigure/rebuilds **before** the next
+    ///   `render_frame`. The frame is **never** held across that recovery.
+    ///
     /// # Errors
     ///
     /// Returns [`PresenterError::NotConfigured`] if the surface is not
-    /// configured, or [`PresenterError::Surface`] on a recoverable surface
-    /// error (the caller decides whether to reconfigure).
+    /// configured, [`PresenterError::SurfaceLost`] on an `Outdated`/`Lost`
+    /// surface error, or [`PresenterError::Surface`] on a render failure.
     fn render_frame(
         &mut self,
         renderer: &StitchRenderer,
@@ -222,7 +340,20 @@ pub trait SurfacePresenter {
         right: &YuvData,
         yaw: f32,
         pitch: f32,
-    ) -> Result<(), PresenterError>;
+    ) -> Result<FrameOutcome, PresenterError>;
+
+    /// Paint an idle/clear frame into the reserved region (UI-SPEC E3).
+    ///
+    /// Called **before the first stitched frame** so the panorama region is
+    /// never an undefined/black hole at startup. The frame is a solid ground
+    /// colour ([`IDLE_CLEAR_COLOR`]); it carries no data and is not a
+    /// placeholder for content, it is the documented idle state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PresenterError::NotConfigured`] if the surface is not
+    /// configured, or [`PresenterError::Surface`] on a render failure.
+    fn render_idle(&mut self) -> Result<(), PresenterError>;
 
     /// Resize the presenter's surface to `width` × `height`.
     ///
@@ -298,5 +429,57 @@ mod tests {
         assert_eq!(rect.width, 100);
         assert_eq!(rect.height, 0);
         assert!(!rect.is_drawable());
+    }
+
+    #[test]
+    fn surface_error_classifies_each_variant_for_recovery() {
+        // FOUND-05: the frame path must branch per `SurfaceError` variant.
+        // Outdated/Lost require recovery; Timeout/OutOfMemory/Other skip only.
+        use reco_core::wgpu::SurfaceError;
+        assert_eq!(
+            classify_surface_error(&SurfaceError::Outdated),
+            SurfaceErrorKind::Outdated
+        );
+        assert_eq!(
+            classify_surface_error(&SurfaceError::Lost),
+            SurfaceErrorKind::Lost
+        );
+        assert_eq!(
+            classify_surface_error(&SurfaceError::Timeout),
+            SurfaceErrorKind::Timeout
+        );
+        assert_eq!(
+            classify_surface_error(&SurfaceError::OutOfMemory),
+            SurfaceErrorKind::OutOfMemory
+        );
+        assert_eq!(
+            classify_surface_error(&SurfaceError::Other),
+            SurfaceErrorKind::Other
+        );
+    }
+
+    #[test]
+    fn recovery_action_distinguishes_rebuild_from_skip() {
+        // Outdated/Lost are recovery actions (reconfigure / rebuild); the
+        // transient variants are plain skips. Asserting the classification here
+        // pins the contract the worker's frame path branches on.
+        let is_recovery = |kind: SurfaceErrorKind| {
+            matches!(kind, SurfaceErrorKind::Outdated | SurfaceErrorKind::Lost)
+        };
+        assert!(is_recovery(SurfaceErrorKind::Outdated));
+        assert!(is_recovery(SurfaceErrorKind::Lost));
+        assert!(!is_recovery(SurfaceErrorKind::Timeout));
+        assert!(!is_recovery(SurfaceErrorKind::OutOfMemory));
+        assert!(!is_recovery(SurfaceErrorKind::Other));
+    }
+
+    #[test]
+    fn idle_clear_color_is_the_app_ground() {
+        // UI-SPEC E3: the idle frame is the documented ground, not an
+        // arbitrary placeholder.
+        assert_eq!(
+            IDLE_CLEAR_COLOR,
+            [30.0 / 255.0, 30.0 / 255.0, 30.0 / 255.0, 1.0]
+        );
     }
 }

@@ -82,9 +82,17 @@ impl SurfacePresenter for FallbackPresenter {
         Err(self.unsupported())
     }
 
+    fn rebind_instance(
+        &mut self,
+        _instance: &reco_core::wgpu::Instance,
+    ) -> Result<(), PresenterError> {
+        Err(self.unsupported())
+    }
+
     fn configure(
         &mut self,
         _device: &reco_core::wgpu::Device,
+        _queue: &reco_core::wgpu::Queue,
         _adapter: &reco_core::wgpu::Adapter,
         _width: u32,
         _height: u32,
@@ -99,7 +107,11 @@ impl SurfacePresenter for FallbackPresenter {
         _right: &YuvData,
         _yaw: f32,
         _pitch: f32,
-    ) -> Result<(), PresenterError> {
+    ) -> Result<super::FrameOutcome, PresenterError> {
+        Err(self.unsupported())
+    }
+
+    fn render_idle(&mut self) -> Result<(), PresenterError> {
         Err(self.unsupported())
     }
 
@@ -132,6 +144,7 @@ mod tests {
         assert!(presenter.resize(1024, 768).is_ok());
         assert_eq!(presenter.viewport().width, 1024);
         // ... but every rendering operation reports a typed `Unsupported`.
+        assert!(presenter.render_idle().is_err());
         match presenter.unsupported() {
             PresenterError::Unsupported { reason } => {
                 assert!(!reason.is_empty());

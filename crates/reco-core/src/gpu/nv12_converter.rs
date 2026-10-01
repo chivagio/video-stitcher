@@ -70,13 +70,18 @@ pub struct Nv12Converter {
     /// Cached bind group for the current render target. Avoids per-frame
     /// descriptor pool allocation which causes OOM on Vulkan (wgpu#7525).
     ///
-    /// Stores a raw pointer to the texture for identity comparison (never
-    /// dereferenced). Stale addresses are not a risk here because wgpu
-    /// textures are `Arc`-wrapped internally - the pointer remains stable
-    /// for the texture's lifetime. The caller always passes the same
-    /// render target reference, and if a new texture is created (e.g.,
-    /// on resize), its address will differ, correctly invalidating the cache.
-    cached_bind_group: Option<(*const wgpu::Texture, wgpu::BindGroup)>,
+    /// Stores the render target texture's **address** as a `usize` identity
+    /// token for comparison (never dereferenced). wgpu textures are
+    /// `Arc`-wrapped internally, so the address is stable for the texture's
+    /// lifetime; a new texture (e.g. on resize) yields a different address and
+    /// correctly invalidates the cache.
+    ///
+    /// Stored as `usize` rather than `*const wgpu::Texture` so [`Nv12Converter`]
+    /// (and therefore [`crate::gpu::GpuContext`]) stays `Send` — consumers such
+    /// as the desktop GUI move the engine onto a worker thread. A raw pointer
+    /// is `!Send` even when it is only ever compared, which would otherwise
+    /// force an `unsafe impl Send` at every consumer boundary.
+    cached_bind_group: Option<(usize, wgpu::BindGroup)>,
     /// Triple-buffered readback buffers (avoids 3 MB allocation per frame at 1080p).
     readback_buffers: [Vec<u8>; 3],
     /// Reusable channel for map_async signaling (avoids per-frame channel alloc).
@@ -343,11 +348,11 @@ impl Nv12Converter {
         // Cache the bind group to avoid per-frame descriptor pool allocation,
         // which causes OOM on the Vulkan backend (wgpu#7525). Rebuild only
         // if the render target texture changes.
-        let texture_ptr: *const wgpu::Texture = render_target;
+        let texture_id: usize = std::ptr::from_ref(render_target) as usize;
         let needs_rebuild = self
             .cached_bind_group
             .as_ref()
-            .is_none_or(|(ptr, _)| *ptr != texture_ptr);
+            .is_none_or(|(id, _)| *id != texture_id);
 
         if needs_rebuild {
             let render_target_view =
@@ -370,7 +375,7 @@ impl Nv12Converter {
                     },
                 ],
             });
-            self.cached_bind_group = Some((texture_ptr, bind_group));
+            self.cached_bind_group = Some((texture_id, bind_group));
         }
 
         let (_, bind_group) = self
