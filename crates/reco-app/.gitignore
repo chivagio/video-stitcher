@@ -1,0 +1,4 @@
+# Frontend build artifacts (Vite). `npm --prefix crates/reco-app run build`
+# regenerates these; they are never committed (the Tauri build consumes them).
+node_modules/
+ui/dist/

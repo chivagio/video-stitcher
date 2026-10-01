@@ -1,9 +1,52 @@
-/* Phase 1 walking-skeleton chrome.
+/* Phase 1 walking-skeleton chrome (UI-SPEC Design System / Surface Layout /
+ * Spacing / Typography / Color).
  *
  * The top region must stay transparent so the native panorama child view shows
- * through (UI-SPEC Surface Layout Contract). The chrome is a bottom-anchored
- * flex column: event/status log (160px) then control row (48px).
+ * through: never paint a background over it (Pitfall 6). The chrome is a
+ * bottom-anchored flex column — event/status log (160px) then control row
+ * (48px).
+ *
+ * Tokens (UI-SPEC), declared here once:
+ *   dominant  #1e1e1e   secondary #2a2a2a   accent #4a9eff (Start preview only)
+ *   info      #c8c8c8   warn      #e0a02e   error  #e5484d
+ *   body      14px/1.5  label     14px/600  heading 20px/600
+ *   spacing   4 / 8 / 16 / 24 / 32 / 48 / 64
  */
+
+:root {
+  /* Colour */
+  --color-dominant: #1e1e1e;
+  --color-secondary: #2a2a2a;
+  --color-accent: #4a9eff;
+  --color-body-text: #e8e8e8;
+  --color-log-info: #c8c8c8;
+  --color-log-warn: #e0a02e;
+  --color-log-error: #e5484d;
+
+  /* Spacing scale (multiples of 4) */
+  --space-xs: 4px;
+  --space-sm: 8px;
+  --space-md: 16px;
+  --space-lg: 24px;
+  --space-xl: 32px;
+  --space-2xl: 48px;
+  --space-3xl: 64px;
+
+  /* Chrome geometry (UI-SPEC Surface Layout Contract) */
+  --log-pane-height: 160px;
+  --control-row-height: 48px;
+
+  /* Typography */
+  --font-ui: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --text-body: 14px;
+  --text-label: 14px;
+  --text-heading: 20px;
+  --line-body: 1.5;
+  --line-tight: 1.2;
+  --weight-regular: 400;
+  --weight-semibold: 600;
+}
 
 * {
   box-sizing: border-box;
@@ -12,62 +55,153 @@
 html,
 body {
   margin: 0;
-  /* Transparent: never paint a background over the panorama region. */
+  padding: 0;
+  /* Transparent: the native panorama child view renders in the uncovered top
+   * region. Painting a background here would hide it (Pitfall 6). */
   background: transparent;
-  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-  color: #e8e8e8;
+  color: var(--color-body-text);
+  font-family: var(--font-ui);
+  font-size: var(--text-body);
+  line-height: var(--line-body);
+  font-weight: var(--weight-regular);
 }
 
-/* Bottom-anchored chrome column; the rest of the window is left uncovered. */
-#chrome {
+/* Bottom-anchored chrome column. The remaining top area is left uncovered. */
+#chrome,
+.chrome {
   position: fixed;
   left: 0;
   right: 0;
   bottom: 0;
   display: flex;
   flex-direction: column;
-  height: 208px; /* log 160 + control row 48 */
+  /* log 160 + control row 48 = 208px, matching ViewportRect::for_window. */
+  height: calc(var(--log-pane-height) + var(--control-row-height));
 }
 
-#log {
-  height: 160px;
+/* ------------------------------------------------------------------ log pane */
+
+.log {
+  height: var(--log-pane-height);
+  flex: 0 0 var(--log-pane-height);
   overflow-y: auto;
-  padding: 8px 12px;
-  background: rgba(20, 20, 24, 0.92);
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 12px;
-  line-height: 1.5;
+  overflow-x: hidden;
+  padding: var(--space-sm) var(--space-md);
+  background: var(--color-dominant);
+  font-family: var(--font-mono);
+  font-size: var(--text-body);
+  line-height: var(--line-body);
 }
 
-.event.info {
-  color: #cfe8ff;
-}
-.event.warn {
-  color: #ffd479;
-}
-.event.error {
-  color: #ff8080;
+/* Empty state: shown until the first event arrives. */
+.log-empty {
+  padding: var(--space-sm) 0;
 }
 
-#controls {
-  height: 48px;
+.log-empty-heading {
+  margin: 0 0 var(--space-sm);
+  font-family: var(--font-ui);
+  font-size: var(--text-heading);
+  font-weight: var(--weight-semibold);
+  line-height: var(--line-tight);
+  color: var(--color-body-text);
+}
+
+.log-empty-body {
+  margin: 0;
+  font-family: var(--font-ui);
+  font-size: var(--text-body);
+  font-weight: var(--weight-regular);
+  line-height: var(--line-body);
+  color: var(--color-log-info);
+}
+
+.log-lines {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-xs);
+}
+
+/* Append-only log lines: `[HH:MM:SS] LEVEL  message`. */
+.log-line {
+  margin: 0;
+  /* Long worker messages wrap instead of forcing a horizontal scrollbar. */
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  white-space: pre-wrap;
+  color: var(--color-log-info);
+}
+
+.log-level {
+  font-weight: var(--weight-semibold);
+  /* Level carries the severity colour; the message text stays body grey. */
+}
+
+.log-line--info .log-level {
+  color: var(--color-log-info);
+}
+
+.log-line--warn .log-level {
+  color: var(--color-log-warn);
+}
+
+.log-line--error .log-level {
+  color: var(--color-log-error);
+}
+
+/* ---------------------------------------------------------------- control row */
+
+.controls {
+  height: var(--control-row-height);
+  flex: 0 0 var(--control-row-height);
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 0 12px;
-  background: rgba(28, 28, 34, 0.96);
+  gap: var(--space-sm);
+  padding: 0 var(--space-md);
+  background: var(--color-secondary);
 }
 
-#controls button {
-  padding: 6px 14px;
-  border: 1px solid #4a4a55;
-  border-radius: 4px;
-  background: #38383f;
-  color: #e8e8e8;
-  font-size: 13px;
+.control-btn {
+  /* Desktop pointer target: padding 8px 16px, minimum hit height 32px. */
+  padding: var(--space-sm) var(--space-md);
+  min-height: 32px;
+  border: 1px solid transparent;
+  border-radius: var(--space-xs);
+  background: var(--color-dominant);
+  color: var(--color-body-text);
+  font-family: var(--font-ui);
+  font-size: var(--text-label);
+  font-weight: var(--weight-semibold);
+  line-height: var(--line-tight);
   cursor: pointer;
 }
 
-#controls button:hover {
-  background: #45454e;
+.control-btn:hover:not(:disabled) {
+  background: #333333;
+}
+
+.control-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* Accent is reserved for the Start preview button's active/focus state and the
+ * button focus ring. It is NOT used for Import or Export, for log text, or for
+ * backgrounds (UI-SPEC Color). */
+.control-btn--primary:active:not(:disabled),
+.control-btn--primary.is-active:not(:disabled) {
+  border-color: var(--color-accent);
+  color: var(--color-accent);
+}
+
+.control-btn--primary:focus,
+.control-btn--primary:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--color-accent);
+}
+
+/* Keyboard focus ring for Import/Export: neutral, never accent. */
+.control-btn:not(.control-btn--primary):focus-visible {
+  outline: 2px solid var(--color-secondary);
+  outline-offset: 1px;
 }

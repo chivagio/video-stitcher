@@ -8,16 +8,35 @@
   </head>
   <body>
     <!--
-      Phase 1 walking-skeleton chrome. The top region is intentionally left
-      transparent and uncovered: the native panorama child view renders there
-      (UI-SPEC Surface Layout Contract). Do not paint a background over it.
+      Phase 1 walking-skeleton chrome (UI-SPEC Surface Layout Contract).
+
+      Two regions, one window:
+        * the top region is intentionally TRANSPARENT and UNCOVERED — the native
+          panorama child view (Rust/WGPU) renders there. Do not paint a
+          background over it.
+        * the bottom 208px is the webview chrome: the event/status log (160px)
+          then the control row (48px).
+
+      The webview never sizes, moves, or creates the native view, and no raw
+      window handle crosses this boundary (CONTEXT D-02).
     -->
-    <div id="chrome">
-      <div id="log" aria-live="polite"></div>
-      <div id="controls">
-        <button id="import" type="button">Import</button>
-        <button id="preview" type="button">Start preview</button>
-        <button id="export" type="button">Export</button>
+    <div id="chrome" class="chrome">
+      <div id="log" class="log" role="log" aria-live="polite" aria-label="Event log">
+        <div id="log-empty" class="log-empty">
+          <h2 class="log-empty-heading">No events yet</h2>
+          <p class="log-empty-body">
+            Press <strong>Import</strong> to load the test clips, then
+            <strong>Start preview</strong> to render the stitched panorama.
+          </p>
+        </div>
+        <div id="log-lines" class="log-lines"></div>
+      </div>
+      <div id="controls" class="controls" role="toolbar" aria-label="Engine controls">
+        <button id="import" class="control-btn" type="button">Import</button>
+        <button id="preview" class="control-btn control-btn--primary" type="button">
+          Start preview
+        </button>
+        <button id="export" class="control-btn" type="button">Export</button>
       </div>
     </div>
     <script type="module" src="./main.ts"></script>
