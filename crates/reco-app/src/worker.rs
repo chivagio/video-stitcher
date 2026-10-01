@@ -166,6 +166,11 @@ impl EventSink {
     fn presenter(&self, kind: crate::presenter::PresenterKind, reason: Option<String>) {
         let _ = self.tx.send(WorkerEvent::Presenter { kind, reason });
     }
+
+    /// Emit the active view mode (PREV-03).
+    fn view(&self, mode: crate::presenter::ViewMode) {
+        let _ = self.tx.send(WorkerEvent::View { mode });
+    }
 }
 
 /// The recovery action a classified surface error demands (FOUND-05).
@@ -263,6 +268,15 @@ pub trait EngineBackend: Send {
     /// Show the separate preview window (PREV-05 "Show preview window" action).
     fn show_preview_window(&mut self, events: &EventSink);
 
+    /// Switch the preview view mode (PREV-03).
+    ///
+    /// Stores the mode on the worker (NOT on the presenter); the next session
+    /// tick picks the render path from it. Requesting the already-active mode
+    /// is a no-op that emits no `View` event and no INFO line. The switch does
+    /// NOT touch the transport frame or pose — it is applied at a tick
+    /// boundary and preserves the playhead exactly.
+    fn set_view(&mut self, mode: crate::presenter::ViewMode, events: &EventSink);
+
     /// Whether the GPU device was lost and needs recovery (FOUND-05).
     ///
     /// Read by the worker loop after every command and every preview tick so a
@@ -354,6 +368,9 @@ fn handle_command<B: EngineBackend>(
         }
         WorkerCommand::ShowPreviewWindow => {
             backend.show_preview_window(events);
+        }
+        WorkerCommand::SetView(mode) => {
+            backend.set_view(mode, events);
         }
         WorkerCommand::Export => {
             interrupted.store(false, Ordering::SeqCst);
@@ -613,6 +630,12 @@ pub struct GpuEngineBackend {
     window_height: u32,
     /// Current webview chrome state (source of truth for the native viewport).
     chrome: crate::presenter::ChromeState,
+    /// Current preview view mode (PREV-03): source tiles vs. stitched panorama.
+    ///
+    /// Stored on the worker (NOT on the presenter); the session tick picks the
+    /// render path from it. A switch is applied at a tick boundary and never
+    /// touches the transport frame or pose.
+    view_mode: crate::presenter::ViewMode,
     /// The loaded calibration, if `Import` has run.
     calibration: Option<reco_core::calibration::MatchCalibration>,
     /// The open decode source, if `Import` has run.
@@ -770,6 +793,7 @@ impl GpuEngineBackend {
             window_width: 1280,
             window_height: 800,
             chrome: crate::presenter::ChromeState::default(),
+            view_mode: crate::presenter::ViewMode::Panorama,
             calibration: None,
             source: None,
             input_size: None,
@@ -1281,6 +1305,11 @@ impl EngineBackend for GpuEngineBackend {
         // `&mut` (the readback path needs `&mut StitchRenderer` for
         // `render_and_readback_rgba`) while the presenter is borrowed `&mut`
         // alongside it. `fov_degrees` is passed to every impl uniformly (PREV-04).
+        // The view mode (PREV-03) picks the render path: Panorama → the
+        // stitched panorama, Source → the two raw source tiles. The mode is
+        // captured before the split-borrow; it is a pure function of the last
+        // requested mode and never touches the transport frame or pose.
+        let view_mode = self.view_mode;
         let Self {
             renderer,
             presenter,
@@ -1290,14 +1319,19 @@ impl EngineBackend for GpuEngineBackend {
             let renderer = renderer
                 .as_mut()
                 .ok_or_else(|| WorkerError::Engine("renderer missing during session".into()))?;
-            presenter.render_frame(
-                renderer,
-                &pair.left,
-                &pair.right,
-                render.yaw,
-                render.pitch,
-                fov_degrees,
-            )
+            match view_mode {
+                crate::presenter::ViewMode::Panorama => presenter.render_frame(
+                    renderer,
+                    &pair.left,
+                    &pair.right,
+                    render.yaw,
+                    render.pitch,
+                    fov_degrees,
+                ),
+                crate::presenter::ViewMode::Source => {
+                    presenter.render_source(renderer, &pair.left, &pair.right)
+                }
+            }
         };
         match outcome {
             Ok(crate::presenter::FrameOutcome::Presented) => {
@@ -1511,6 +1545,23 @@ impl EngineBackend for GpuEngineBackend {
         }
     }
 
+    fn set_view(&mut self, mode: crate::presenter::ViewMode, events: &EventSink) {
+        // Idempotent no-op: requesting the already-active mode changes nothing
+        // and emits no `View` event and no INFO line (PREV-03).
+        if mode == self.view_mode {
+            return;
+        }
+        self.view_mode = mode;
+        events.info(format!(
+            "view switched to {}",
+            match mode {
+                crate::presenter::ViewMode::Source => "source",
+                crate::presenter::ViewMode::Panorama => "panorama",
+            }
+        ));
+        events.view(mode);
+    }
+
     fn recovery_pending(&self) -> bool {
         self.device_lost.load(Ordering::SeqCst)
     }
@@ -1672,6 +1723,8 @@ mod tests {
         lost: Arc<AtomicBool>,
         /// The mock's active presenter (PREV-05).
         active_kind: crate::presenter::PresenterKind,
+        /// The mock's current view mode (PREV-03).
+        view_mode: crate::presenter::ViewMode,
     }
 
     impl MockBackend {
@@ -1687,6 +1740,7 @@ mod tests {
                 import_fails: false,
                 lost: Arc::new(AtomicBool::new(false)),
                 active_kind: crate::presenter::PresenterKind::Native,
+                view_mode: crate::presenter::ViewMode::Panorama,
             }
         }
 
@@ -1716,6 +1770,14 @@ mod tests {
 
         fn tick_session(&mut self, events: &EventSink) -> Result<(), WorkerError> {
             self.record("tick");
+            // Record which render path the view mode selected (PREV-03): the
+            // mock has no GPU, so it records the path the real backend's
+            // `tick_session` would take. Done before the mutable session borrow
+            // so the ops lock does not alias the session borrow.
+            match self.view_mode {
+                crate::presenter::ViewMode::Panorama => self.record("render_panorama"),
+                crate::presenter::ViewMode::Source => self.record("render_source"),
+            }
             let Some(t) = self.session.as_mut() else {
                 return Ok(());
             };
@@ -1796,6 +1858,24 @@ mod tests {
 
         fn show_preview_window(&mut self, _events: &EventSink) {
             self.record("show_preview_window");
+        }
+
+        fn set_view(&mut self, mode: crate::presenter::ViewMode, events: &EventSink) {
+            self.record("set_view");
+            // Mirror the real backend: idempotent no-op when the mode is
+            // already active (no `View` event, no INFO line).
+            if mode == self.view_mode {
+                return;
+            }
+            self.view_mode = mode;
+            events.info(format!(
+                "view switched to {}",
+                match mode {
+                    crate::presenter::ViewMode::Source => "source",
+                    crate::presenter::ViewMode::Panorama => "panorama",
+                }
+            ));
+            events.view(mode);
         }
 
         fn recovery_pending(&self) -> bool {

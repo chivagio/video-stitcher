@@ -163,6 +163,30 @@ impl SurfacePresenter for ReadbackPresenter {
         Ok(FrameOutcome::Presented)
     }
 
+    fn render_source(
+        &mut self,
+        renderer: &mut StitchRenderer,
+        left: &YuvData,
+        right: &YuvData,
+    ) -> Result<FrameOutcome, PresenterError> {
+        let left_planes = left.as_planes();
+        let right_planes = right.as_planes();
+        // Render the source tiles into the internal target and read back,
+        // mirroring `render_frame`'s panorama readback path.
+        let rgba = renderer
+            .render_source_and_readback_rgba(&left_planes, &right_planes)
+            .map_err(|e| PresenterError::Surface {
+                reason: format!("render_source_and_readback_rgba failed: {e}"),
+            })?;
+        if let Some(bytes) = rgba
+            && self.should_send()
+            && let Some(channel) = self.channel.as_ref()
+        {
+            let _ = channel.send(tauri::ipc::Response::new(bytes.to_vec()));
+        }
+        Ok(FrameOutcome::Presented)
+    }
+
     fn render_idle(&mut self) -> Result<(), PresenterError> {
         // No-op: the webview owns the region in readback mode and paints its
         // degraded banner/idle state itself; there is no surface to clear.

@@ -500,6 +500,50 @@ impl SurfacePresenter for X11Presenter {
         Ok(FrameOutcome::Presented)
     }
 
+    fn render_source(
+        &mut self,
+        renderer: &mut StitchRenderer,
+        left: &YuvData,
+        right: &YuvData,
+    ) -> Result<FrameOutcome, PresenterError> {
+        let surface_format = self.surface_format.ok_or(PresenterError::NotConfigured)?;
+        let frame = match self.surface.get_current_texture() {
+            Ok(f) => f,
+            Err(e) => {
+                let kind = super::classify_surface_error(&e);
+                return match kind {
+                    crate::presenter::SurfaceErrorKind::Outdated
+                    | crate::presenter::SurfaceErrorKind::Lost => {
+                        Err(PresenterError::SurfaceLost { kind })
+                    }
+                    crate::presenter::SurfaceErrorKind::Timeout
+                    | crate::presenter::SurfaceErrorKind::OutOfMemory
+                    | crate::presenter::SurfaceErrorKind::Other => {
+                        Ok(FrameOutcome::Skipped { kind })
+                    }
+                };
+            }
+        };
+        let render_format = StitchRenderer::strip_srgb(surface_format);
+        let view = frame
+            .texture
+            .create_view(&reco_core::wgpu::TextureViewDescriptor {
+                format: Some(render_format),
+                ..Default::default()
+            });
+
+        let left_planes = left.as_planes();
+        let right_planes = right.as_planes();
+        renderer
+            .render_source_tiles(&left_planes, &right_planes, &view)
+            .map_err(|e| PresenterError::Surface {
+                reason: format!("render_source_tiles failed: {e}"),
+            })?;
+
+        frame.present();
+        Ok(FrameOutcome::Presented)
+    }
+
     fn render_idle(&mut self) -> Result<(), PresenterError> {
         // UI-SPEC E3: paint the reserved region with the app ground colour
         // before the first stitched frame so it is never an undefined/black

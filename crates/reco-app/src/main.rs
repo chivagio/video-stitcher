@@ -68,7 +68,8 @@ fn main() -> anyhow::Result<()> {
             commands::set_chrome,
             commands::set_presenter,
             commands::preview_attach_readback,
-            commands::show_preview_window
+            commands::show_preview_window,
+            commands::set_view
         ])
         .setup(|app| {
             if let Err(e) = run_skeleton(app) {

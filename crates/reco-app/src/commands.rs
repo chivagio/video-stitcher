@@ -240,6 +240,22 @@ pub async fn show_preview_window(state: tauri::State<'_, WorkerHandle>) -> Resul
     state.send(WorkerCommand::ShowPreviewWindow)
 }
 
+/// Switch the preview between source tiles and the stitched panorama (PREV-03).
+///
+/// Thin: posts `SetView`; the worker applies the switch at a tick boundary.
+/// Typed [`ViewMode`](crate::presenter::ViewMode) — never a string.
+///
+/// # Errors
+///
+/// Returns [`WorkerError::ChannelClosed`] if the worker has already exited.
+#[tauri::command]
+pub async fn set_view(
+    state: tauri::State<'_, WorkerHandle>,
+    mode: crate::presenter::ViewMode,
+) -> Result<(), WorkerError> {
+    state.send(WorkerCommand::SetView(mode))
+}
+
 /// A command from the UI to the engine worker.
 ///
 /// `Clone + Send + 'static` — the compile-time assertion in `events.rs`
@@ -324,6 +340,14 @@ pub enum WorkerCommand {
 
     /// Show the separate preview window (PREV-05).
     ShowPreviewWindow,
+
+    /// Switch the preview between source tiles and the stitched panorama
+    /// (PREV-03).
+    ///
+    /// Typed [`ViewMode`](crate::presenter::ViewMode) — never a string. The
+    /// worker applies the switch at a tick boundary; the playhead and pose are
+    /// preserved.
+    SetView(crate::presenter::ViewMode),
 
     /// Stop the worker loop and return.
     Shutdown,
@@ -465,6 +489,26 @@ mod tests {
             WorkerCommand::SetPresenter(crate::presenter::PresenterKind::SeparateWindow)
         );
         assert_eq!(rx.recv().unwrap(), WorkerCommand::ShowPreviewWindow);
+    }
+
+    #[test]
+    fn set_view_command_round_trips_through_the_channel() {
+        let (tx, rx) = mpsc::channel();
+        let handle = WorkerHandle::new(tx);
+        handle
+            .send(WorkerCommand::SetView(crate::presenter::ViewMode::Source))
+            .unwrap();
+        handle
+            .send(WorkerCommand::SetView(crate::presenter::ViewMode::Panorama))
+            .unwrap();
+        assert_eq!(
+            rx.recv().unwrap(),
+            WorkerCommand::SetView(crate::presenter::ViewMode::Source)
+        );
+        assert_eq!(
+            rx.recv().unwrap(),
+            WorkerCommand::SetView(crate::presenter::ViewMode::Panorama)
+        );
     }
 
     #[test]

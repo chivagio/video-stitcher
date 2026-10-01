@@ -368,6 +368,54 @@ impl StitchRenderer {
         Ok(data)
     }
 
+    /// Render the two raw source tiles into the internal target and read back
+    /// tightly-packed RGBA pixels (PREV-03 source mode for the readback
+    /// presenter).
+    ///
+    /// Mirrors [`render_and_readback_rgba`](Self::render_and_readback_rgba) but
+    /// draws the raw source tiles (left | right, letterboxed) instead of the
+    /// stitched panorama. Uses the same triple-buffered readback staging, so
+    /// the returned slice is from 2 frames ago (`None` on the first two calls
+    /// during warmup).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PipelineError::InvalidConfig`] if the readback helper cannot
+    /// be initialized or a plane slice is too small.
+    pub fn render_source_and_readback_rgba(
+        &mut self,
+        left: &YuvPlanes<'_>,
+        right: &YuvPlanes<'_>,
+    ) -> Result<Option<&[u8]>, PipelineError> {
+        // Render source tiles into the internal render target.
+        let target_view = self
+            .pipeline
+            .render_target()
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        self.render_source_tiles(left, right, &target_view)?;
+
+        // Read back through the same triple-buffered staging as
+        // `render_and_readback_rgba`. The source-tile draw was already
+        // submitted to the queue by `render_source_tiles`; the readback
+        // copies the target into a staging buffer and maps it.
+        if self.rgba.is_none() {
+            let w = self.pipeline.viewport().width;
+            let h = self.pipeline.viewport().height;
+            self.rgba = Some(RgbaReadback::new(self.pipeline.gpu(), w, h).map_err(|e| {
+                PipelineError::InvalidConfig {
+                    reason: format!("RGBA readback init: {e}"),
+                }
+            })?);
+        }
+        let rgba = self.rgba.as_mut().unwrap();
+        let data = rgba
+            .readback_from_texture(self.pipeline.gpu(), self.pipeline.render_target())
+            .map_err(|e| PipelineError::InvalidConfig {
+                reason: format!("RGBA readback: {e}"),
+            })?;
+        Ok(data)
+    }
+
     /// Flush one pending RGBA frame from the triple-buffer pipeline.
     ///
     /// Call in a loop after the frame loop ends to drain the final 1-2

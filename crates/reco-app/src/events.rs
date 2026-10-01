@@ -120,6 +120,16 @@ pub enum WorkerEvent {
         /// Why the active presenter was chosen, when it was a fallback.
         reason: Option<String>,
     },
+
+    /// The preview view mode changed (PREV-03).
+    ///
+    /// Carries only the [`ViewMode`](crate::presenter::ViewMode) — never a
+    /// surface or texture handle. Emitted only on an actual change; requesting
+    /// the already-active mode is a no-op that emits no event.
+    View {
+        /// The new view mode.
+        mode: crate::presenter::ViewMode,
+    },
 }
 
 /// The UI-facing shape of an event-log line (UI-SPEC Event Log Contract).
@@ -197,6 +207,16 @@ impl WorkerEvent {
                     Some(reason) => crate::presenter::fallback_warn_line(*kind, reason),
                     None => format!("presenter: {}", kind.name()),
                 },
+            },
+            WorkerEvent::View { mode } => LogLine {
+                level: Level::Info,
+                message: format!(
+                    "view switched to {}",
+                    match mode {
+                        crate::presenter::ViewMode::Source => "source",
+                        crate::presenter::ViewMode::Panorama => "panorama",
+                    }
+                ),
             },
         }
     }
@@ -440,6 +460,38 @@ mod tests {
         };
         assert_eq!(active.to_log_line().level, Level::Info);
         assert_eq!(active.to_log_line().message, "presenter: Native");
+    }
+
+    #[test]
+    fn view_event_roundtrips_through_serde() {
+        let event = WorkerEvent::View {
+            mode: crate::presenter::ViewMode::Source,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(
+            json.contains("\"kind\":\"view\""),
+            "unexpected json: {json}"
+        );
+        assert!(
+            json.contains("\"mode\":\"source\""),
+            "unexpected json: {json}"
+        );
+        let back: WorkerEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(event, back);
+    }
+
+    #[test]
+    fn view_event_projects_to_an_info_log_line() {
+        let source = WorkerEvent::View {
+            mode: crate::presenter::ViewMode::Source,
+        };
+        assert_eq!(source.to_log_line().level, Level::Info);
+        assert_eq!(source.to_log_line().message, "view switched to source");
+
+        let panorama = WorkerEvent::View {
+            mode: crate::presenter::ViewMode::Panorama,
+        };
+        assert_eq!(panorama.to_log_line().message, "view switched to panorama");
     }
 
     #[test]

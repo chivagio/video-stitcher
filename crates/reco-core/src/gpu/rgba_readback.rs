@@ -180,6 +180,45 @@ impl RgbaReadback {
         }
     }
 
+    /// Read back a texture that was already rendered to by a prior submission
+    /// (e.g. [`SourceTileRenderer::draw`](crate::render::source_tiles::SourceTileRenderer::draw)).
+    ///
+    /// Unlike [`readback`](Self::readback), this does **not** take render
+    /// commands — the caller has already submitted its own draw. It only
+    /// enqueues the `copy_texture_to_buffer` into the current staging slot,
+    /// then maps and strips the slot written 2 frames ago.
+    ///
+    /// Returns `None` on the first two calls (GPU warmup), and
+    /// `Some(&[u8])` of length `width * height * 4` afterward.
+    pub fn readback_from_texture(
+        &mut self,
+        gpu: &GpuContext,
+        source: &wgpu::Texture,
+    ) -> Result<Option<&[u8]>, RgbaReadbackError> {
+        let write_slot = self.current_slot;
+
+        self.submit_copy_from_texture(gpu, source, write_slot)?;
+
+        // Read back from 2 frames ago (pending >= 2).
+        let has_result = if self.pending_count >= 2 {
+            let read_slot = (write_slot + 1) % 3;
+            self.map_and_strip(gpu, read_slot)?;
+            true
+        } else {
+            false
+        };
+
+        self.pending_count = (self.pending_count + 1).min(2);
+        self.current_slot = (write_slot + 1) % 3;
+
+        if has_result {
+            let read_slot = (write_slot + 1) % 3;
+            Ok(Some(&self.output[read_slot]))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Flush one pending frame from the triple-buffer pipeline.
     ///
     /// Call this in a loop after the frame loop ends to drain remaining
@@ -246,6 +285,46 @@ impl RgbaReadback {
         );
 
         gpu.queue.submit([render_commands, encoder.finish()]);
+        Ok(())
+    }
+
+    /// Enqueue only a `copy_texture_to_buffer` into `slot` (no render
+    /// commands — the caller already submitted its own draw).
+    fn submit_copy_from_texture(
+        &self,
+        gpu: &GpuContext,
+        source: &wgpu::Texture,
+        slot: usize,
+    ) -> Result<(), RgbaReadbackError> {
+        let mut encoder = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("rgba_readback_encoder"),
+            });
+
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: source,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &self.staging[slot],
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(self.padded_bytes_per_row),
+                    rows_per_image: Some(self.height),
+                },
+            },
+            wgpu::Extent3d {
+                width: self.width,
+                height: self.height,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        gpu.queue.submit([encoder.finish()]);
         Ok(())
     }
 

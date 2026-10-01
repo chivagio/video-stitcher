@@ -148,6 +148,37 @@ pub const PRESENTER_CHAIN: [PresenterKind; 3] = [
     PresenterKind::Readback,
 ];
 
+/// Which content the preview region shows (PREV-03).
+///
+/// The source↔panorama comparison is a single toggle that switches the whole
+/// preview region between the stitched panorama and the two raw sources tiled
+/// side-by-side, sharing one transport/playhead (UI-SPEC Interaction rule 4).
+/// Serde snake_case so it round-trips through the typed `set_view` command and
+/// the `View` event without stringly-typed handling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ViewMode {
+    /// The two raw camera sources tiled side-by-side, letterboxed (contain).
+    Source,
+    /// The stitched panorama (the default).
+    #[default]
+    Panorama,
+}
+
+impl ViewMode {
+    /// Toggle to the other mode.
+    // Consumed by the UI (through the serialized `mode`) once the frontend
+    // wires the view toggle; the Rust seam is complete and typed.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn toggled(self) -> Self {
+        match self {
+            ViewMode::Source => ViewMode::Panorama,
+            ViewMode::Panorama => ViewMode::Source,
+        }
+    }
+}
+
 /// Whether a presenter-construction error forces the chain to fall through to
 /// the next step.
 ///
@@ -554,6 +585,36 @@ pub trait SurfacePresenter {
         fov_degrees: f32,
     ) -> Result<FrameOutcome, PresenterError>;
 
+    /// Render the two raw source tiles (left | right, letterboxed) into this
+    /// presenter's surface (PREV-03 source mode).
+    ///
+    /// Mirrors [`render_frame`](Self::render_frame) but draws the raw sources
+    /// instead of the stitched panorama. Implementations acquire the surface view
+    /// (or the readback target) and call
+    /// [`StitchRenderer::render_source_tiles`](reco_core::render::stitch_renderer::StitchRenderer::render_source_tiles)
+    /// — mirroring each presenter's existing acquire/classify/present contract.
+    ///
+    /// The default implementation returns [`PresenterError::Unsupported`] so a
+    /// presenter that cannot host source mode (e.g. the fallback presenter)
+    /// reports a typed error rather than panicking.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PresenterError::Unsupported`] from the default impl; surface
+    /// presenters return the same error vocabulary as
+    /// [`render_frame`](Self::render_frame).
+    fn render_source(
+        &mut self,
+        renderer: &mut StitchRenderer,
+        left: &YuvData,
+        right: &YuvData,
+    ) -> Result<FrameOutcome, PresenterError> {
+        let _ = (renderer, left, right);
+        Err(PresenterError::Unsupported {
+            reason: "source mode is not supported by this presenter".to_string(),
+        })
+    }
+
     /// Paint an idle/clear frame into the reserved region (UI-SPEC E3).
     ///
     /// Called **before the first stitched frame** so the panorama region is
@@ -764,6 +825,30 @@ mod tests {
         assert_eq!(
             IDLE_CLEAR_COLOR,
             [30.0 / 255.0, 30.0 / 255.0, 30.0 / 255.0, 1.0]
+        );
+    }
+
+    #[test]
+    fn view_mode_defaults_to_panorama_and_toggles() {
+        // PREV-03: the default view is the stitched panorama; toggling
+        // switches to source and back.
+        assert_eq!(ViewMode::default(), ViewMode::Panorama);
+        assert_eq!(ViewMode::Panorama.toggled(), ViewMode::Source);
+        assert_eq!(ViewMode::Source.toggled(), ViewMode::Panorama);
+        // A pure function of the last requested mode: Source → Panorama →
+        // Source returns to Source.
+        assert_eq!(ViewMode::Source.toggled().toggled(), ViewMode::Source);
+    }
+
+    #[test]
+    fn view_mode_serializes_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&ViewMode::Source).unwrap(),
+            "\"source\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ViewMode::Panorama).unwrap(),
+            "\"panorama\""
         );
     }
 
