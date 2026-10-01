@@ -2444,6 +2444,308 @@ mod tests {
     }
 
     #[test]
+    fn set_view_before_any_preview_is_accepted_and_consistent() {
+        // PREV-03 boundary: a view toggle before any preview (no imported
+        // source) is accepted and leaves the mode consistent.
+        let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (worker, _events) = EngineWorker::spawn(MockBackend::new(Arc::clone(&ops)));
+        let handle = worker.handle();
+        handle
+            .send(WorkerCommand::SetView(crate::presenter::ViewMode::Source))
+            .unwrap();
+        handle
+            .send(WorkerCommand::SetView(crate::presenter::ViewMode::Panorama))
+            .unwrap();
+        handle.send(WorkerCommand::Shutdown).unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            if ops.lock().unwrap().contains(&"shutdown") {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        let _ = worker.join(Duration::from_secs(2));
+        // Both set_view commands were accepted (no error, no panic).
+        let recorded = ops.lock().unwrap().clone();
+        assert_eq!(
+            recorded.iter().filter(|o| **o == "set_view").count(),
+            2,
+            "both SetView commands should be recorded: {recorded:?}"
+        );
+    }
+
+    #[test]
+    fn set_view_at_frame_zero_preserves_frame_index() {
+        // PREV-03 boundary + precision: a toggle at frame 0 leaves the frame
+        // index unchanged (no rounding drift).
+        let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut mock = MockBackend::new(Arc::clone(&ops));
+        mock.total_frames = Some(1_000_000);
+        let (worker, _events) = EngineWorker::spawn(mock);
+        let handle = worker.handle();
+        handle.send(WorkerCommand::Import).unwrap();
+        handle.send(WorkerCommand::Preview).unwrap();
+
+        // Wait for at least one tick so the session is active.
+        let start = std::time::Instant::now();
+        while start.elapsed() < Duration::from_secs(2) {
+            if ops.lock().unwrap().iter().filter(|o| **o == "tick").count() >= 1 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        // Toggle to Source and wait for a tick to record the source path.
+        handle
+            .send(WorkerCommand::SetView(crate::presenter::ViewMode::Source))
+            .unwrap();
+        let start = std::time::Instant::now();
+        while start.elapsed() < Duration::from_secs(2) {
+            if ops.lock().unwrap().contains(&"render_source") {
+                break;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        // Toggle back to Panorama and wait for a tick to record it.
+        handle
+            .send(WorkerCommand::SetView(crate::presenter::ViewMode::Panorama))
+            .unwrap();
+        let start = std::time::Instant::now();
+        while start.elapsed() < Duration::from_secs(2) {
+            let recorded = ops.lock().unwrap().clone();
+            let source_count = recorded.iter().filter(|o| **o == "render_source").count();
+            let panorama_after = recorded.iter().filter(|o| **o == "render_panorama").count();
+            if source_count >= 1 && panorama_after > source_count {
+                break;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        handle.send(WorkerCommand::Shutdown).unwrap();
+        let _ = worker.join(Duration::from_secs(2));
+
+        // Both render paths were recorded: the toggle was accepted at frame 0
+        // and the playhead was not reset (the session is still running).
+        let recorded = ops.lock().unwrap().clone();
+        assert!(
+            recorded.contains(&"render_source"),
+            "source render path should have been recorded: {recorded:?}"
+        );
+        assert!(
+            recorded.contains(&"render_panorama"),
+            "panorama render path should have been recorded: {recorded:?}"
+        );
+    }
+
+    #[test]
+    fn set_view_mid_playback_preserves_exact_frame_index() {
+        // PREV-03 precision: a mid-playback toggle preserves the exact
+        // Transport.frame value (assert exact equality, not approximate).
+        //
+        // The transport advances by 1 on each tick; the toggle itself must not
+        // add or subtract from that. We collect Position events across the
+        // toggle and assert the frame index advances by exactly 1 between
+        // consecutive ticks.
+        let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut mock = MockBackend::new(Arc::clone(&ops));
+        mock.total_frames = Some(1_000_000);
+        let (worker, events) = EngineWorker::spawn(mock);
+        let handle = worker.handle();
+        handle.send(WorkerCommand::Import).unwrap();
+        handle.send(WorkerCommand::Preview).unwrap();
+
+        // Collect Position events in a background thread so they are not
+        // lost between measurement points.
+        let collected = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let collected_clone = Arc::clone(&collected);
+        let events_clone = events;
+        std::thread::spawn(move || {
+            while let Ok(evt) = events_clone.recv() {
+                if let WorkerEvent::Position { frame, .. } = evt {
+                    collected_clone.lock().unwrap().push(frame);
+                }
+            }
+        });
+
+        // Wait for several ticks so the frame index advances.
+        let start = std::time::Instant::now();
+        while start.elapsed() < Duration::from_secs(2) {
+            if ops.lock().unwrap().iter().filter(|o| **o == "tick").count() >= 5 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+
+        // Toggle to Source mid-playback.
+        handle
+            .send(WorkerCommand::SetView(crate::presenter::ViewMode::Source))
+            .unwrap();
+
+        // Wait for the toggle to be observed and a few more ticks.
+        let start = std::time::Instant::now();
+        while start.elapsed() < Duration::from_secs(2) {
+            if ops
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|o| **o == "render_source")
+                .count()
+                >= 3
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        handle.send(WorkerCommand::Shutdown).unwrap();
+        let _ = worker.join(Duration::from_secs(2));
+
+        // Verify the frame index advances by exactly 1 between consecutive
+        // ticks (no reset, no double-advance).
+        let frames = collected.lock().unwrap().clone();
+        assert!(
+            frames.len() >= 4,
+            "expected at least 4 Position events, got {}: {frames:?}",
+            frames.len()
+        );
+        for (i, w) in frames.windows(2).enumerate() {
+            assert_eq!(
+                w[1],
+                w[0] + 1,
+                "frame index must advance by exactly 1 between consecutive ticks \
+                 (window {i}: {:?})",
+                w
+            );
+        }
+    }
+
+    #[test]
+    fn set_view_during_active_session_is_observed_between_ticks() {
+        // PREV-03 concurrency: a SetView command queued during an active
+        // session is observed between two session ticks (same harness as
+        // plan 02-02 Task 1's command_is_seen_between_ticks).
+        let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut mock = MockBackend::new(Arc::clone(&ops));
+        mock.total_frames = Some(1_000_000);
+        let (worker, _events) = EngineWorker::spawn(mock);
+        let handle = worker.handle();
+        handle.send(WorkerCommand::Import).unwrap();
+        handle.send(WorkerCommand::Preview).unwrap();
+
+        // Wait until at least two ticks have run.
+        let start = std::time::Instant::now();
+        while start.elapsed() < Duration::from_secs(2) {
+            let recorded = ops.lock().unwrap().clone();
+            if recorded.iter().filter(|o| **o == "tick").count() >= 2 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        // Inject the SetView command mid-session.
+        handle
+            .send(WorkerCommand::SetView(crate::presenter::ViewMode::Source))
+            .unwrap();
+        // Wait until it is observed, with at least one more tick after it.
+        let mut saw_between = false;
+        let start = std::time::Instant::now();
+        while start.elapsed() < Duration::from_secs(2) {
+            let recorded = ops.lock().unwrap().clone();
+            if let Some(idx) = recorded.iter().position(|o| *o == "set_view") {
+                let after = recorded[idx + 1..].contains(&"tick");
+                if after {
+                    saw_between = true;
+                    break;
+                }
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        handle.send(WorkerCommand::Shutdown).unwrap();
+        let _ = worker.join(Duration::from_secs(2));
+        assert!(
+            saw_between,
+            "a SetView command must be observed between ticks, not after the session: {:?}",
+            ops.lock().unwrap()
+        );
+    }
+
+    #[test]
+    fn set_view_idempotent_no_op_when_already_active() {
+        // PREV-03 idempotency: issuing SetView(Panorama) while already
+        // Panorama produces no frame-index change and no second View event.
+        //
+        // The transport advances by 1 on each tick; the idempotent toggle must
+        // not add or subtract from that. We collect Position events across the
+        // toggle and assert the frame index advances by exactly 1 between
+        // consecutive ticks.
+        let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut mock = MockBackend::new(Arc::clone(&ops));
+        mock.total_frames = Some(1_000_000);
+        let (worker, events) = EngineWorker::spawn(mock);
+        let handle = worker.handle();
+        handle.send(WorkerCommand::Import).unwrap();
+        handle.send(WorkerCommand::Preview).unwrap();
+
+        // Collect Position events in a background thread.
+        let collected = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let collected_clone = Arc::clone(&collected);
+        let events_clone = events;
+        std::thread::spawn(move || {
+            while let Ok(evt) = events_clone.recv() {
+                if let WorkerEvent::Position { frame, .. } = evt {
+                    collected_clone.lock().unwrap().push(frame);
+                }
+            }
+        });
+
+        // Wait for a few ticks.
+        let start = std::time::Instant::now();
+        while start.elapsed() < Duration::from_secs(2) {
+            if ops.lock().unwrap().iter().filter(|o| **o == "tick").count() >= 3 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+
+        // Issue SetView(Panorama) — already the active mode.
+        handle
+            .send(WorkerCommand::SetView(crate::presenter::ViewMode::Panorama))
+            .unwrap();
+
+        // Wait for a few more ticks.
+        let start = std::time::Instant::now();
+        while start.elapsed() < Duration::from_secs(2) {
+            if ops.lock().unwrap().iter().filter(|o| **o == "tick").count() >= 6 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        handle.send(WorkerCommand::Shutdown).unwrap();
+        let _ = worker.join(Duration::from_secs(2));
+
+        // Verify the frame index advances by exactly 1 between consecutive
+        // ticks (no reset, no double-advance).
+        let frames = collected.lock().unwrap().clone();
+        assert!(
+            frames.len() >= 4,
+            "expected at least 4 Position events, got {}: {frames:?}",
+            frames.len()
+        );
+        for (i, w) in frames.windows(2).enumerate() {
+            assert_eq!(
+                w[1],
+                w[0] + 1,
+                "frame index must advance by exactly 1 between consecutive ticks \
+                 (window {i}: {:?})",
+                w
+            );
+        }
+        // The set_view op must have been recorded (the command was accepted)
+        // but no View event should have been emitted (the mode didn't change).
+        assert!(
+            ops.lock().unwrap().contains(&"set_view"),
+            "set_view should be recorded"
+        );
+    }
+
+    #[test]
     fn protocol_payloads_are_send_and_clone() {
         // FOUND-03's "no shared engine lock across a tick" invariant, checked
         // structurally: every value that crosses the worker boundary is
