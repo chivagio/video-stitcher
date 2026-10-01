@@ -69,7 +69,8 @@ fn main() -> anyhow::Result<()> {
             commands::set_presenter,
             commands::preview_attach_readback,
             commands::show_preview_window,
-            commands::set_view
+            commands::set_view,
+            commands::intent
         ])
         .setup(|app| {
             if let Err(e) = run_skeleton(app) {

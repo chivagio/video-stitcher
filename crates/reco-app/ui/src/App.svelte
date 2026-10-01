@@ -1,25 +1,272 @@
 <!--
   Phase 2 production preview shell (UI-SPEC Surface Layout Contract).
 
-  Minimal placeholder for Task 2 build verification. Task 3 replaces this
-  with the full component tree: transport bar, controls panel, log drawer,
-  preview surface, and state overlays.
+  The window is one full-window transparent webview composited ABOVE a
+  Rust-owned native wgpu child view (the stitched panorama). The webview
+  paints only the opaque chrome panels:
+
+    * bottom transport strip (72px, full width) — opaque
+    * right controls rail (40px collapsed / 280px expanded) — opaque
+    * event-log drawer (240px expanded / 0 collapsed) — opaque
+
+  The remaining TOP-LEFT region is intentionally TRANSPARENT and
+  UNPAINTED — the native panorama renders there. Never paint a
+  background, border, or shadow over it (Phase 2 constraint 1).
+
+  The webview never sizes, moves, or creates the native view, and no raw
+  window handle crosses this boundary (CONTEXT D-02).
 -->
-<main class="contents">
-  <div id="preview-region" class="preview-region" aria-label="Panorama"></div>
-</main>
+<script lang="ts">
+  import { onMount } from "svelte";
+  import { invoke } from "@tauri-apps/api/core";
+  import { transport } from "./lib/transport.svelte";
+  import { pose } from "./lib/pose.svelte";
+  import { presenter } from "./lib/presenter.svelte";
+  import { log } from "./lib/log.svelte";
+  import PreviewSurface from "./components/PreviewSurface.svelte";
+  import Timeline from "./components/Timeline.svelte";
+  import TimecodeReadout from "./components/TimecodeReadout.svelte";
+  import TransportButton from "./components/TransportButton.svelte";
+  import ViewToggle from "./components/ViewToggle.svelte";
+  import PresenterBadge from "./components/PresenterBadge.svelte";
+  import ControlsPanel from "./components/ControlsPanel.svelte";
+  import LogDrawer from "./components/LogDrawer.svelte";
+  import type { PresenterKind, ViewMode } from "./lib/types";
+
+  // Chrome state (reported to the worker via set_chrome).
+  let panelExpanded = $state(false);
+  let drawerExpanded = $state(false);
+
+  // View mode (mirrors the worker's ViewMode).
+  let viewMode = $state<ViewMode>("panorama");
+
+  // Initialize stores on mount.
+  onMount(() => {
+    void transport.init();
+    void pose.init();
+    void presenter.init();
+    void log.init();
+    return () => {
+      transport.destroy();
+      pose.destroy();
+      presenter.destroy();
+      log.destroy();
+    };
+  });
+
+  // Report chrome state changes to the worker.
+  $effect(() => {
+    void invoke("set_chrome", {
+      panel_expanded: panelExpanded,
+      drawer_expanded: drawerExpanded,
+    });
+  });
+
+  // Transport controls.
+  function handlePlayPause(): void {
+    if (transport.status === "playing") {
+      void transport.pause();
+    } else {
+      void transport.play();
+    }
+  }
+
+  function handleStepBack(): void {
+    void transport.step(-1);
+  }
+
+  function handleStepForward(): void {
+    void transport.step(1);
+  }
+
+  function handleLoopToggle(): void {
+    void transport.setLoop(!transport.loop);
+  }
+
+  function handleSeek(frame: number): void {
+    void transport.seek(frame);
+  }
+
+  // View toggle.
+  function handleViewToggle(): void {
+    const next = viewMode === "source" ? "panorama" : "source";
+    viewMode = next;
+    void invoke("set_view", { mode: next });
+  }
+
+  // Panel toggle.
+  function handlePanelToggle(): void {
+    panelExpanded = !panelExpanded;
+  }
+
+  // Drawer toggle.
+  function handleDrawerToggle(): void {
+    drawerExpanded = !drawerExpanded;
+  }
+
+  // Pose controls.
+  function handleFovChange(value: number): void {
+    void pose.setFov(value);
+  }
+
+  function handleResetView(): void {
+    void pose.reset();
+  }
+
+  function handlePresenterChange(value: PresenterKind | "auto"): void {
+    if (value !== "auto") {
+      void presenter.setPresenter(value);
+    }
+  }
+
+  // Readback attach.
+  function handleAttachReadback(): void {
+    // The Channel is created by the readback presenter attach command.
+    // This is a placeholder for the actual channel creation.
+  }
+
+  // Show preview window.
+  function handleShowPreviewWindow(): void {
+    void presenter.showPreviewWindow();
+  }
+
+  // Keyboard routing (focus-scoped).
+  function handleGlobalKeyDown(e: KeyboardEvent): void {
+    if (e.key === " ") {
+      e.preventDefault();
+      handlePlayPause();
+    } else if (e.key === ",") {
+      e.preventDefault();
+      handleStepBack();
+    } else if (e.key === ".") {
+      e.preventDefault();
+      handleStepForward();
+    } else if (e.key === "l" || e.key === "L") {
+      e.preventDefault();
+      handleLoopToggle();
+    } else if (e.key === "v" || e.key === "V") {
+      e.preventDefault();
+      handleViewToggle();
+    }
+  }
+
+  // Derived state.
+  const isPlaying = $derived(transport.status === "playing");
+  const controlsEnabled = $derived(transport.controlsEnabled);
+  const isWarning = $derived(presenter.kind !== "native");
+</script>
+
+<svelte:window onkeydown={handleGlobalKeyDown} />
+
+<div class="app-shell">
+  <!-- Preview surface (transparent in native mode) -->
+  <PreviewSurface
+    presenterKind={presenter.kind}
+    {viewMode}
+    onAttachReadback={handleAttachReadback}
+    onShowPreviewWindow={handleShowPreviewWindow}
+  />
+
+  <!-- Event-log drawer (above transport bar) -->
+  <LogDrawer expanded={drawerExpanded} onToggle={handleDrawerToggle} />
+
+  <!-- Transport bar (bottom) -->
+  <div class="transport-bar" role="toolbar" aria-label="Transport and engine controls">
+    <div class="transport-row">
+      <!-- Timeline row -->
+      <Timeline
+        frame={transport.frame}
+        total={transport.total}
+        disabled={!controlsEnabled}
+        onSeek={handleSeek}
+      />
+      <TimecodeReadout
+        current={transport.currentTimecode}
+        duration={transport.durationTimecode}
+      />
+    </div>
+
+    <div class="transport-row">
+      <!-- Control row -->
+      <TransportButton
+        icon="step-back"
+        label="Step back"
+        disabled={!controlsEnabled}
+        onClick={handleStepBack}
+      />
+      <TransportButton
+        icon={isPlaying ? "pause" : "play"}
+        label={isPlaying ? "Pause" : "Play"}
+        disabled={!controlsEnabled}
+        active={isPlaying}
+        onClick={handlePlayPause}
+      />
+      <TransportButton
+        icon="step-forward"
+        label="Step forward"
+        disabled={!controlsEnabled}
+        onClick={handleStepForward}
+      />
+      <TransportButton
+        icon="loop"
+        label="Loop"
+        disabled={!controlsEnabled}
+        active={transport.loop}
+        onClick={handleLoopToggle}
+      />
+      <ViewToggle
+        mode={viewMode}
+        disabled={!controlsEnabled}
+        onToggle={handleViewToggle}
+      />
+      <TransportButton
+        icon="log"
+        label="Log"
+        active={drawerExpanded}
+        onClick={handleDrawerToggle}
+      />
+      <PresenterBadge
+        label={presenter.badgeLabel}
+        isWarning={isWarning}
+      />
+    </div>
+  </div>
+
+  <!-- Controls panel (right edge) -->
+  <ControlsPanel
+    expanded={panelExpanded}
+    onToggle={handlePanelToggle}
+    onFovChange={handleFovChange}
+    onResetView={handleResetView}
+    onPresenterChange={handlePresenterChange}
+  />
+</div>
 
 <style>
-  /* The preview region must stay fully transparent — any background/border/
-   * shadow here would hide the native wgpu panorama (Phase 2 constraint 1). */
-  .preview-region {
+  .app-shell {
+    position: fixed;
+    inset: 0;
+    overflow: hidden;
+  }
+
+  .transport-bar {
     position: fixed;
     left: 0;
-    top: 0;
-    width: 100%;
-    height: 100%;
-    background: transparent;
-    border: 0;
-    box-shadow: none;
+    right: 0;
+    bottom: 0;
+    height: var(--transport-bar-height);
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: var(--space-xs);
+    padding: 0 var(--space-md);
+    background: var(--color-secondary);
+    z-index: 10;
+  }
+
+  .transport-row {
+    display: flex;
+    align-items: center;
+    gap: var(--space-sm);
   }
 </style>

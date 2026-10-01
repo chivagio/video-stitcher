@@ -256,6 +256,23 @@ pub async fn set_view(
     state.send(WorkerCommand::SetView(mode))
 }
 
+/// Forward a transport-agnostic input intent to the worker (PREV-04).
+///
+/// Thin, same contract as [`play`]: post `Intent` and return. The typed
+/// [`reco_control::ControlIntent`] is the pose/input vocabulary — the UI
+/// never invents a parallel input vocabulary (02-CONTEXT).
+///
+/// # Errors
+///
+/// Returns [`WorkerError::ChannelClosed`] if the worker has already exited.
+#[tauri::command]
+pub async fn intent(
+    state: tauri::State<'_, WorkerHandle>,
+    intent: reco_control::ControlIntent,
+) -> Result<(), WorkerError> {
+    state.send(WorkerCommand::Intent(intent))
+}
+
 /// A command from the UI to the engine worker.
 ///
 /// `Clone + Send + 'static` — the compile-time assertion in `events.rs`
