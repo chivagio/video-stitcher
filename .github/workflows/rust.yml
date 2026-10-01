@@ -22,11 +22,18 @@ env:
   # against /usr/include/obs/obs.h on every workspace-level cargo
   # command (clippy, test, doc, bench). Without it, any job that
   # touches reco-obs fails at build-script time.
+  #
+  # libwebkit2gtk-4.1-dev + libgtk-3-dev are the Tauri 2 / wry Linux
+  # build prerequisites for the reco-app host (pkg-config for
+  # webkit2gtk-4.1 and gtk+-3.0). webkit2gtk-4.1 is ALSO a runtime
+  # prerequisite for DIAG-05. Required now because workspace-level
+  # commands (`--workspace`) build reco-app too.
   APT_PACKAGES: >-
     libavcodec-dev libavformat-dev libavutil-dev
     libswscale-dev libavdevice-dev libavfilter-dev libswresample-dev
     libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
     libfontconfig1-dev libobs-dev
+    libwebkit2gtk-4.1-dev libgtk-3-dev
     pkg-config clang
 
 jobs:
@@ -47,6 +54,11 @@ jobs:
           packages: ${{ env.APT_PACKAGES }}
       - name: Format check
         run: cargo fmt --all -- --check
+      - name: wgpu pin gate (FOUND-04)
+        # Fails if any non-engine crate declares `wgpu` directly, if the
+        # workspace pin in [workspace.dependencies] drifts from 28, or if
+        # Cargo.lock resolves a non-28 wgpu. No GPU required.
+        run: bash scripts/check-wgpu-pin.sh
       - name: Clippy (default features)
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Clippy (with profiling)
@@ -220,6 +232,12 @@ jobs:
         run: cargo check -p reco-cli
       - name: Check reco-gui (macOS Metal path)
         run: cargo check -p reco-gui
+      - name: Check reco-app (Tauri host, compile-only)
+        # Compile-check only. macOS ships WKWebView in the OS, so no
+        # webkit2gtk system package is needed. This is NOT the
+        # four-platform render gate — CI has no GPU runner; that gate is
+        # the recorded manual UAT run (Plan 05).
+        run: cargo check -p reco-app
       - name: Check reco-detect (coreml + load-dynamic)
         run: cargo check -p reco-detect --features coreml,load-dynamic
 
@@ -245,7 +263,12 @@ jobs:
       # reco-gui transitively depends on ffmpeg-sys-next via reco-io,
       # which fails to build on windows-latest without vcpkg FFmpeg
       # provisioning. Deferred to M8 once we wire vcpkg in a way that
-      # doesn't blow per-push CI time budget.
+      # doesn't blow per-push CI time budget. The Tauri host (`reco-app`)
+      # has the SAME FFmpeg constraint and is likewise NOT built here.
+      #
+      # CAVEAT: CI green does NOT mean the four-platform render gate
+      # (D-04) passed. CI compile-checks/pins only; it has no GPU runner.
+      # The render gate is a recorded MANUAL UAT run per OS (Plan 05).
 
   # Cross-compile check: cargo check type-checks without linking, so no
   # FFmpeg or ORT native libraries are needed for the target architecture.
