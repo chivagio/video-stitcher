@@ -1472,13 +1472,14 @@ impl EngineBackend for GpuEngineBackend {
             .iter()
             .position(|k| *k == kind)
             .unwrap_or(crate::presenter::PRESENTER_CHAIN.len());
+        let start = start.min(crate::presenter::PRESENTER_CHAIN.len().saturating_sub(1));
         let mut attempts: Vec<(
             crate::presenter::PresenterKind,
             Result<(), crate::presenter::PresenterError>,
         )> = Vec::new();
         // Try the requested step and every weaker step after it. A non-fall-through
         // error is fatal to the attempt and is reported as-is.
-        for candidate in &crate::presenter::PRESENTER_CHAIN[start.min(2)..] {
+        for candidate in &crate::presenter::PRESENTER_CHAIN[start..] {
             if *candidate == self.active_presenter() {
                 attempts.push((*candidate, Ok(())));
                 break;
