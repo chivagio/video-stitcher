@@ -31,8 +31,16 @@ pub const CALIBRATION_FILE: &str = "match.json";
 pub const DEFAULT_MEDIA_DIR: &str = "test-media";
 
 /// Fixed export output file name (D-08: fixed output path).
+///
+/// Consumed by the export command added in Plan 01-04 (the thin export path);
+/// defined here with the rest of the D-08 hardcoded inputs so the whole
+/// hardcoded surface is reviewable in one place.
+#[allow(dead_code)]
 pub const EXPORT_OUTPUT_FILE: &str = "reco-app-export.mp4";
 /// Fixed export preset label (D-08: fixed preset — H.264 / software encode).
+///
+/// See [`EXPORT_OUTPUT_FILE`] — used by Plan 01-04's export command.
+#[allow(dead_code)]
 pub const EXPORT_PRESET: &str = "h264-software";
 
 /// Typed error for hardcoded-path resolution.
@@ -96,6 +104,10 @@ pub fn media_paths() -> Result<MediaPaths, HardcodedError> {
 /// # Errors
 ///
 /// Propagates [`HardcodedError`] from [`media_dir`].
+///
+/// Consumed by Plan 01-04's export command; defined alongside the other D-08
+/// constants so the hardcoded surface reads as one unit.
+#[allow(dead_code)]
 pub fn export_output_path() -> Result<PathBuf, HardcodedError> {
     Ok(media_dir()?.join(EXPORT_OUTPUT_FILE))
 }

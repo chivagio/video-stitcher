@@ -71,28 +71,30 @@ impl X11Presenter {
     where
         W: HasWindowHandle + HasDisplayHandle,
     {
-        let window_handle = window.window_handle().map_err(|e| PresenterError::ChildView {
-            reason: format!("window_handle() failed: {e:?}"),
-        })?;
-        let display_handle = window.display_handle().map_err(|e| PresenterError::ChildView {
-            reason: format!("display_handle() failed: {e:?}"),
-        })?;
+        let window_handle = window
+            .window_handle()
+            .map_err(|e| PresenterError::ChildView {
+                reason: format!("window_handle() failed: {e:?}"),
+            })?;
+        let display_handle = window
+            .display_handle()
+            .map_err(|e| PresenterError::ChildView {
+                reason: format!("display_handle() failed: {e:?}"),
+            })?;
 
-        // Extract the parent Xlib window id and its X connection. A Wayland
-        // parent has neither — that is the D-05 unsupported path, not a bug.
+        // Extract the parent Xlib window id from the window handle, and its X
+        // connection from the *display* handle. raw-window-handle 0.6 splits
+        // these: `XlibWindowHandle` is { window, visual_id } and carries no
+        // display; `XlibDisplayHandle` is { display, screen }.
+        //
+        // A Wayland parent has neither — that is the D-05 unsupported path,
+        // not a bug.
         //
         // The child MUST be created on the same X connection that owns the
         // parent window; a fresh XOpenDisplay would produce a window the parent
         // server-side window cannot contain.
-        let (parent_xid, display) = match window_handle.as_raw() {
-            RawWindowHandle::Xlib(h) => {
-                if h.display.is_null() {
-                    return Err(PresenterError::ChildView {
-                        reason: "Xlib window handle had a null display".to_string(),
-                    });
-                }
-                (h.window, h.display)
-            }
+        let parent_xid = match window_handle.as_raw() {
+            RawWindowHandle::Xlib(h) => h.window,
             other => {
                 return Err(PresenterError::Unsupported {
                     reason: format!(
@@ -102,6 +104,26 @@ impl X11Presenter {
                 });
             }
         };
+
+        // The non-null `Display*` comes from the display handle. `Option<
+        // NonNull<_>>` means "absent" (`None`) rather than a null pointer, so
+        // there is no null check to perform here.
+        let display = match display_handle.as_raw() {
+            raw_window_handle::RawDisplayHandle::Xlib(h) => {
+                h.display.ok_or_else(|| PresenterError::ChildView {
+                    reason: "Xlib display handle carried no display pointer".to_string(),
+                })?
+            }
+            other => {
+                return Err(PresenterError::Unsupported {
+                    reason: format!(
+                        "parent display handle is {other:?}, not Xlib — \
+                         Wayland has no X11-style child embedding (D-05)"
+                    ),
+                });
+            }
+        };
+        let display = display.as_ptr().cast::<xlib::Display>();
 
         // SAFETY: `display` is a non-null pointer taken from the parent window
         // handle; it is the live connection that owns `parent_xid` and remains
@@ -141,11 +163,10 @@ impl X11Presenter {
             (xlib.XFlush)(display);
         }
 
-        let child_nonzero = std::num::NonZeroU64::new(child_window).ok_or_else(|| {
-            PresenterError::ChildView {
+        let child_nonzero =
+            std::num::NonZeroU64::new(child_window).ok_or_else(|| PresenterError::ChildView {
                 reason: "child window id was zero".to_string(),
-            }
-        })?;
+            })?;
 
         // SAFETY: the child window id is a valid X11 window for the lifetime of
         // this presenter (destroyed only in Drop), and the display connection is
@@ -189,13 +210,13 @@ impl SurfacePresenter for X11Presenter {
         height: u32,
     ) -> Result<(), PresenterError> {
         let caps = self.surface.get_capabilities(adapter);
-        let surface_format = caps
-            .formats
-            .first()
-            .copied()
-            .ok_or_else(|| PresenterError::Surface {
-                reason: "surface reported no supported formats".to_string(),
-            })?;
+        let surface_format =
+            caps.formats
+                .first()
+                .copied()
+                .ok_or_else(|| PresenterError::Surface {
+                    reason: "surface reported no supported formats".to_string(),
+                })?;
 
         // Strip sRGB from the surface format and carry the stripped format in
         // `view_formats` to avoid double-gamma — the same contract the CLI

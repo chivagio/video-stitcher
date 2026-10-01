@@ -27,6 +27,10 @@ mod presenter;
 use presenter::{PresenterError, ViewportRect};
 #[cfg(all(unix, not(target_os = "macos")))]
 use presenter::{SurfacePresenter, x11::X11Presenter};
+// `info()` / `next_frame()` are trait methods on `FfmpegFileSource`, not inherent
+// ones — the trait must be in scope to call them (crates/reco-core/src/source.rs:345,351).
+#[cfg(all(unix, not(target_os = "macos")))]
+use reco_core::source::FrameSource as _;
 
 /// Install the standard tracing subscriber + log bridge.
 ///
@@ -130,8 +134,7 @@ fn build_window_and_chrome(
 ) -> Result<(tauri::window::Window, ViewportRect), SkeletonError> {
     const WIDTH: f64 = 1280.0;
     const HEIGHT: f64 = 800.0;
-    const CHROME_HEIGHT: f64 =
-        (presenter::LOG_PANE_HEIGHT + presenter::CONTROL_ROW_HEIGHT) as f64;
+    const CHROME_HEIGHT: f64 = (presenter::LOG_PANE_HEIGHT + presenter::CONTROL_ROW_HEIGHT) as f64;
 
     let window = tauri::window::Window::builder(app, "main")
         .title("Reco")
@@ -152,7 +155,10 @@ fn build_window_and_chrome(
         )
         .map_err(|e| SkeletonError::Window(e.to_string()))?;
 
-    Ok((window, ViewportRect::for_window(WIDTH as u32, HEIGHT as u32)))
+    Ok((
+        window,
+        ViewportRect::for_window(WIDTH as u32, HEIGHT as u32),
+    ))
 }
 
 /// Decode one frame pair from the hardcoded clips and drive one stitched frame.

@@ -4,7 +4,7 @@
   "version": "0.5.4",
   "identifier": "org.reco-project.reco-app",
   "build": {
-    "frontendDist": "../ui"
+    "frontendDist": "ui"
   },
   "app": {
     "withGlobalTauri": true,
@@ -15,6 +15,9 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all"
+    "targets": "all",
+    "icon": [
+      "icons/icon.png"
+    ]
   }
 }

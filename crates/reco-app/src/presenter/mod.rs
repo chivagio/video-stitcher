@@ -33,7 +33,6 @@
 //! runtime-swappable presenter (PREV-05: native compositing → separate preview
 //! window → throttled readback) extends.
 
-use reco_core::gpu::GpuContext;
 use reco_core::render::stitch_renderer::StitchRenderer;
 use reco_core::render::viewport::ViewportConfig;
 use reco_core::source::YuvData;
@@ -49,10 +48,15 @@ pub mod fallback;
 /// (CONVENTIONS.md / ARCHITECTURE.md). Windows/macOS arm in as those impls
 /// land; targets without a native child-view impl fall back to
 /// [`fallback::FallbackPresenter`] (D-05).
+// `PlatformPresenter` names the compile-time-selected impl as a convenience for
+// consumers; Phase 1's single `run_skeleton` path constructs the concrete type
+// directly. Kept as the documented seam Phase 2 selects through (D-02).
+#[allow(dead_code)]
 #[cfg(all(unix, not(target_os = "macos")))]
 pub type PlatformPresenter = x11::X11Presenter;
 
 /// The platform-native presenter on targets with no native child-view impl.
+#[allow(dead_code)]
 #[cfg(not(all(unix, not(target_os = "macos"))))]
 pub type PlatformPresenter = fallback::FallbackPresenter;
 
@@ -134,6 +138,11 @@ impl ViewportRect {
     }
 
     /// Whether the viewport has a drawable (non-zero) area.
+    ///
+    /// A window can legitimately shrink below the 208px chrome reservation, in
+    /// which case the panorama region is empty. Exercised by this module's
+    /// tests; the Phase 1 binary path always passes a 1280x800 viewport.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn is_drawable(&self) -> bool {
         self.width > 0 && self.height > 0
     }
@@ -187,9 +196,16 @@ pub trait SurfacePresenter {
     ///
     /// Returns [`PresenterError::Surface`] if the surface cannot be
     /// reconfigured.
+    // Part of the presenter contract (D-02) that Phase 2's runtime-swappable
+    // presenter and window-resize handling drive. Phase 1's single-frame
+    // `run_skeleton` path never resizes; every impl provides it, and the
+    // fallback impl's version is covered by this module's tests.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn resize(&mut self, width: u32, height: u32) -> Result<(), PresenterError>;
 
     /// The current viewport geometry.
+    // Part of the presenter contract (D-02); see [`Self::resize`].
+    #[cfg_attr(not(test), allow(dead_code))]
     fn viewport(&self) -> ViewportRect;
 }
 

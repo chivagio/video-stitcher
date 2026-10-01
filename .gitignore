@@ -1,6 +1,9 @@
 # Rust
 target/
 
+# Tauri generated schemas (build output, regenerated on build)
+crates/reco-app/gen/
+
 # Video artifacts
 *.mp4
 reco-trace.json
@@ -15,6 +18,9 @@ __pycache__/
 
 # Claude Code
 .claude/
+
+# GSD planning (local-only; Git Tracking = No)
+.planning/
 
 # Cargo local config
 .cargo/
