@@ -23,6 +23,7 @@
 use super::pipeline::{Nv12Planes, PipelineError, StitchPipeline, YuvPlanes};
 use super::renderer::InputFormat;
 use super::scene::SceneGeometry;
+use super::source_tiles::SourceTileRenderer;
 use super::viewport::ViewportConfig;
 use crate::calibration::MatchCalibration;
 use crate::gpu::GpuContext;
@@ -63,6 +64,10 @@ pub struct StitchRenderer {
     nv12: Option<Nv12Converter>,
     /// RGBA readback helper for display in GUI frameworks (lazy-initialized).
     rgba: Option<RgbaReadback>,
+    /// Raw-source tile renderer for the source↔panorama toggle (PREV-03),
+    /// lazily built on the first `render_source_tiles` call and cached so
+    /// repeated toggles allocate no per-frame GPU resources.
+    source_tiles: Option<SourceTileRenderer>,
 }
 
 impl StitchRenderer {
@@ -113,6 +118,7 @@ impl StitchRenderer {
             coverage,
             nv12: None,
             rgba: None,
+            source_tiles: None,
         })
     }
 
@@ -147,6 +153,63 @@ impl StitchRenderer {
     ) -> Result<(), PipelineError> {
         self.pipeline
             .render_nv12_to_view(left, right, yaw, pitch, view)
+    }
+
+    /// Render the two raw source tiles (left | right, letterboxed, 1px
+    /// separator) into a provided view (PREV-03).
+    ///
+    /// This is the **additive** `reco-core` render path the `reco-app`
+    /// presenter uses for the source↔panorama toggle. It does **not** stitch:
+    /// it draws the two decoded camera frames side-by-side into `view`,
+    /// preserving each frame's aspect (contain) and never allocating a second
+    /// device. The [`SourceTileRenderer`] is built lazily on the first call and
+    /// cached, so toggling back and forth allocates no per-frame resources.
+    ///
+    /// The view's format must match the renderer's configured target format
+    /// (the caller passes the surface/readback view it already acquires); the
+    /// tile renderer is rebuilt when the format or viewport changes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PipelineError::InvalidConfig`] if the tile renderer cannot be
+    /// built for the current viewport/format, or if a plane slice is too small.
+    pub fn render_source_tiles(
+        &mut self,
+        left: &YuvPlanes<'_>,
+        right: &YuvPlanes<'_>,
+        view: &wgpu::TextureView,
+    ) -> Result<(), PipelineError> {
+        let (w, h) = self.pipeline.source_info();
+        let (vw, vh) = {
+            let viewport = self.pipeline.viewport();
+            (viewport.width, viewport.height)
+        };
+        let view_format = self.pipeline.render_format();
+
+        // (Re)build the tile renderer when absent or when the viewport/format
+        // changed (a resize or a renderer swap invalidates the cached quads and
+        // pipelines). A single extra pipeline per session, never per toggle
+        // (T-02-12).
+        let needs_rebuild = match &self.source_tiles {
+            None => true,
+            Some(tiles) => !tiles.matches(view_format, w, h, vw, vh),
+        };
+        if needs_rebuild {
+            let tile_width = (vw / 2).max(1);
+            self.source_tiles = Some(SourceTileRenderer::new(
+                self.pipeline.gpu().device(),
+                view_format,
+                w,
+                h,
+                tile_width,
+                vh,
+            )?);
+        }
+        let tiles = self
+            .source_tiles
+            .as_mut()
+            .expect("tile renderer built above");
+        tiles.draw(self.pipeline.gpu().queue(), left, right, view)
     }
 
     /// Render YUV420P frames to either a surface view or the internal

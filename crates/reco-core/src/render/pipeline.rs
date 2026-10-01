@@ -758,6 +758,14 @@ impl StitchPipeline {
     pub fn render_target(&self) -> &wgpu::Texture {
         self.renderer.render_target()
     }
+
+    /// The texture format the renderer targets (the internal render target's
+    /// format). Used by [`StitchRenderer::render_source_tiles`](super::stitch_renderer::StitchRenderer::render_source_tiles)
+    /// so the raw-source tile pipeline is built for the same format the view
+    /// was created with — no second format negotiation, no second device.
+    pub fn render_format(&self) -> wgpu::TextureFormat {
+        self.renderer.render_target().format()
+    }
 }
 
 #[cfg(test)]

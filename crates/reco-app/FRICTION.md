@@ -38,3 +38,42 @@ allow(dead_code))]` attribute is now stale-ish (the field is read cross-platform
 via `adapter()`), but left in place to keep the diff additive; a follow-up
 cleanup can drop it.
 
+### A2. No two-tile raw-source render path in reco-core
+
+**Impact:** Medium (PREV-03). The source↔panorama comparison toggle needs to
+draw the left and right *raw* decoded frames tiled side-by-side into the
+presenter's acquired surface view (or the readback target). No `reco-core` API
+does this:
+
+- `LensPreviewRenderer` (`crates/reco-core/src/lens/preview.rs`) renders **one**
+  camera through the fisheye shader and **allocates and returns its own
+  `wgpu::Texture`** each frame; it cannot draw into a caller-provided view, so a
+  consumer would have to build a second composition pass (and own the texture)
+  outside the engine.
+- `StitchPipeline`/`StitchRenderer` only draw the **stitched panorama**; there is
+  no path that uploads the two sources and paints them as independent tiles.
+- The nearest analogue (`LensPreviewRenderer`) also wants a whole `GpuContext`
+  rather than the shared device/queue the presenter already holds (D-03).
+
+Working around this in `reco-app` would mean re-implementing YUV upload + a
+shader + a pipeline in the consumer crate — exactly the kind of engine-API
+workaround the project rule forbids.
+
+**Resolution (Phase 2, plan 02-04):** `reco-core` gained an additive render path
+that closes the gap without changing any existing caller:
+
+- `render::source_tiles::SourceTileRenderer` — a renderer that uploads the two
+  YUV420P sources and draws them into a **caller-provided** `wgpu::TextureView`,
+  creating its pipeline/textures on the **caller-supplied device** (the shared
+  worker device). Left/right tiles use contain letterboxing (aspect preserved,
+  never stretched) with a 1px separator between the halves.
+- `StitchRenderer::render_source_tiles(left, right, view)` — builds and caches an
+  internal `SourceTileRenderer` lazily (rebuilt only on a format/viewport change)
+  and draws into the given view. No readback, no second device, no per-toggle
+  allocation.
+
+**Residual gap:** none observed. A future consumer that wants raw tiles with a
+different layout (e.g. stacked vertically, or with per-tile overlays) would still
+need its own draw path; the new renderer is intentionally fixed to the UI-SPEC's
+"left | right side-by-side" layout.
+
