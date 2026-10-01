@@ -1,24 +1,28 @@
 import { defineConfig } from "vite";
+import { svelte } from "@sveltejs/vite-plugin-svelte";
+import tailwindcss from "@tailwindcss/vite";
 
-// Phase 1 walking-skeleton frontend build.
+// Phase 2 production preview shell build (UI-SPEC).
 //
-// Vite's `root` is `ui/` (where index.html, main.ts, and style.css live) and
+// Vite's `root` is `ui/` (where index.html, src/, and app.css live) and
 // output goes to `ui/dist`, matching `tauri.conf.json`'s
-// `build.frontendDist: "ui/dist"`. Only Vite-emitted files live in the output;
-// the TypeScript sources are build-time only.
+// `build.frontendDist: "ui/dist"`. Only Vite-emitted files live in the
+// output; the TypeScript/Svelte sources are build-time only.
 //
-// `npm run build` runs `tsc --noEmit && vite build`, so this config is never
-// reached with a type error.
+// `npm run build` runs `svelte-check --tsconfig ./tsconfig.json && vite
+// build`, so this config is never reached with a type error.
 //
-// No framework plugin: the UI-SPEC locks framework-free vanilla DOM. Phase 2/3
-// may adopt one without unwinding a pre-committed component model.
+// The Svelte plugin compiles .svelte components; the Tailwind CSS v4 plugin
+// processes the `@import "tailwindcss"` in app.css. No component library —
+// hand-rolled Svelte 5 components styled with Tailwind utility classes.
 export default defineConfig({
   root: "ui",
   base: "./",
+  plugins: [svelte(), tailwindcss()],
   build: {
     outDir: "dist",
     emptyOutDir: true,
-    // The skeleton loads local assets in the webview (WebviewUrl::App); never a
+    // The shell loads local assets in the webview (WebviewUrl::App); never a
     // remote URL. No source maps ship in the production bundle.
     sourcemap: false,
   },

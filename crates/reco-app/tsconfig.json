@@ -16,5 +16,5 @@
     "noEmit": true,
     "types": []
   },
-  "include": ["ui/**/*.ts"]
+  "include": ["ui/**/*.ts", "ui/**/*.svelte"]
 }

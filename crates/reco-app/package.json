@@ -2,16 +2,21 @@
   "name": "reco-app-ui",
   "private": true,
   "version": "0.5.4",
-  "description": "Phase 1 walking-skeleton frontend for the Tauri host (Vite + TypeScript, framework-free vanilla DOM).",
+  "description": "Phase 2 production preview shell for the Tauri host (Svelte 5 + Vite + TypeScript + Tailwind CSS).",
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc --noEmit && vite build"
+    "build": "svelte-check --tsconfig ./tsconfig.json && vite build"
   },
   "devDependencies": {
+    "@sveltejs/vite-plugin-svelte": "^7.3.1",
+    "@tailwindcss/vite": "^4.3.3",
     "@tauri-apps/cli": "^2",
+    "svelte": "^5.57.1",
+    "svelte-check": "^4.7.6",
+    "tailwindcss": "^4.3.3",
     "typescript": "^5.9.3",
-    "vite": "^7.1.9"
+    "vite": "^8.2.2"
   },
   "dependencies": {
     "@tauri-apps/api": "^2"
