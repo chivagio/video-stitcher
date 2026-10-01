@@ -1,0 +1,71 @@
+[package]
+publish = false
+name = "reco-app"
+version = "0.5.4"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Tauri 2 desktop host for Reco panoramic video stitcher"
+
+[[bin]]
+name = "reco-app"
+path = "src/main.rs"
+
+[features]
+# Default gives autocam + ort (CPU) detection, matching the other binary
+# consumers. Jetson / custom builds opt out via --no-default-features +
+# an explicit backend so the glibc-sensitive prebuilt ort isn't pulled.
+default = ["autocam", "ort"]
+autocam = ["dep:reco-autocam"]
+ort = ["autocam", "reco-autocam/ort"]
+tensorrt = ["autocam", "reco-autocam/tensorrt"]
+tensorrt-native = ["autocam", "reco-autocam/tensorrt-native"]
+ncnn = ["autocam", "reco-autocam/ncnn"]
+cuda = ["autocam", "reco-autocam/cuda"]
+coreml = ["autocam", "reco-autocam/coreml"]
+directml = ["autocam", "reco-autocam/directml"]
+load-dynamic = ["autocam", "reco-autocam/load-dynamic"]
+profiling = ["reco-core/profiling", "reco-io/profiling", "reco-calibrate/profiling"]
+
+[dependencies]
+reco-core = { path = "../reco-core" }
+reco-control = { path = "../reco-control" }
+reco-io = { path = "../reco-io", features = ["ffmpeg", "config", "stacked-output"] }
+reco-calibrate = { path = "../reco-calibrate", features = ["io"] }
+# default-features = false so autocam's own default (ort) doesn't
+# pull ort on Jetson / tensorrt-native builds. The default feature
+# set above re-enables ort for non-Jetson consumers.
+reco-detect = { path = "../reco-detect", default-features = false }
+reco-autocam = { path = "../reco-autocam", optional = true, default-features = false }
+
+# EXACT pin: the native-embedding APIs (Window::builder / Window::add_child)
+# live behind `unstable` and must not drift underneath the presenter
+# (STATE.md blocker). Do NOT let this float to a caret range.
+tauri = { version = "=2.12.1", features = ["unstable"] }
+# Raw window-handle ABI (0.6) is used ONLY inside the presenter modules;
+# it never crosses IPC to the frontend (D-02). wgpu 28 also uses
+# raw-window-handle ^0.6, so the handle types are compatible.
+raw-window-handle = "0.6"
+pollster = "0.4"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+log = "0.4"
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-log = { workspace = true }
+
+# NOTE: `wgpu` is deliberately NOT a dependency here. FOUND-04 requires
+# reaching wgpu through `reco_core::wgpu` (re-exported at
+# crates/reco-core/src/lib.rs). Adding a direct `wgpu` key to this manifest
+# is forbidden: it causes texture-interop version skew (ARCHITECTURE.md
+# anti-pattern) and fails the FOUND-04 CI gate.
+
+# X11 child-view construction (D-01/D-05). Only needed on non-macOS Unix.
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+x11-dl = "2"
+
+[build-dependencies]
+tauri-build = "2"

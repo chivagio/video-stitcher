@@ -399,6 +399,37 @@ impl GpuContext {
         }
     }
 
+    /// Create a GPU context from an existing device/queue that also retains the
+    /// originating [`wgpu::Adapter`].
+    ///
+    /// Sibling of [`Self::from_device_queue`] for consumers that need the
+    /// adapter alongside the shared device — notably a native-surface presenter
+    /// that must call `Surface::get_capabilities(&adapter)` while still sharing
+    /// the device rather than creating a second one. The palette is otherwise
+    /// identical to [`Self::from_device_queue`]; that constructor keeps its
+    /// `adapter: None` semantics for existing callers.
+    ///
+    /// The adapter must be the same one that created `device` so backend-
+    /// specific queries and surface compatibility agree.
+    pub fn from_device_queue_with_adapter(
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        adapter_info: wgpu::AdapterInfo,
+        adapter: wgpu::Adapter,
+    ) -> Self {
+        log::info!(
+            "GpuContext from external device (adapter retained): {} ({:?})",
+            adapter_info.name,
+            adapter_info.backend
+        );
+        Self {
+            device,
+            queue,
+            adapter_info,
+            adapter: Some(adapter),
+        }
+    }
+
     /// The name of the selected GPU adapter (e.g. "NVIDIA GeForce RTX 5070").
     pub fn gpu_name(&self) -> &str {
         &self.adapter_info.name
@@ -552,6 +583,17 @@ impl GpuContext {
     /// Access the wgpu command queue.
     pub fn queue(&self) -> &wgpu::Queue {
         &self.queue
+    }
+
+    /// Access the retained wgpu adapter, if this context holds one.
+    ///
+    /// Returns `Some` when the context was built by [`Self::new`],
+    /// [`Self::for_surface`], or [`Self::from_device_queue_with_adapter`], and
+    /// `None` when built by [`Self::from_device_queue`] (which has no adapter
+    /// handle). Windowed consumers use this for surface capability negotiation
+    /// (e.g. `Surface::get_capabilities`).
+    pub fn adapter(&self) -> Option<&wgpu::Adapter> {
+        self.adapter.as_ref()
     }
 }
 

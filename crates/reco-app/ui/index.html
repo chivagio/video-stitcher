@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Reco</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <!--
+      Phase 1 walking-skeleton chrome. The top region is intentionally left
+      transparent and uncovered: the native panorama child view renders there
+      (UI-SPEC Surface Layout Contract). Do not paint a background over it.
+    -->
+    <div id="chrome">
+      <div id="log" aria-live="polite"></div>
+      <div id="controls">
+        <button id="import" type="button">Import</button>
+        <button id="preview" type="button">Start preview</button>
+        <button id="export" type="button">Export</button>
+      </div>
+    </div>
+    <script type="module" src="./main.ts"></script>
+  </body>
+</html>

@@ -1,0 +1,73 @@
+/* Phase 1 walking-skeleton chrome.
+ *
+ * The top region must stay transparent so the native panorama child view shows
+ * through (UI-SPEC Surface Layout Contract). The chrome is a bottom-anchored
+ * flex column: event/status log (160px) then control row (48px).
+ */
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  /* Transparent: never paint a background over the panorama region. */
+  background: transparent;
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  color: #e8e8e8;
+}
+
+/* Bottom-anchored chrome column; the rest of the window is left uncovered. */
+#chrome {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  display: flex;
+  flex-direction: column;
+  height: 208px; /* log 160 + control row 48 */
+}
+
+#log {
+  height: 160px;
+  overflow-y: auto;
+  padding: 8px 12px;
+  background: rgba(20, 20, 24, 0.92);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.event.info {
+  color: #cfe8ff;
+}
+.event.warn {
+  color: #ffd479;
+}
+.event.error {
+  color: #ff8080;
+}
+
+#controls {
+  height: 48px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 12px;
+  background: rgba(28, 28, 34, 0.96);
+}
+
+#controls button {
+  padding: 6px 14px;
+  border: 1px solid #4a4a55;
+  border-radius: 4px;
+  background: #38383f;
+  color: #e8e8e8;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+#controls button:hover {
+  background: #45454e;
+}
