@@ -8,37 +8,41 @@
   </head>
   <body>
     <!--
-      Phase 1 walking-skeleton chrome (UI-SPEC Surface Layout Contract).
+      Phase 2 preview shell (UI-SPEC Surface Layout Contract).
 
-      Two regions, one window:
-        * the top region is intentionally TRANSPARENT and UNCOVERED — the native
-          panorama child view (Rust/WGPU) renders there. Do not paint a
-          background over it.
-        * the bottom 208px is the webview chrome: the event/status log (160px)
-          then the control row (48px).
+      The window is one full-window transparent webview composited ABOVE a
+      Rust-owned native wgpu child view (the stitched panorama). The webview
+      paints only the opaque chrome panels:
+
+        * bottom transport strip (72px, full width) — opaque
+        * right controls rail (40px collapsed / 280px expanded) — opaque
+
+      The remaining TOP-LEFT region (#preview-region) is intentionally
+      TRANSPARENT and UNPAINTED — the native panorama renders there. Never
+      paint a background, border, or shadow over it (Phase 2 constraint 1).
 
       The webview never sizes, moves, or creates the native view, and no raw
       window handle crosses this boundary (CONTEXT D-02).
+
+      NOTE: this task (02-01) restructures the chrome enough to drive the
+      z-order/compositing probe. The full transport UI (timeline, timecode,
+      play/pause/step/loop, view toggle, presenter badge) and the collapsible
+      controls panel live in plans 02-04/02-05.
     -->
-    <div id="chrome" class="chrome">
-      <div id="log" class="log" role="log" aria-live="polite" aria-label="Event log">
-        <div id="log-empty" class="log-empty">
-          <h2 class="log-empty-heading">No events yet</h2>
-          <p class="log-empty-body">
-            Press <strong>Import</strong> to load the test clips, then
-            <strong>Start preview</strong> to render the stitched panorama.
-          </p>
-        </div>
-        <div id="log-lines" class="log-lines"></div>
-      </div>
-      <div id="controls" class="controls" role="toolbar" aria-label="Engine controls">
-        <button id="import" class="control-btn" type="button">Import</button>
-        <button id="preview" class="control-btn control-btn--primary" type="button">
-          Start preview
-        </button>
-        <button id="export" class="control-btn" type="button">Export</button>
-      </div>
+    <div id="preview-region" class="preview-region" aria-label="Panorama"></div>
+
+    <div id="transport" class="transport" role="toolbar" aria-label="Transport and engine controls">
+      <!-- The three Phase 1 buttons remain, solely so the probe can drive
+           import → preview. Plan 02-05 replaces them with the real transport. -->
+      <button id="import" class="control-btn" type="button">Import</button>
+      <button id="preview" class="control-btn control-btn--primary" type="button">
+        Start preview
+      </button>
+      <button id="export" class="control-btn" type="button">Export</button>
     </div>
+
+    <div id="controls-rail" class="controls-rail" aria-label="Controls"></div>
+
     <script type="module" src="./main.ts"></script>
   </body>
 </html>

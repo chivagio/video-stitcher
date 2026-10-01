@@ -1,18 +1,20 @@
 //! `reco-app` — Tauri 2 desktop host that links the Reco engine crates
-//! in-process and composites a native `wgpu::Surface` under the Tauri webview.
+//! in-process and composites a native `wgpu::Surface` **below** the Tauri
+//! webview.
 //!
-//! # Phase 1 walking skeleton (FOUND-01, FOUND-02)
+//! # Phase 2 preview shell (PREV-01, D-03)
 //!
-//! This is the phase's existential risk step: prove on ONE target first
-//! (Linux/X11) that a Rust-owned native **child view** under the Tauri webview
-//! can host a `wgpu::Surface` on the **shared** engine device, render one real
-//! stitched frame from two hardcoded clips, and present it composited under the
-//! webview (CONTEXT D-01/D-02/D-03; RESEARCH assumptions A1/A3).
+//! A full-window transparent Tauri webview is composited **above** a
+//! Rust-owned native `wgpu::Surface` child view. The webview paints only the
+//! opaque chrome (bottom transport bar + right controls rail + log drawer),
+//! leaving the top-left preview region transparent so the native panorama
+//! shows through; pointer events over that region reach the webview because the
+//! native child is stacked below it.
 //!
 //! ```text
-//!   Tauri/tao window
-//!   ├── chrome webview (bottom 208px: log 160 + control row 48)
-//!   └── native X11 child view (top region) ── owns wgpu::Surface (shared device)
+//!   Tauri/tao window (transparent)
+//!   ├── chrome webview (full window, transparent; opaque chrome panels paint)
+//!   └── native X11 child view (top-left region) ── owns wgpu::Surface
 //! ```
 //!
 //! Window and child-view creation happen in `tauri::Builder::setup`, never in a
@@ -29,7 +31,7 @@ mod worker;
 
 #[cfg(all(unix, not(target_os = "macos")))]
 use presenter::x11::X11Presenter;
-use presenter::{PresenterError, ViewportRect};
+use presenter::{ChromeState, PresenterError, ViewportRect};
 #[cfg(all(unix, not(target_os = "macos")))]
 use tauri::Manager as _;
 
@@ -80,12 +82,29 @@ fn main() -> anyhow::Result<()> {
 /// it; the gate report (Plan 05) folds it in).
 #[cfg(all(unix, not(target_os = "macos")))]
 fn run_skeleton(app: &mut tauri::App) -> Result<(), SkeletonError> {
-    let (window, rect) = build_window_and_chrome(app)?;
+    // Ordering is load-bearing (RESEARCH Pitfall 1): the native child view must
+    // be created BEFORE the chrome webview so the webview sits ABOVE it in
+    // z-order. An above-webview native child would swallow pointer events over
+    // the preview region (breaking drag/wheel pose input, PREV-04).
+    let window = build_window(app)?;
 
-    // Build the presenter first: the presenter owns its Surface (D-03), and
-    // that surface drives adapter selection when the worker creates the device.
+    // The native region is the L-shaped complement of the chrome (bottom
+    // transport bar + right controls rail + log drawer), computed by the single
+    // Rust geometry source of truth (UI-SPEC Geometry authority).
+    let rect = ViewportRect::for_chrome(1280, 800, &ChromeState::default());
+
+    // Build the presenter before the webview: the presenter owns its Surface
+    // (D-03), and that surface drives adapter selection when the worker creates
+    // the device. It is explicitly lowered below the webview before the webview
+    // is added, so pointer events reach the chrome.
     let instance = reco_core::wgpu::Instance::default();
-    let presenter = X11Presenter::new(&window, &instance, rect)?;
+    let mut presenter = X11Presenter::new(&window, &instance, rect)?;
+    presenter.lower();
+
+    // Full-window transparent chrome webview: it is an absolutely positioned set
+    // of opaque panels that tiles around the transparent preview hole. Pointer
+    // events over the preview region land on this webview (it is above).
+    add_chrome_webview(app, &window)?;
 
     // Ownership handoff (FOUND-03): the device is created *inside* the worker
     // from the presenter's surface, so the worker is the sole device owner.
@@ -206,7 +225,8 @@ fn install_event_bridge(
 /// so a Wayland-only / unported build still links and reports cleanly.
 #[cfg(not(all(unix, not(target_os = "macos"))))]
 fn run_skeleton(app: &mut tauri::App) -> Result<(), SkeletonError> {
-    let (_window, rect) = build_window_and_chrome(app)?;
+    let _window = build_window(app)?;
+    let rect = ViewportRect::for_chrome(1280, 800, &ChromeState::default());
     let presenter = presenter::fallback::FallbackPresenter::new(
         "native child-view compositing is not yet implemented for this target (D-05)",
         rect,
@@ -222,24 +242,43 @@ fn run_skeleton(app: &mut tauri::App) -> Result<(), SkeletonError> {
     Ok(())
 }
 
-/// Create the one resizable window plus the bottom-anchored chrome webview.
+/// Create the one resizable, transparent window (no chrome yet).
 ///
-/// The webview occupies the bottom 208px (log 160 + control row 48) and leaves
-/// the top region uncovered (UI-SPEC Surface Layout Contract; RESEARCH
-/// Pitfall 6). Returns the window and the uncovered panorama rectangle.
-fn build_window_and_chrome(
-    app: &mut tauri::App,
-) -> Result<(tauri::window::Window, ViewportRect), SkeletonError> {
+/// The window is created first and the native presenter's child view is added
+/// on top of it (in `run_skeleton`) *before* the chrome webview, so the webview
+/// is the topmost layer and receives pointer events over the preview region
+/// (RESEARCH Pitfall 1). `transparent(true)` is what allows the webview to
+/// leave the native preview region unpainted (Phase 2 Surface Layout Contract).
+fn build_window(app: &mut tauri::App) -> Result<tauri::window::Window, SkeletonError> {
     const WIDTH: f64 = 1280.0;
     const HEIGHT: f64 = 800.0;
-    const CHROME_HEIGHT: f64 = (presenter::LOG_PANE_HEIGHT + presenter::CONTROL_ROW_HEIGHT) as f64;
 
-    let window = tauri::window::Window::builder(app, "main")
+    tauri::window::Window::builder(app, "main")
         .title("Reco")
         .inner_size(WIDTH, HEIGHT)
         .min_inner_size(960.0, 600.0)
+        .transparent(true)
         .build()
-        .map_err(|e| SkeletonError::Window(e.to_string()))?;
+        .map_err(|e| SkeletonError::Window(e.to_string()))
+}
+
+/// Add the full-window transparent chrome webview on top of the native view.
+///
+/// The webview covers the whole window and is asked to be transparent; the
+/// chrome markup paints only the opaque bottom transport strip and right
+/// controls rail, leaving the top-left preview region (the native panorama)
+/// unpainted. Pointer events over the preview region land on this webview
+/// because the native child was lowered below it (RESEARCH Pitfall 1/2).
+///
+/// The webview is explicitly built full-window and `.auto_resize()`d so it
+/// tracks the window on resize; the native child viewport is recomputed and the
+/// surface reconfigured by the worker's resize path (Plan 02-02+).
+fn add_chrome_webview(
+    _app: &mut tauri::App,
+    window: &tauri::window::Window,
+) -> Result<(), SkeletonError> {
+    const WIDTH: f64 = 1280.0;
+    const HEIGHT: f64 = 800.0;
 
     window
         .add_child(
@@ -247,16 +286,14 @@ fn build_window_and_chrome(
                 "chrome",
                 tauri::WebviewUrl::App("index.html".into()),
             )
+            .transparent(true)
             .auto_resize(),
-            tauri::LogicalPosition::new(0.0, HEIGHT - CHROME_HEIGHT),
-            tauri::LogicalSize::new(WIDTH, CHROME_HEIGHT),
+            tauri::LogicalPosition::new(0.0, 0.0),
+            tauri::LogicalSize::new(WIDTH, HEIGHT),
         )
         .map_err(|e| SkeletonError::Window(e.to_string()))?;
 
-    Ok((
-        window,
-        ViewportRect::for_window(WIDTH as u32, HEIGHT as u32),
-    ))
+    Ok(())
 }
 
 /// Typed errors at the binary edge.

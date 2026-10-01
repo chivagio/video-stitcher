@@ -233,6 +233,13 @@ impl X11Presenter {
             (xlib.XFlush)(display);
         }
 
+        // Lower the child below any window added later (the chrome webview).
+        // X11 stacks child windows above their parent; without this the native
+        // child view (created before the webview, Pitfall 1) would sit above the
+        // webview and swallow pointer events over the preview region (PREV-04).
+        // See [`X11Presenter::lower`].
+        Self::lower_window(&xlib, display, child_window);
+
         let child_nonzero =
             std::num::NonZeroU64::new(child_window).ok_or_else(|| PresenterError::ChildView {
                 reason: "child window id was zero".to_string(),
@@ -291,6 +298,45 @@ impl X11Presenter {
         self.queue
             .as_ref()
             .expect("presenter queue is set by configure()")
+    }
+
+    /// Lower `child_window` to the bottom of its siblings on `display` (z-order).
+    ///
+    /// The X server stacks child windows in creation order (later = higher). The
+    /// native child view is created *before* the chrome webview (Pitfall 1), so
+    /// without this call it would sit **above** the webview and swallow pointer
+    /// events over the preview region, breaking mouse-drag pan / wheel zoom
+    /// (PREV-04). `XLowerWindow` places it beneath every sibling.
+    ///
+    /// Static helper so it is callable both during construction (before `Self`
+    /// exists) and from [`Self::lower`]. A no-op for a zero window id.
+    fn lower_window(xlib: &xlib::Xlib, display: *mut xlib::Display, child_window: u64) {
+        if child_window == 0 {
+            return;
+        }
+        // SAFETY: `display` is the live connection that owns `child_window`
+        // (both come from the same parent connection), and `child_window` is a
+        // valid X11 window for this presenter's lifetime.
+        unsafe {
+            (xlib.XLowerWindow)(display, child_window);
+            (xlib.XFlush)(display);
+        }
+    }
+}
+
+impl X11Presenter {
+    /// Lower the native child view below the chrome webview (z-order).
+    ///
+    /// Idempotent and safe to call at any point after construction; a no-op
+    /// after [`X11Presenter::release_child_window`] has destroyed the window.
+    /// `XLowerWindow(child, Below)` places the child beneath every sibling,
+    /// which is what makes pointer events over the preview region reach the
+    /// full-window webview (RESEARCH Pitfall 1).
+    pub fn lower(&mut self) {
+        let Some(child) = self.child_window else {
+            return;
+        };
+        Self::lower_window(&self.xlib, self.display, child.get());
     }
 }
 

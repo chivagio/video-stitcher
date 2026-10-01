@@ -32,9 +32,15 @@
   --space-2xl: 48px;
   --space-3xl: 64px;
 
-  /* Chrome geometry (UI-SPEC Surface Layout Contract) */
-  --log-pane-height: 160px;
-  --control-row-height: 48px;
+  /* Chrome geometry (UI-SPEC Surface Layout Contract).
+   * Rust is the single source of truth for the native viewport geometry
+   * (presenter/mod.rs). These CSS values MIRROR the Rust constants and must
+   * match: TRANSPORT_BAR_HEIGHT / CONTROLS_PANEL_WIDTH /
+   * CONTROLS_PANEL_COLLAPSED_WIDTH / LOG_DRAWER_HEIGHT. */
+  --transport-bar-height: 72px;
+  --controls-panel-width: 280px;
+  --controls-panel-collapsed-width: 40px;
+  --log-drawer-height: 240px;
 
   /* Typography */
   --font-ui: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
@@ -66,98 +72,55 @@ body {
   font-weight: var(--weight-regular);
 }
 
-/* Bottom-anchored chrome column. The remaining top area is left uncovered. */
-#chrome,
-.chrome {
+/* Bottom-anchored chrome panels. The remaining top-left area is left
+ * transparent and uncovered so the native panorama shows through. */
+
+/* ------------------------------------------------------- preview region (hole) */
+
+/* The reserved native-preview region. It MUST stay fully transparent — any
+ * background/border/shadow here would hide the native wgpu panorama
+ * (Phase 2 constraint 1). Sized to the L-shaped complement of the chrome so
+ * the native viewport (computed by Rust) and this hole agree. */
+#preview-region,
+.preview-region {
+  position: fixed;
+  left: 0;
+  top: 0;
+  width: calc(100% - var(--controls-panel-collapsed-width));
+  height: calc(100% - var(--transport-bar-height));
+  background: transparent;
+  border: 0;
+  box-shadow: none;
+}
+
+/* ------------------------------------------------------------ transport bar */
+
+/* Bottom transport strip: full width, fixed height, opaque secondary. */
+#transport,
+.transport {
   position: fixed;
   left: 0;
   right: 0;
   bottom: 0;
-  display: flex;
-  flex-direction: column;
-  /* log 160 + control row 48 = 208px, matching ViewportRect::for_window. */
-  height: calc(var(--log-pane-height) + var(--control-row-height));
-}
-
-/* ------------------------------------------------------------------ log pane */
-
-.log {
-  height: var(--log-pane-height);
-  flex: 0 0 var(--log-pane-height);
-  overflow-y: auto;
-  overflow-x: hidden;
-  padding: var(--space-sm) var(--space-md);
-  background: var(--color-dominant);
-  font-family: var(--font-mono);
-  font-size: var(--text-body);
-  line-height: var(--line-body);
-}
-
-/* Empty state: shown until the first event arrives. */
-.log-empty {
-  padding: var(--space-sm) 0;
-}
-
-.log-empty-heading {
-  margin: 0 0 var(--space-sm);
-  font-family: var(--font-ui);
-  font-size: var(--text-heading);
-  font-weight: var(--weight-semibold);
-  line-height: var(--line-tight);
-  color: var(--color-body-text);
-}
-
-.log-empty-body {
-  margin: 0;
-  font-family: var(--font-ui);
-  font-size: var(--text-body);
-  font-weight: var(--weight-regular);
-  line-height: var(--line-body);
-  color: var(--color-log-info);
-}
-
-.log-lines {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-xs);
-}
-
-/* Append-only log lines: `[HH:MM:SS] LEVEL  message`. */
-.log-line {
-  margin: 0;
-  /* Long worker messages wrap instead of forcing a horizontal scrollbar. */
-  overflow-wrap: anywhere;
-  word-break: break-word;
-  white-space: pre-wrap;
-  color: var(--color-log-info);
-}
-
-.log-level {
-  font-weight: var(--weight-semibold);
-  /* Level carries the severity colour; the message text stays body grey. */
-}
-
-.log-line--info .log-level {
-  color: var(--color-log-info);
-}
-
-.log-line--warn .log-level {
-  color: var(--color-log-warn);
-}
-
-.log-line--error .log-level {
-  color: var(--color-log-error);
-}
-
-/* ---------------------------------------------------------------- control row */
-
-.controls {
-  height: var(--control-row-height);
-  flex: 0 0 var(--control-row-height);
+  height: var(--transport-bar-height);
   display: flex;
   align-items: center;
   gap: var(--space-sm);
   padding: 0 var(--space-md);
+  background: var(--color-secondary);
+}
+
+/* --------------------------------------------------------------- controls rail */
+
+/* Right controls rail: from the top to the transport bar top, opaque secondary.
+ * Collapsed (40px) by default in this task; the expandable panel is plan 02-05. */
+#controls-rail,
+.controls-rail {
+  position: fixed;
+  right: 0;
+  top: 0;
+  bottom: var(--transport-bar-height);
+  width: var(--controls-panel-collapsed-width);
   background: var(--color-secondary);
 }
 
