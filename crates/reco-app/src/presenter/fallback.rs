@@ -78,6 +78,10 @@ impl FallbackPresenter {
 }
 
 impl SurfacePresenter for FallbackPresenter {
+    fn surface(&self) -> Result<&reco_core::wgpu::Surface<'static>, PresenterError> {
+        Err(self.unsupported())
+    }
+
     fn configure(
         &mut self,
         _device: &reco_core::wgpu::Device,

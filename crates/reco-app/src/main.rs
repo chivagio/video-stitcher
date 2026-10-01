@@ -25,14 +25,13 @@ mod commands;
 mod events;
 mod hardcoded;
 mod presenter;
+mod worker;
 
+#[cfg(all(unix, not(target_os = "macos")))]
+use presenter::x11::X11Presenter;
 use presenter::{PresenterError, ViewportRect};
 #[cfg(all(unix, not(target_os = "macos")))]
-use presenter::{SurfacePresenter, x11::X11Presenter};
-// `info()` / `next_frame()` are trait methods on `FfmpegFileSource`, not inherent
-// ones — the trait must be in scope to call them (crates/reco-core/src/source.rs:345,351).
-#[cfg(all(unix, not(target_os = "macos")))]
-use reco_core::source::FrameSource as _;
+use tauri::Manager as _;
 
 /// Install the standard tracing subscriber + log bridge.
 ///
@@ -69,7 +68,8 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Create the window, presenter, shared device, and drive one stitched frame.
+/// Create the window, the presenter's shared device, and start the engine
+/// worker that exclusively owns the device (FOUND-03 / D-06).
 ///
 /// Returns a typed error so the exact A1/A3 failure is visible (the caller logs
 /// it; the gate report (Plan 05) folds it in).
@@ -78,30 +78,59 @@ fn run_skeleton(app: &mut tauri::App) -> Result<(), SkeletonError> {
     let (window, rect) = build_window_and_chrome(app)?;
 
     // Build the presenter first: the presenter owns its Surface (D-03), and
-    // that surface drives adapter selection so the shared device is compatible
-    // with it.
+    // that surface drives adapter selection when the worker creates the device.
     let instance = reco_core::wgpu::Instance::default();
-    let mut presenter = X11Presenter::new(&window, &instance, rect)?;
+    let presenter = X11Presenter::new(&window, &instance, rect)?;
 
-    // Create the device + adapter ONCE through the adapter-retaining
-    // `for_surface` path (the presenter needs the adapter for
-    // `get_capabilities`; RESEARCH Pitfall 4 / Open Question 3), then hand that
-    // device to the presenter — never a second device (D-03/FOUND-03).
-    let (gpu, surface_info) = pollster::block_on(reco_core::gpu::GpuContext::for_surface(
-        &instance,
-        presenter.surface(),
-    ))?;
+    // Ownership handoff (FOUND-03): the device is created *inside* the worker
+    // from the presenter's surface, so the worker is the sole device owner.
+    // Nothing on this (the setup) thread holds a device handle or renders
+    // directly.
+    let (worker, events) = worker::spawn_gpu_worker(instance, Box::new(presenter), rect)?;
 
-    let adapter = gpu.adapter().ok_or(SkeletonError::NoAdapterRetained)?;
-    presenter.configure(gpu.device(), adapter, rect.width, rect.height)?;
-    log::info!("surface format: {:?}", surface_info.format);
+    // The webview bridge: drain typed worker events on an async Tauri task and
+    // forward each one to the frontend. Plan 04 wires the JS `listen` side; the
+    // plumbing lives here.
+    install_event_bridge(app.handle().clone(), events);
 
-    drive_one_frame(gpu, surface_info.format, &mut presenter, rect)?;
+    // Drive the thin path: import the hardcoded clips, then render the live
+    // stitched frames (D-07). Commands cross the channel — never a direct
+    // engine call (D-06).
+    let handle = worker.handle();
+    handle
+        .send(worker::WorkerCommand::Import)
+        .map_err(SkeletonError::Worker)?;
+    handle
+        .send(worker::WorkerCommand::Preview)
+        .map_err(SkeletonError::Worker)?;
 
-    // Keep the window alive for the webview; the presenter is dropped at end of
-    // setup (Phase 1 drives exactly one frame).
-    drop(window);
+    // Keep the worker (and the window whose child the worker renders into)
+    // alive for the app's lifetime; the webview owns the lifetime from here.
+    app.manage(worker);
+    app.manage(window);
+
     Ok(())
+}
+
+/// Forward typed [`worker::WorkerEvent`]s to the webview on an async task.
+///
+/// Drains the worker's event channel on Tauri's async runtime and emits each
+/// event under the `"worker-event"` event name. The frontend (Plan 04) listens
+/// with `listen("worker-event", ...)` and appends log lines.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn install_event_bridge(
+    app: tauri::AppHandle,
+    events: std::sync::mpsc::Receiver<worker::WorkerEvent>,
+) {
+    tauri::async_runtime::spawn_blocking(move || {
+        // `recv` blocks until an event arrives or the worker drops the sender
+        // (at shutdown); both cases end the loop cleanly.
+        while let Ok(event) = events.recv() {
+            if let Err(e) = tauri::Emitter::emit(&app, "worker-event", &event) {
+                log::warn!("failed to emit worker event: {e}");
+            }
+        }
+    });
 }
 
 /// Fallback path for targets without a native child-view presenter yet.
@@ -163,46 +192,6 @@ fn build_window_and_chrome(
     ))
 }
 
-/// Decode one frame pair from the hardcoded clips and drive one stitched frame.
-#[cfg(all(unix, not(target_os = "macos")))]
-fn drive_one_frame(
-    gpu: reco_core::gpu::GpuContext,
-    surface_format: reco_core::wgpu::TextureFormat,
-    presenter: &mut impl SurfacePresenter,
-    rect: ViewportRect,
-) -> Result<(), SkeletonError> {
-    let paths = hardcoded::media_paths()?;
-    let cal = reco_core::calibration::MatchCalibration::from_file(paths.calibration.as_path())?;
-
-    let mut source = reco_io::adapters::FfmpegFileSource::open_with_offset(
-        paths.left.as_path(),
-        paths.right.as_path(),
-        cal.sync_offset,
-    )?;
-    let info = source.info();
-
-    let viewport = presenter::viewport_config(rect, 0.05, cal.rig_tilt as f32);
-    let renderer = reco_core::render::stitch_renderer::StitchRenderer::new(
-        cal,
-        gpu,
-        viewport,
-        info.width,
-        info.height,
-        surface_format,
-        reco_core::render::renderer::InputFormat::Yuv420p,
-    )?;
-
-    let frame = source.next_frame()?.ok_or(SkeletonError::NoFrames)?;
-    let (left, right) = match frame {
-        reco_core::source::StereoFrame::Yuv420p(pair) => (pair.left, pair.right),
-        _ => return Err(SkeletonError::NotYuv420p),
-    };
-
-    presenter.render_frame(&renderer, &left, &right, 0.0, 0.0)?;
-    log::info!("A1 verdict: native child view presented one stitched frame on Linux/X11");
-    Ok(())
-}
-
 /// Typed errors at the binary edge.
 #[derive(Debug, thiserror::Error)]
 enum SkeletonError {
@@ -227,13 +216,7 @@ enum SkeletonError {
     /// Hardcoded path resolution failed.
     #[error(transparent)]
     Hardcoded(#[from] hardcoded::HardcodedError),
-    /// The device-creation path did not retain an adapter (FOUND-04 gap).
-    #[error("engine did not retain a wgpu::Adapter (adapter gap — see FRICTION.md)")]
-    NoAdapterRetained,
-    /// The hardcoded clips produced no frames.
-    #[error("hardcoded clips produced no frames")]
-    NoFrames,
-    /// The clips did not decode to YUV420P.
-    #[error("hardcoded clips did not decode to YUV420P")]
-    NotYuv420p,
+    /// Posting a command to the engine worker failed.
+    #[error(transparent)]
+    Worker(#[from] events::WorkerError),
 }

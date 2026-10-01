@@ -202,6 +202,10 @@ impl X11Presenter {
 }
 
 impl SurfacePresenter for X11Presenter {
+    fn surface(&self) -> Result<&reco_core::wgpu::Surface<'static>, PresenterError> {
+        Ok(&self.surface)
+    }
+
     fn configure(
         &mut self,
         device: &reco_core::wgpu::Device,
@@ -320,18 +324,6 @@ impl SurfacePresenter for X11Presenter {
 
     fn viewport(&self) -> ViewportRect {
         self.viewport
-    }
-}
-
-impl X11Presenter {
-    /// Borrow the wgpu surface for device creation.
-    ///
-    /// Used by the binary only, to pass `&Surface` into
-    /// `GpuContext::for_surface` (adapter selection compatible with this
-    /// surface). The surface never leaves the Rust process and is never
-    /// exposed across IPC (D-02).
-    pub fn surface(&self) -> &reco_core::wgpu::Surface<'static> {
-        &self.surface
     }
 }
 

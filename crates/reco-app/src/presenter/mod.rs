@@ -24,10 +24,9 @@
 //! D-03: the presenter owns its own [`wgpu::Surface`] but **shares the engine
 //! worker's device and queue**. The engine worker remains the single device
 //! owner (FOUND-03); the presenter is a render target the worker draws into.
-//! The presenter therefore never calls [`GpuContext::for_surface`] (which would
-//! mint its own device) — it borrows `device()` / `queue()` from the worker's
-//! [`GpuContext`] and negotiates surface capabilities against the worker's
-//! retained adapter.
+//! The presenter therefore never creates its own GPU device — it borrows the
+//! device and queue from the worker's GPU context and negotiates surface
+//! capabilities against the worker's retained adapter.
 //!
 //! The trait surface ([`SurfacePresenter`]) is the seam Phase 2's
 //! runtime-swappable presenter (PREV-05: native compositing → separate preview
@@ -41,6 +40,19 @@ use reco_core::source::YuvData;
 pub mod x11;
 
 pub mod fallback;
+
+/// Compile-time check that the presenter can be moved to the engine worker
+/// thread.
+///
+/// The worker takes the presenter as `Box<dyn SurfacePresenter + Send>` — the
+/// `Send` bound is mandatory because the presenter is moved onto the worker
+/// thread (D-03), which is the only thread that draws into its surface. This
+/// assertion fails the build if a platform impl ever stops being `Send`.
+#[cfg(all(unix, not(target_os = "macos")))]
+const _: fn() = || {
+    fn assert_send<T: Send>() {}
+    assert_send::<x11::X11Presenter>();
+};
 
 /// The platform-native presenter selected at compile time.
 ///
@@ -152,7 +164,29 @@ impl ViewportRect {
 ///
 /// Implementors hide all platform-specific child-view and raw-handle plumbing;
 /// callers (the engine worker) only see configure / render / resize.
+///
+/// # Threading
+///
+/// A presenter is constructed on the setup thread (the window handle is only
+/// available there) and then **moved onto the engine worker thread**, which is
+/// the only thread that draws into it. Platform impls must therefore be
+/// `Send`; the worker boxes them as `Box<dyn SurfacePresenter + Send>` and
+/// [`x11::X11Presenter`] carries a compile-time `Send` assertion.
 pub trait SurfacePresenter {
+    /// The presenter's surface, for device creation.
+    ///
+    /// The worker calls this **once** to create the shared device through the
+    /// engine's surface-compatible GPU-context constructor; the surface never
+    /// leaves the Rust process and is never exposed across IPC (D-02/D-03).
+    /// Implementors return their own surface; the presenter keeps ownership.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PresenterError::Unsupported`] on a target with no surface
+    /// (the D-05 fallback), so the caller reports the recorded posture rather
+    /// than panicking.
+    fn surface(&self) -> Result<&reco_core::wgpu::Surface<'static>, PresenterError>;
+
     /// Configure (or reconfigure) the surface against the shared device.
     ///
     /// Must be called with the **worker's** device and retained adapter — never

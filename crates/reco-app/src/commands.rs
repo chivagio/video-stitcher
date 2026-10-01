@@ -15,8 +15,8 @@
 //!   build WorkerCommand ──▶ WorkerHandle::send ──▶ mpsc ──▶ worker_loop
 //! ```
 //!
-//! This module deliberately imports **no engine types** (`reco_io` / `reco_core`
-//! / `reco_control` engine surfaces) beyond the transport-agnostic
+//! This module deliberately imports **no engine types** (no `reco-io` /
+//! `reco-core` engine surfaces) beyond the transport-agnostic
 //! [`reco_control::ControlIntent`] input vocabulary: a command handler that
 //! cannot name an engine type cannot accidentally call one.
 //!
@@ -62,12 +62,12 @@ pub enum WorkerCommand {
     Export,
 
     /// Forward a transport-agnostic input intent (pan / zoom / quality) to the
-    /// worker's `PoseControl` on the same message-passing path as the other
+    /// worker's pose state on the same message-passing path as the other
     /// commands.
     ///
     /// Reusing `reco_control::ControlIntent` (PATTERNS.md "Don't Hand-Roll")
     /// means the UI never invents a parallel input vocabulary and there is no
-    /// direct `PoseControl` call from a command handler.
+    /// direct pose-control call from a command handler.
     Intent(reco_control::ControlIntent),
 
     /// Stop the worker loop and return.
