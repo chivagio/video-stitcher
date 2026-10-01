@@ -396,7 +396,7 @@ impl SurfacePresenter for SeparateWindowPresenter {
         self.show()
     }
 
-    /// Hide the separate preview window now, while the app is still alive.    ///
+    /// Hide the separate preview window now, while the app is still alive.
     /// Unlike the X11 presenter this owns a *top-level* Tauri window, not a raw
     /// child window, so teardown is a `hide` (Tauri owns the window's lifetime);
     /// dropping the handle is handled by [`Drop`]. Idempotent.
