@@ -94,6 +94,19 @@ pub enum WorkerEvent {
         /// Whether full-clip looping is enabled.
         loop_enabled: bool,
     },
+
+    /// The worker's authoritative pose after a session tick (PREV-04).
+    ///
+    /// Emitted once per tick with the *current* (eased) pose the renderer used,
+    /// so the UI's pan/zoom readout mirrors the render rather than the target.
+    Pose {
+        /// Current yaw in radians.
+        yaw: f32,
+        /// Current pitch in radians.
+        pitch: f32,
+        /// Current vertical FOV in degrees.
+        fov_degrees: f32,
+    },
 }
 
 /// The UI-facing shape of an event-log line (UI-SPEC Event Log Contract).
@@ -148,6 +161,17 @@ impl WorkerEvent {
                 message: format!(
                     "transport: {state:?}, loop {}",
                     if *loop_enabled { "on" } else { "off" }
+                ),
+            },
+            WorkerEvent::Pose {
+                yaw,
+                pitch,
+                fov_degrees,
+            } => LogLine {
+                level: Level::Info,
+                message: format!(
+                    "pose: yaw {:.3}, pitch {:.3}, fov {:.1}",
+                    yaw, pitch, fov_degrees
                 ),
             },
         }
@@ -361,6 +385,22 @@ mod tests {
     }
 
     #[test]
+    fn pose_event_roundtrips_through_serde() {
+        let event = WorkerEvent::Pose {
+            yaw: 0.25,
+            pitch: -0.1,
+            fov_degrees: 75.0,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(
+            json.contains("\"kind\":\"pose\""),
+            "unexpected json: {json}"
+        );
+        let back: WorkerEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(event, back);
+    }
+
+    #[test]
     fn state_events_project_to_neutral_log_lines() {
         let pos = WorkerEvent::Position {
             frame: 5,
@@ -376,5 +416,13 @@ mod tests {
         };
         assert_eq!(tr.to_log_line().level, Level::Info);
         assert!(tr.to_log_line().message.contains("transport"));
+
+        let pose = WorkerEvent::Pose {
+            yaw: 0.0,
+            pitch: 0.0,
+            fov_degrees: 75.0,
+        };
+        assert_eq!(pose.to_log_line().level, Level::Info);
+        assert!(pose.to_log_line().message.contains("fov 75.0"));
     }
 }

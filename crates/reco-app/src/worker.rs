@@ -130,6 +130,15 @@ impl EventSink {
             loop_enabled,
         });
     }
+
+    /// Emit the authoritative pose after a tick (PREV-04).
+    fn pose(&self, yaw: f32, pitch: f32, fov_degrees: f32) {
+        let _ = self.tx.send(WorkerEvent::Pose {
+            yaw,
+            pitch,
+            fov_degrees,
+        });
+    }
 }
 
 /// The recovery action a classified surface error demands (FOUND-05).
@@ -764,10 +773,24 @@ fn install_device_lost_handlers(device: &reco_core::wgpu::Device, lost: Arc<Atom
 /// the worker calls this. It mirrors the CLI's per-key dispatch reference
 /// (`crates/reco-cli/src/preview.rs:581-633`). Extracted as a free function so
 /// the intent→pose effect is testable without a GPU.
+///
+/// [`reco_control::PoseIntent::Reset`] is special-cased to
+/// [`PoseControl::snap_to_rest`] (an immediate return to the configured rest
+/// position) rather than the eased `IntentTranslator` hotkey path: "Reset view"
+/// is a deliberate snap, not a smoothing target (PREV-04 / CONTEXT "Reset
+/// view"). Every other intent keeps the shared vocabulary via
+/// [`reco_control::IntentTranslator`].
 pub fn dispatch_intent(
     pose: &mut reco_control::pose_control::PoseControl,
     intent: reco_control::ControlIntent,
 ) {
+    if matches!(
+        intent,
+        reco_control::ControlIntent::Pose(reco_control::PoseIntent::Reset)
+    ) {
+        pose.snap_to_rest();
+        return;
+    }
     reco_control::IntentTranslator::new(pose).dispatch(intent);
 }
 
@@ -944,10 +967,31 @@ impl EngineBackend for GpuEngineBackend {
             }
         };
 
-        // 4. Resolve the pose the renderer uses this frame. (Task 02-02/2 adds
-        //    the per-tick pose easing and FOV plumbing; here the pose is the
-        //    rest pose until that lands.)
+        // 4. Pose tick + FOV plumbing (PREV-04). Mirror the CLI's smooth_camera:
+        //    tick the pose so the CURRENT pose moves toward the target, push the
+        //    resolved FOV onto the pipeline (which clamps 1..179 internally),
+        //    keep the viewport inside the coverage boundary, then render with
+        //    the eased pose and emit it.
+        self.pose.tick();
+        let aspect = if self.viewport.height > 0 {
+            self.viewport.width as f32 / self.viewport.height as f32
+        } else {
+            1.0
+        };
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.pipeline_mut().set_fov(self.pose.current_fov_deg());
+            // Keep the viewport inside the coverage boundary (mirror the CLI's
+            // clamp_enabled path exactly).
+            let coverage = renderer.coverage();
+            self.pose
+                .clamp_via_coverage(coverage, aspect, self.rig_tilt);
+        }
         let render = self.pose.render_pose(self.rig_tilt);
+        events.pose(
+            self.pose.current_pose().yaw,
+            self.pose.current_pose().pitch,
+            self.pose.current_fov_deg(),
+        );
 
         // 5. Render + present.
         let outcome = {
@@ -1209,6 +1253,8 @@ mod tests {
         session: Option<crate::transport::Transport>,
         /// Total frames the mock source reports (drives the end transition).
         total_frames: Option<u64>,
+        /// Records the FOV value the mock "pushed onto the pipeline" each tick.
+        last_pushed_fov: Arc<std::sync::Mutex<Option<f32>>>,
         import_fails: bool,
         /// Mirrors the real backend's device-lost flag (FOUND-05).
         lost: Arc<AtomicBool>,
@@ -1223,6 +1269,7 @@ mod tests {
                 )),
                 session: None,
                 total_frames: Some(5),
+                last_pushed_fov: Arc::new(std::sync::Mutex::new(None)),
                 import_fails: false,
                 lost: Arc::new(AtomicBool::new(false)),
             }
@@ -1252,16 +1299,31 @@ mod tests {
             Ok(())
         }
 
-        fn tick_session(&mut self, _events: &EventSink) -> Result<(), WorkerError> {
+        fn tick_session(&mut self, events: &EventSink) -> Result<(), WorkerError> {
             self.record("tick");
             let Some(t) = self.session.as_mut() else {
                 return Ok(());
             };
+            // Mirror the real tick's pose work: tick + push FOV + emit pose.
+            {
+                let mut pose = self.pose.lock().unwrap();
+                pose.tick();
+                *self.last_pushed_fov.lock().unwrap() = Some(pose.current_fov_deg());
+                let current = pose.current_pose();
+                events.pose(current.yaw, current.pitch, pose.current_fov_deg());
+            }
             // Advance the transport; if it reaches Ended (loop off), the session
             // ends so the worker loop returns to a blocking recv.
             if t.state() == crate::transport::TransportState::Playing {
                 t.on_frame_advanced();
+                let frame = t.frame();
+                let total = t.total_frames();
+                let fps_rational = t.fps_rational();
                 let ended = t.state() == crate::transport::TransportState::Ended;
+                if ended {
+                    events.transport(t.state(), t.loop_enabled());
+                }
+                events.position(frame, total, fps_rational);
                 if ended {
                     self.session = None;
                 }
@@ -1660,6 +1722,119 @@ mod tests {
             .join(Duration::from_secs(2))
             .expect("worker joins after an ended session");
         assert!(t0.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn pose_intent_moves_current_pose_and_pushes_fov_after_one_tick() {
+        // Task 2: after dispatch_intent(Pose(DeltaYawRad)) + one session tick,
+        // the CURRENT pose yaw moves away from rest toward the target, and the
+        // FOV pushed onto the pipeline is within (1, 179).
+        let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut mock = MockBackend::new(Arc::clone(&ops));
+        mock.total_frames = Some(1_000_000);
+        let shared_pose = Arc::clone(&mock.pose);
+        let pushed = Arc::clone(&mock.last_pushed_fov);
+        let (worker, _events) = EngineWorker::spawn(mock);
+        let handle = worker.handle();
+        handle.send(WorkerCommand::Import).unwrap();
+        handle.send(WorkerCommand::Preview).unwrap();
+
+        let intent = reco_control::ControlIntent::Pose(reco_control::PoseIntent::DeltaYawRad(0.5));
+        handle.send(WorkerCommand::Intent(intent)).unwrap();
+
+        let start = std::time::Instant::now();
+        let mut moved = false;
+        while start.elapsed() < Duration::from_secs(2) {
+            {
+                let pose = shared_pose.lock().unwrap();
+                if pose.current_yaw_rad().abs() > 1e-4 {
+                    moved = true;
+                    break;
+                }
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        handle.send(WorkerCommand::Shutdown).unwrap();
+        let _ = worker.join(Duration::from_secs(2));
+        assert!(moved, "current pose yaw did not move after a tick");
+        let fov = pushed
+            .lock()
+            .unwrap()
+            .expect("a FOV was pushed to the pipeline");
+        assert!(
+            fov > 1.0 && fov < 179.0,
+            "pushed FOV {fov} outside (1, 179)"
+        );
+    }
+
+    #[test]
+    fn reset_intent_returns_pose_to_rest() {
+        // Task 2: Pose(Reset) snaps yaw/pitch/fov back to the rest values.
+        let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mock = MockBackend::new(Arc::clone(&ops));
+        let shared_pose = Arc::clone(&mock.pose);
+        {
+            let mut pose = shared_pose.lock().unwrap();
+            pose.apply_drag(500.0, -300.0);
+            pose.tick_with(1.0);
+            assert!(pose.current_yaw_rad().abs() > 1e-3);
+        }
+        let (worker, _events) = EngineWorker::spawn(mock);
+        let handle = worker.handle();
+        handle
+            .send(WorkerCommand::Intent(reco_control::ControlIntent::Pose(
+                reco_control::PoseIntent::Reset,
+            )))
+            .unwrap();
+        handle.send(WorkerCommand::Shutdown).unwrap();
+
+        let start = std::time::Instant::now();
+        while start.elapsed() < Duration::from_secs(2) {
+            if ops.lock().unwrap().contains(&"intent") {
+                break;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        let _ = worker.join(Duration::from_secs(2));
+        let pose = shared_pose.lock().unwrap();
+        let rest = pose.config().rest_pose;
+        assert!((pose.current_yaw_rad() - rest.yaw).abs() < 1e-6);
+        assert!((pose.current_pitch_rad() - rest.pitch).abs() < 1e-6);
+        assert!((pose.current_fov_deg() - rest.fov_degrees.unwrap()).abs() < 1e-6);
+    }
+
+    #[test]
+    fn pose_event_is_emitted_carrying_the_current_pose() {
+        // Task 2: a Pose event carries the worker's current pose after a tick.
+        let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut mock = MockBackend::new(Arc::clone(&ops));
+        mock.total_frames = Some(1_000_000);
+        let (worker, events) = EngineWorker::spawn(mock);
+        let handle = worker.handle();
+        handle.send(WorkerCommand::Import).unwrap();
+        handle.send(WorkerCommand::Preview).unwrap();
+        handle
+            .send(WorkerCommand::Intent(reco_control::ControlIntent::Pose(
+                reco_control::PoseIntent::SetFovDeg(60.0),
+            )))
+            .unwrap();
+
+        let mut saw_pose = false;
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            match events.recv_timeout(Duration::from_millis(100)) {
+                Ok(WorkerEvent::Pose { fov_degrees, .. }) => {
+                    assert!(fov_degrees > 1.0 && fov_degrees < 179.0);
+                    saw_pose = true;
+                    break;
+                }
+                Ok(_) => continue,
+                Err(_) => continue,
+            }
+        }
+        handle.send(WorkerCommand::Shutdown).unwrap();
+        let _ = worker.join(Duration::from_secs(2));
+        assert!(saw_pose, "no Pose event was emitted");
     }
 
     #[test]
