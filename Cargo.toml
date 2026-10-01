@@ -25,6 +25,11 @@ license = "AGPL-3.0-only"
 repository = "https://github.com/reco-project/video-stitcher"
 
 [workspace.dependencies]
+# FOUND-04: the workspace wgpu pin lives HERE and nowhere else. Every
+# consumer references `wgpu = { workspace = true }`, so the pin cannot
+# drift between crates and the FOUND-04 gate (scripts/check-wgpu-pin.sh)
+# has a single anchor to assert against.
+wgpu = "28"
 tracing = "0.1"
 # tracing-subscriber + env-filter: structured log output with RUST_LOG-
 # style filtering, feature-gated JSON emit for diagnostic bundles.
