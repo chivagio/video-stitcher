@@ -207,6 +207,14 @@ pub trait EngineBackend: Send {
     /// state, loop, and coalesced seek).
     fn transport(&mut self) -> &mut crate::transport::Transport;
 
+    /// Report the webview chrome's collapsible state; recompute and reconfigure
+    /// the native viewport (no transport/pose reset).
+    fn set_chrome(&mut self, chrome: crate::presenter::ChromeState, events: &EventSink);
+
+    /// Reconfigure the native viewport for a new window size (no transport/pose
+    /// reset). Must run at a command boundary (no `SurfaceTexture` alive).
+    fn resize_viewport(&mut self, width: u32, height: u32, events: &EventSink);
+
     /// Run the hardcoded file→file export until `interrupted` is set.
     fn export(&mut self, events: &EventSink, interrupted: &AtomicBool) -> Result<(), WorkerError>;
 
@@ -283,6 +291,21 @@ fn handle_command<B: EngineBackend>(
         WorkerCommand::SetLoop(enabled) => {
             backend.transport().set_loop(enabled);
             emit_transport(backend, events);
+        }
+        WorkerCommand::SetChrome {
+            panel_expanded,
+            drawer_expanded,
+        } => {
+            backend.set_chrome(
+                crate::presenter::ChromeState {
+                    panel_expanded,
+                    drawer_expanded,
+                },
+                events,
+            );
+        }
+        WorkerCommand::ResizeViewport { width, height } => {
+            backend.resize_viewport(width, height, events);
         }
         WorkerCommand::Export => {
             interrupted.store(false, Ordering::SeqCst);
@@ -536,6 +559,12 @@ pub struct GpuEngineBackend {
     first_frame_marker_pending: bool,
     /// Wall-clock time of the last presented frame, for pacing the tick.
     last_frame_time: std::time::Instant,
+    /// Last-known window width in physical pixels (seeded from `tauri.conf.json`).
+    window_width: u32,
+    /// Last-known window height in physical pixels (seeded from `tauri.conf.json`).
+    window_height: u32,
+    /// Current webview chrome state (source of truth for the native viewport).
+    chrome: crate::presenter::ChromeState,
     /// The loaded calibration, if `Import` has run.
     calibration: Option<reco_core::calibration::MatchCalibration>,
     /// The open decode source, if `Import` has run.
@@ -638,6 +667,9 @@ impl GpuEngineBackend {
             session: None,
             first_frame_marker_pending: true,
             last_frame_time: std::time::Instant::now(),
+            window_width: 1280,
+            window_height: 800,
+            chrome: crate::presenter::ChromeState::default(),
             calibration: None,
             source: None,
             input_size: None,
@@ -742,6 +774,55 @@ impl GpuEngineBackend {
     /// The active session's frame-rate rational, if any.
     fn session_fps_rational(&self) -> Option<(i32, i32)> {
         self.session.as_ref().and_then(|t| t.fps_rational())
+    }
+
+    /// Recompute the native viewport from the stored window size + chrome state
+    /// and reconfigure the presenter's surface in place.
+    ///
+    /// Runs at a **command boundary** (the worker drains commands before a
+    /// session tick), so no `SurfaceTexture` is alive. It does NOT touch the
+    /// transport or pose, so a resize preserves the playhead and view
+    /// (RESEARCH Pitfall 8).
+    fn reconfigure_viewport(&mut self, events: &EventSink) {
+        let rect = crate::presenter::ViewportRect::for_chrome(
+            self.window_width,
+            self.window_height,
+            &self.chrome,
+        );
+        self.viewport = rect;
+        // Skip a non-drawable rect: reconfiguring to zero would make the
+        // pipeline's `resize` warn and no-op anyway; keep the last good rect.
+        if !rect.is_drawable() {
+            events.info(format!(
+                "viewport reconfigure skipped: {}x{} not drawable",
+                rect.width, rect.height
+            ));
+            return;
+        }
+        let result = self
+            .presenter
+            .resize(rect.width, rect.height)
+            .and_then(|()| {
+                self.presenter.configure(
+                    self.gpu.device(),
+                    self.gpu.queue(),
+                    &self.adapter,
+                    rect.width,
+                    rect.height,
+                )
+            })
+            .map(|()| {
+                if let Some(renderer) = self.renderer.as_mut() {
+                    renderer.pipeline_mut().resize(rect.width, rect.height);
+                }
+            });
+        match result {
+            Ok(()) => events.info(format!(
+                "viewport reconfigured to {}x{}",
+                rect.width, rect.height
+            )),
+            Err(e) => events.failed(WorkerError::Engine(e.to_string())),
+        }
     }
 }
 
@@ -1084,6 +1165,17 @@ impl EngineBackend for GpuEngineBackend {
             .get_or_insert_with(|| crate::transport::Transport::new(30.0, None, None))
     }
 
+    fn set_chrome(&mut self, chrome: crate::presenter::ChromeState, events: &EventSink) {
+        self.chrome = chrome;
+        self.reconfigure_viewport(events);
+    }
+
+    fn resize_viewport(&mut self, width: u32, height: u32, events: &EventSink) {
+        self.window_width = width;
+        self.window_height = height;
+        self.reconfigure_viewport(events);
+    }
+
     fn export(&mut self, events: &EventSink, interrupted: &AtomicBool) -> Result<(), WorkerError> {
         let paths =
             crate::hardcoded::media_paths().map_err(|e| WorkerError::Engine(e.to_string()))?;
@@ -1343,6 +1435,14 @@ mod tests {
         fn transport(&mut self) -> &mut crate::transport::Transport {
             self.session
                 .get_or_insert_with(|| crate::transport::Transport::new(30.0, None, None))
+        }
+
+        fn set_chrome(&mut self, _chrome: crate::presenter::ChromeState, _events: &EventSink) {
+            self.record("set_chrome");
+        }
+
+        fn resize_viewport(&mut self, _width: u32, _height: u32, _events: &EventSink) {
+            self.record("resize_viewport");
         }
 
         fn export(
@@ -1835,6 +1935,43 @@ mod tests {
         handle.send(WorkerCommand::Shutdown).unwrap();
         let _ = worker.join(Duration::from_secs(2));
         assert!(saw_pose, "no Pose event was emitted");
+    }
+
+    #[test]
+    fn chrome_and_resize_commands_reach_the_backend() {
+        // Task 3: SetChrome and ResizeViewport are handled at the worker's
+        // command drain and observed by the backend in arrival order. They must
+        // not require an active session (Pitfall 8: reconfigure preserves
+        // position/pose; it is a boundary command).
+        let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (worker, _events) = EngineWorker::spawn(MockBackend::new(Arc::clone(&ops)));
+        let handle = worker.handle();
+        handle
+            .send(WorkerCommand::SetChrome {
+                panel_expanded: true,
+                drawer_expanded: true,
+            })
+            .unwrap();
+        handle
+            .send(WorkerCommand::ResizeViewport {
+                width: 1024,
+                height: 600,
+            })
+            .unwrap();
+        handle.send(WorkerCommand::Shutdown).unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            if ops.lock().unwrap().contains(&"shutdown") {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        let _ = worker.join(Duration::from_secs(2));
+        assert_eq!(
+            &*ops.lock().unwrap(),
+            &["set_chrome", "resize_viewport", "shutdown"]
+        );
     }
 
     #[test]

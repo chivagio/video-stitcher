@@ -64,7 +64,8 @@ fn main() -> anyhow::Result<()> {
             commands::pause,
             commands::seek,
             commands::step_frame,
-            commands::set_loop
+            commands::set_loop,
+            commands::set_chrome
         ])
         .setup(|app| {
             if let Err(e) = run_skeleton(app) {
@@ -130,7 +131,12 @@ fn run_skeleton(app: &mut tauri::App) -> Result<(), SkeletonError> {
     // FOUND-06: register the clean-teardown path on the window. A close request
     // must stop the worker, join it within a timeout, and drop the engine in the
     // documented order — never hang, never `std::process::exit`.
-    install_close_handler(&window, worker);
+    //
+    // The same handler also forwards window resizes to the worker as
+    // `ResizeViewport`, so the native viewport is reconfigured at a command
+    // boundary (Plan 02-02 Task 3) — the frontend/webview never sizes the
+    // native view.
+    install_close_handler(&window, worker, handle.clone());
 
     // The thin path is driven by the WEBVIEW, not from here: the three
     // `#[tauri::command]` handlers post Import / Preview / Export when the user
@@ -161,7 +167,8 @@ struct TeardownState {
 /// How long to wait for the worker to stop before giving up (FOUND-06).
 const SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Register the window-close handler that performs clean teardown (FOUND-06).
+/// Register the window-close handler that performs clean teardown (FOUND-06),
+/// and forward window resizes to the worker (Plan 02-02 Task 3).
 ///
 /// On [`tauri::WindowEvent::CloseRequested`] / `Destroyed`, the worker is asked
 /// to stop and joined within [`SHUTDOWN_TIMEOUT`]. The drop order is enforced by
@@ -169,8 +176,17 @@ const SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// renderer → drop surface → drop device) — see `worker.rs` for the NVDEC/wgpu
 /// hazard citation. The event bridge task ends when the worker drops its event
 /// sender, so the process can exit.
+///
+/// On [`tauri::WindowEvent::Resized`], a [`WorkerCommand::ResizeViewport`] is
+/// posted through `resize_handle`; the worker recomputes the native viewport
+/// from the new size + reported chrome state and reconfigures the surface,
+/// without resetting the playhead or pose.
 #[cfg(all(unix, not(target_os = "macos")))]
-fn install_close_handler(window: &tauri::window::Window, worker: worker::EngineWorker) {
+fn install_close_handler(
+    window: &tauri::window::Window,
+    worker: worker::EngineWorker,
+    resize_handle: worker::WorkerHandle,
+) {
     let state = TeardownState {
         worker: std::sync::Mutex::new(Some(worker)),
     };
@@ -180,18 +196,32 @@ fn install_close_handler(window: &tauri::window::Window, worker: worker::EngineW
     window.app_handle().manage(shared.clone());
 
     window.on_window_event(move |event| {
-        if matches!(
-            event,
-            tauri::WindowEvent::CloseRequested { .. } | tauri::WindowEvent::Destroyed
-        ) {
-            // Take the worker once; a second close event is a no-op.
-            let taken = shared.worker.lock().ok().and_then(|mut guard| guard.take());
-            if let Some(worker) = taken {
-                match worker.shutdown(SHUTDOWN_TIMEOUT) {
-                    Ok(()) => log::info!("engine worker stopped cleanly"),
-                    Err(e) => log::warn!("engine worker shutdown: {e}"),
+        match event {
+            tauri::WindowEvent::Resized(size) => {
+                // Forward the new physical size to the worker. A zero size is
+                // ignored (a minimized window reports 0x0; `for_chrome`
+                // saturates, but reconfiguring to zero is pointless).
+                if size.width > 0
+                    && size.height > 0
+                    && let Err(e) = resize_handle.send(worker::WorkerCommand::ResizeViewport {
+                        width: size.width,
+                        height: size.height,
+                    })
+                {
+                    log::warn!("failed to forward window resize to the worker: {e}");
                 }
             }
+            tauri::WindowEvent::CloseRequested { .. } | tauri::WindowEvent::Destroyed => {
+                // Take the worker once; a second close event is a no-op.
+                let taken = shared.worker.lock().ok().and_then(|mut guard| guard.take());
+                if let Some(worker) = taken {
+                    match worker.shutdown(SHUTDOWN_TIMEOUT) {
+                        Ok(()) => log::info!("engine worker stopped cleanly"),
+                        Err(e) => log::warn!("engine worker shutdown: {e}"),
+                    }
+                }
+            }
+            _ => {}
         }
     });
 }

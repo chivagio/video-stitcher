@@ -170,6 +170,26 @@ pub async fn set_loop(
     state.send(WorkerCommand::SetLoop(enabled))
 }
 
+/// Report the webview chrome's collapsible state (UI-SPEC Geometry authority).
+///
+/// Thin: posts `SetChrome`; the worker recomputes the native viewport. Names no
+/// engine type.
+///
+/// # Errors
+///
+/// Returns [`WorkerError::ChannelClosed`] if the worker has already exited.
+#[tauri::command]
+pub async fn set_chrome(
+    state: tauri::State<'_, WorkerHandle>,
+    panel_expanded: bool,
+    drawer_expanded: bool,
+) -> Result<(), WorkerError> {
+    state.send(WorkerCommand::SetChrome {
+        panel_expanded,
+        drawer_expanded,
+    })
+}
+
 /// A command from the UI to the engine worker.
 ///
 /// `Clone + Send + 'static` — the compile-time assertion in `events.rs`
@@ -224,6 +244,26 @@ pub enum WorkerCommand {
 
     /// Enable/disable full-clip looping (PREV-02).
     SetLoop(bool),
+
+    /// Report the webview chrome's collapsible state so the worker recomputes
+    /// the native viewport (UI-SPEC Geometry authority).
+    SetChrome {
+        /// Whether the right controls panel is expanded.
+        panel_expanded: bool,
+        /// Whether the event-log drawer is expanded.
+        drawer_expanded: bool,
+    },
+
+    /// Reconfigure the native viewport for a new window size (PREV-01/04).
+    ///
+    /// Sent by `main.rs` on `WindowEvent::Resized`; carries no engine type and
+    /// preserves transport position and pose (Pitfall 8).
+    ResizeViewport {
+        /// New window width in physical pixels.
+        width: u32,
+        /// New window height in physical pixels.
+        height: u32,
+    },
 
     /// Stop the worker loop and return.
     Shutdown,
@@ -320,6 +360,18 @@ mod tests {
             .send(WorkerCommand::StepFrame { direction: 1 })
             .unwrap();
         handle.send(WorkerCommand::SetLoop(true)).unwrap();
+        handle
+            .send(WorkerCommand::SetChrome {
+                panel_expanded: true,
+                drawer_expanded: false,
+            })
+            .unwrap();
+        handle
+            .send(WorkerCommand::ResizeViewport {
+                width: 1280,
+                height: 800,
+            })
+            .unwrap();
         assert_eq!(rx.recv().unwrap(), WorkerCommand::Play);
         assert_eq!(rx.recv().unwrap(), WorkerCommand::Pause);
         assert_eq!(rx.recv().unwrap(), WorkerCommand::Seek { frame: 42 });
@@ -328,6 +380,20 @@ mod tests {
             WorkerCommand::StepFrame { direction: 1 }
         );
         assert_eq!(rx.recv().unwrap(), WorkerCommand::SetLoop(true));
+        assert_eq!(
+            rx.recv().unwrap(),
+            WorkerCommand::SetChrome {
+                panel_expanded: true,
+                drawer_expanded: false
+            }
+        );
+        assert_eq!(
+            rx.recv().unwrap(),
+            WorkerCommand::ResizeViewport {
+                width: 1280,
+                height: 800
+            }
+        );
     }
 
     #[test]
