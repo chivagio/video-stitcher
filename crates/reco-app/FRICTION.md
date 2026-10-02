@@ -114,3 +114,30 @@ Wiring the rune stores to the typed event payloads is the real fix; it is out of
 scope for Phase 2 and is left as the first thing to tighten when the frontend
 protocol next changes.
 
+### A4. "0 errors" from `svelte-check` hid a dead UI control — read the warnings
+
+**Impact:** High (PREV-02), and it survived two verification passes. `Timeline.svelte`
+computed its slider bounds as plain `const`s:
+
+```js
+const max = total !== null && total > 0 ? total - 1 : 0;   // frozen at mount
+const value = dragging ? dragFrame : frame;                 // frozen at mount
+```
+
+Svelte 5 evaluates the component body once, so both froze at mount — with `total`
+null that pinned the range to `min=0 max=0 value=0` permanently. The playhead never
+advanced and a mouse drag could never seek, i.e. the `scrub` capability PREV-02 names
+was absent. It was masked in the accessibility tree (`aria-valuetext` reads live props)
+and keyboard stepping and the Step buttons still worked, so the only honest signal was
+`svelte-check`'s **8 warnings** — which both earlier passes reported as "0 errors" and
+moved on. `const` -> `$derived` fixed it.
+
+**Resolution (Phase 2, gap closure):** both bindings are `$derived`; `svelte-check` is now
+`0 errors and 0 warnings`, and that zero-warning state is the gate, not zero-errors.
+
+**Residual gap:** nothing enforces the gate — `npm run build` succeeds with warnings, and
+CI does not run `svelte-check`. Until it does, a non-reactive binding can be reintroduced
+silently. The two remaining warning classes at the time of writing were also real defects
+(`canvasEl` missing `$state`, and a `tabindex` on a `role="img"` div), which is the
+argument for wiring `svelte-check --fail-on-warnings` into CI.
+
