@@ -66,6 +66,11 @@
   // could never seek (PREV-02).
   const max = $derived(total !== null && total > 0 ? total - 1 : 0);
   const value = $derived(dragging ? dragFrame : frame);
+
+  // E3 "accent progress fill": the played fraction of the track, as a percentage
+  // for the CSS gradient stop. Guarded against a zero-length track (no session
+  // yet) so the gradient stays 0% instead of dividing by zero to NaN.
+  const progress = $derived(max > 0 ? Math.min(100, (value / max) * 100) : 0);
 </script>
 
 <input
@@ -76,6 +81,7 @@
   step="1"
   {value}
   {disabled}
+  style:--progress="{progress}%"
   aria-label="Timeline"
   aria-valuetext="{frame} of {total ?? 0}"
   oninput={handleInput}
@@ -122,5 +128,29 @@
 
   .timeline:focus-visible {
     box-shadow: 0 0 0 2px var(--color-accent);
+  }
+
+  /* E3 accent progress fill. The thumb moves on its own, but the played part
+     of the track is only visible if the runnable track is styled, so both
+     engines get a gradient stopped at the reactive --progress custom property
+     set inline by the component. */
+  .timeline::-webkit-slider-runnable-track {
+    height: 4px;
+    border-radius: 2px;
+    background: linear-gradient(
+      to right,
+      var(--color-accent) 0 var(--progress),
+      var(--color-dominant) var(--progress) 100%
+    );
+  }
+
+  .timeline::-moz-range-track {
+    height: 4px;
+    border-radius: 2px;
+    background: linear-gradient(
+      to right,
+      var(--color-accent) 0 var(--progress),
+      var(--color-dominant) var(--progress) 100%
+    );
   }
 </style>
