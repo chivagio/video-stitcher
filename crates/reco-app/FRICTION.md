@@ -284,3 +284,45 @@ handling by hand, so the next change to any of those can drift the same way. Not
 time or CI — keeps a `MockBackend` in step with a `GpuEngineBackend`; the honest cheap signal
 remains the headless probe (`scripts/phase2-chrome-probe.sh`), which drives the real binary.
 
+### A10. A child window takes the input a webview drawn into its parent can never have
+
+**Impact:** High (PREV-04), and it shipped as a feature that did nothing. The
+panorama is an X11 **child window** of the main window and the WebKitGTK webview is
+**not** a separate X window — GTK draws it into the parent's own surface. An X child
+composites above its parent's own drawing and receives every pointer event in its
+area, so the webview's `onpointerdown` / `onpointermove` / `onwheel` over the preview
+region could never fire: a 500 px drag and five wheel notches during live playback
+changed zero pixels, and the frontend's path was green in `svelte-check`, green in
+the build, and unreachable.
+
+Two consequences follow, and both are architecture rather than bug:
+
+1. **A native presenter and a webview presenter cannot share one pose-input route.**
+   Each needs its own, and which one is live is a property of the *presenter*, not of
+   the view. The webview route is now gated on `presenterKind !== "native"`; in native
+   mode it is inert by construction, and in readback / separate-window mode it is the
+   only route there is (swapping presenters destroys the outgoing child window, so
+   nothing native is left over the region).
+2. **The child owns the input.** `X11Presenter` selects the button/motion/wheel masks
+   and drains them with `XCheckWindowEvent`, and the worker translates the gesture
+   through `presenter::pointer_input::pointer_gesture_to_intents` — the same
+   `dispatch_intent` the typed `WorkerCommand::Intent` path uses.
+
+The same shared-`Display*` hazard that makes this necessary is the one that makes it
+dangerous: GTK and this presenter hold the *same* `Display*`, so `XPending` +
+`XNextEvent` would drain GTK's own queue and silently break the entire UI. The drain
+is window-and-mask scoped for that reason, and there is a negative grep
+(`XNextEvent`/`XPending(` must not appear) plus a mutation proof guarding it.
+
+**Resolution (Phase 2, plan 02-10):** see above. The translation itself is pure —
+no X types, no GPU — so its sign convention is pinned by unit tests that run in CI
+where there is no X server at all.
+
+**Residual gap:** the drag sign convention now has **two** implementations, this
+frontend path and `presenter::pointer_input`'s `YAW_DRAG_SIGN` / `PITCH_DRAG_SIGN`
+(see A6), and nothing keeps them in step: `crates/reco-app/ui` has no test runner, so
+a flip on one side is invisible to every automated gate. The honest cheap signal is
+the live drag assertion in `scripts/phase2-chrome-probe.sh`. Unrelatedly, the
+unified drag/wheel path in `PoseControl` (`drag_deg_per_pixel`, `wheel_fov_per_tick`,
+`invert_drag_x`/`y`) is now unused by this consumer — it is a second place the same
+conversion is configured, and the two will drift.

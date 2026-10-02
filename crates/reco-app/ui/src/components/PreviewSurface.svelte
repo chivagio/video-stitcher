@@ -22,12 +22,28 @@
   } = $props();
 
   const isNative = $derived(presenterKind === "native");
-  // UI-SPEC "Pose input mapping (panorama mode only)": pan and zoom are gated on
-  // the VIEW, not the presenter. Gating on presenter kind instead would leave
-  // pan dead in the readback arm - where the panorama is just as much under the
-  // cursor - and would mutate the pose in source view, which `render_source`
-  // ignores, so the pan would be silently invisible.
-  const poseActive = $derived(viewMode === "panorama");
+  // Pose input mapping (UI-SPEC "panorama mode only"), plus the window-ownership
+  // rule. Two gates, in this order:
+  //
+  //   1. VIEW: pan and zoom apply to the panorama only. In source view the
+  //      region shows the two raw tiles, which `render_source` draws without
+  //      the pose, so a pan there would be silently invisible.
+  //   2. PRESENTER: only the presenters that draw NO native window over this
+  //      region can have the webview own their pointer input. The native
+  //      presenter's panorama is an X11 CHILD window of the main window and the
+  //      WebKitGTK webview is not a separate X window (GTK draws it into the
+  //      parent's own surface), so the child composites above the parent's own
+  //      drawing and takes every pointer event in its area: the webview cannot
+  //      see those events at all. The Rust side owns them instead
+  //      (`X11Presenter::take_pointer_gesture`). Swapping presenters calls
+  //      `release_presenter_window()` on the outgoing one, which destroys that
+  //      child window, so in readback / separate-window mode nothing native
+  //      covers this region and these handlers are the ONLY route to the pose.
+  //
+  // So this is not "native has a second path": in native mode the region is a
+  // hole the webview cannot see, and these handlers are inert there by
+  // construction.
+  const webviewPoseActive = $derived(viewMode === "panorama" && presenterKind !== "native");
   const isSeparateWindow = $derived(presenterKind === "separate_window");
   const isReadback = $derived(presenterKind === "readback");
 
@@ -41,12 +57,21 @@
   // at 150 deg. The pose store stays protocol-typed (radians) and does no
   // layout math — the viewport width is only known here.
   //
-  // Signs are grab-the-world (direct manipulation), and they DIFFER:
-  //   drag right -> reveal content to the left  -> camera turns left  -> yaw down
-  //   drag down  -> reveal content above        -> camera pitches up  -> pitch up
-  // They are named constants so the convention is one obvious place to flip.
+  // Signs come from the ENGINE convention, not from screen intuition:
+  //   +yaw looks LEFT  (so drag right -> negative yaw -> camera turns right)
+  //   +pitch looks UP  (so drag down  -> negative pitch -> camera looks down)
+  // That is the CLI's arrow mapping (`crates/reco-cli/src/preview.rs:582-598`:
+  // Left = +yaw, Right = -yaw, Up = +pitch, Down = -pitch), so a drag and the
+  // Shift+arrow nudge agree on BOTH axes.
+  //
+  // They stay named constants so the convention is one obvious place to flip --
+  // and the Rust native path carries the identical pair in
+  // `crates/reco-app/src/presenter/pointer_input.rs` (`YAW_DRAG_SIGN` /
+  // `PITCH_DRAG_SIGN`, pinned by unit tests against the CLI). THE TWO MUST BE
+  // CHANGED TOGETHER, or the pan direction will differ between the native and
+  // readback presenters.
   const YAW_DRAG_SIGN = -1;
-  const PITCH_DRAG_SIGN = 1;
+  const PITCH_DRAG_SIGN = -1;
 
   let panning = $state(false);
   let lastX = 0;
@@ -60,7 +85,7 @@
   }
 
   function handlePointerDown(e: PointerEvent): void {
-    if (!poseActive || e.button !== 0) return;
+    if (!webviewPoseActive || e.button !== 0) return;
     panning = true;
     lastX = e.clientX;
     lastY = e.clientY;
@@ -129,7 +154,7 @@
   class:native={isNative}
   class:separate-window={isSeparateWindow}
   class:readback={isReadback}
-  class:pose-active={poseActive}
+  class:pose-active={webviewPoseActive}
   role="img"
   aria-label={viewMode === "source" ? "Source" : "Panorama"}
   class:panning
@@ -139,7 +164,7 @@
   onpointerup={endPan}
   onpointercancel={endPan}
   onwheel={(e) => {
-    if (poseActive) {
+    if (webviewPoseActive) {
       e.preventDefault();
       const delta = e.deltaY > 0 ? -1 : 1;
       void pose.nudgeFov(delta);
@@ -211,8 +236,10 @@
   }
 
   /* A drag pans, so the region must not also scroll/zoom the page, and the
-     cursor should say so. Keyed on the panorama view rather than `.native`,
-     matching the `poseActive` gate the handlers use. */
+     cursor should say so. Keyed on `webviewPoseActive` (panorama view AND a
+     presenter whose pointer input the webview owns), matching the gate the
+     handlers use -- in native mode the cursor here is the panorama's, not the
+     webview's, so a grab cursor would be a lie. */
   .preview-surface.pose-active {
     touch-action: none;
     cursor: grab;
