@@ -141,3 +141,29 @@ silently. The two remaining warning classes at the time of writing were also rea
 (`canvasEl` missing `$state`, and a `tabindex` on a `role="img"` div), which is the
 argument for wiring `svelte-check --fail-on-warnings` into CI.
 
+### A5. The engine-side pose path verified clean while pan had zero callers
+
+**Impact:** High (PREV-04 / ROADMAP SC 4), and it passed two verification passes.
+The worker, `intent_translator`, and `PoseControl` were all correct and unit-tested for
+yaw, pitch, and FOV. What was missing was the frontend caller: `pose.svelte.ts` had a
+complete `nudgeYaw` / `nudgePitch` / `nudgeYawStep` / `nudgePitchStep` API with **zero
+call sites**, and the preview surface handled only `onwheel`. So "User can pan, zoom, and
+adjust FOV" shipped as two of three.
+
+This is the same failure shape as A3 and A4: the half of the feature that is cheap to
+test in isolation gets verified, and the seam that actually determines whether a user can
+perform the action stays unobserved — here because the only way to observe it is a real
+pointer drag, which the headless rig cannot do (`xdotool` synthesises clicks, not drags).
+
+**Resolution (Phase 2, gap closure):** drag-pan is wired on the preview surface with
+pointer capture, px→rad is zoom-relative (a full-width drag sweeps one FOV), and
+`Shift`+arrow nudges pose (bare arrows stay with the timeline's frame stepping). The step
+helpers now take a `-1 | 1` direction — they previously always stepped positive, so left
+and right were the same action.
+
+**Residual gap:** the px→rad constant and the grab-the-world sign convention are
+frontend-only judgements with no automated coverage; they are called out explicitly in
+`02-UAT.md` item 5 so a human confirms the feel rather than inheriting it. The broader
+pattern worth watching: a capability is not delivered until its *caller* exists, and
+"the engine side is tested" is not evidence that a user can reach it.
+
