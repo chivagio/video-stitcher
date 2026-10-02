@@ -167,3 +167,28 @@ frontend-only judgements with no automated coverage; they are called out explici
 pattern worth watching: a capability is not delivered until its *caller* exists, and
 "the engine side is tested" is not evidence that a user can reach it.
 
+### A6. Pose sign conventions are undocumented, and two doc comments disagree
+
+**Impact:** Medium (PREV-04), invisible to every gate. `PoseControl` treats **+yaw as
+looking LEFT** and **+pitch as looking UP**. Nothing in `reco-control` or the GUI states
+this, and the two comments written while wiring pan (the drag handler and the arrow-key
+handler) asserted opposite conventions. The result shipped as two spellings of the same
+gesture pointing opposite ways: drag right looked right, `Shift`+`Right` looked left.
+
+The only dependable references are `crates/reco-cli/src/preview.rs:582-598` (the CLI's
+arrow mapping, which is correct) and the `view_matrix` itself. **Neither doc comment can
+be trusted here.**
+
+**Resolution (Phase 2, gap closure):** both paths now follow the CLI mapping —
+`Left = +yaw`, `Right = -yaw`, `Up = +pitch`, `Down = -pitch` — and the `nudgeYawStep`
+doc now states the sign convention explicitly instead of naming the screen direction.
+`YAW_DRAG_SIGN` / `PITCH_DRAG_SIGN` remain named constants so the drag convention is
+flippable in one place, and `02-UAT.md` item 5 cross-checks drag against arrows so a human
+confirms the feel rather than trusting either comment.
+
+**Residual gap:** the convention is stated only in comments and in the CLI. A flipped
+constant passes `svelte-check`, the frontend build, and the probe — there is no frontend
+test runner in `package.json`, and no automated signal exists for this class of bug. Two
+options worth taking later: a tiny test that asserts the four arrow signs against the CLI
+mapping, and a `reco-control` doc line on `ViewportPosition` stating that +yaw looks left.
+
