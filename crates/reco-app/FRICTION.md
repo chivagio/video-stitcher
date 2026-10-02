@@ -192,6 +192,11 @@ test runner in `package.json`, and no automated signal exists for this class of 
 options worth taking later: a tiny test that asserts the four arrow signs against the CLI
 mapping, and a `reco-control` doc line on `ViewportPosition` stating that +yaw looks left.
 
+As of plan 02-10 the drag convention has **two** implementations — this frontend path and the
+Rust native path in `crates/reco-app/src/presenter/pointer_input.rs` (`YAW_DRAG_SIGN` /
+`PITCH_DRAG_SIGN`, pinned by unit tests against the CLI) — and they must be flipped together,
+or the pan direction will differ between the native and readback presenters.
+
 ### A7. A `#[tauri::command]` with a snake_case argument silently never fires
 
 **Impact:** High (PREV-01 / PREV-02 chrome), and it was the real cause of the UAT gap
@@ -226,4 +231,56 @@ breakage will reappear the next time a multi-word argument is added. The durable
 `rename_all = "snake_case"` at the app level (e.g. on the `Builder`) so the whole IPC surface
 is snake_case by construction and the crate stops carrying two spellings; the residual risk
 until then is only for newly added multi-word arguments.
+
+### A8. A session constructor that silently drops user-set state
+
+**Impact:** High (PREV-02), and silent. `EngineBackend::transport()` prefers the live
+session and falls back to the import-built transport, so a `SetLoop` issued with no session
+active lands on `loaded` — but `begin_preview` builds a brand-new `Transport`, and
+`Transport::new` hard-codes `loop_enabled: false`. The flag was stored correctly and then
+thrown away at the session boundary, with no error anywhere: the user sees the clip stop at
+its end instead of wrapping. The generalisable name for this is **a constructor that silently
+drops user-set state** — the setting round-trips through every layer that inspects it, so the
+only place it can die is the line that builds the next one.
+
+**Resolution (Phase 2, plan 02-09):** `transport::carry_user_state(previous, next)` is the
+single named seam for state that must survive a session boundary, and
+`worker::new_session_transport` is the shared constructor that applies it — to the real backend
+*and* to the GPU-free mock, so the mock cannot drift from the real behaviour.
+`GpuEngineBackend::begin_preview` carries before any projection is emitted; `end_preview`
+mirrors a session's flag back into `loaded`, so a flag set during a session also survives that
+session ending (a failed tick ends it too). Five tests cover it; one is mutation-proven.
+
+**Residual gap:** `Transport` still has no general notion of "user-set vs derived" state —
+`carry_user_state` carries one field by name, so the next user-settable field can still be
+forgotten. A durable fix is a `Transport::inheriting_from(&self, next: Self)` constructor that
+makes the carry unskippable by construction; not taken here because it changes
+`Transport::new`'s shape for every caller. The mutation proof also has a blind spot worth
+remembering: while the two backends built their session transport on separate lines, deleting
+the carry from the *real* backend left every mock-driven test green. Sharing the constructor
+closed that hole; it does not close the general one, where a GPU-free mock cannot observe a
+GPU-backed path at all.
+
+### A9. A mock backend that mirrors the real one only by convention
+
+**Impact:** Medium, and it masked a High defect for one plan. `MockBackend` is what makes the
+worker loop, its ordering and its command protocol testable without a GPU — but nothing tied
+it to `GpuEngineBackend`. When plan 02-09 added the session-boundary carry, the tests passed
+against the mock's own copy of the behaviour while the real backend's call site was a separate
+line that could be deleted with every gate still green. Same shape as A3, A4, A5 and A7: the
+half that is cheap to test in isolation gets verified, and the seam that actually determines
+what a user gets stays unobserved.
+
+**Resolution (Phase 2, plan 02-09):** the session transport is built by one free function,
+`worker::new_session_transport`, called from both backends, and its precedence (session, then
+`loaded`) is asserted directly by
+`worker::tests::new_session_transport_carries_from_the_session_then_the_loaded_transport`
+without a GPU. The mutation proof now bites: removing the carry from that one function fails
+three tests, where previously it failed none.
+
+**Residual gap:** only the seams that were factored out are protected. The mock still
+duplicates `tick_session`'s shape, `end_preview`'s bookkeeping and the presenter's error
+handling by hand, so the next change to any of those can drift the same way. Nothing — compile
+time or CI — keeps a `MockBackend` in step with a `GpuEngineBackend`; the honest cheap signal
+remains the headless probe (`scripts/phase2-chrome-probe.sh`), which drives the real binary.
 
