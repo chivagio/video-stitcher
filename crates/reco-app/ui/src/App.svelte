@@ -152,10 +152,13 @@
       // Left/Right belong to the timeline (frame stepping) whenever it has
       // focus, and a bare arrow reaching here too would seek and pan at once.
       e.preventDefault();
-      void pose.nudgeYawStep(-1);
+      // Signs mirror the CLI's arrow mapping (crates/reco-cli/src/preview.rs),
+      // which is the authority: +yaw looks LEFT, so Left takes the positive
+      // delta. Verified against view_matrix, not assumed from the doc comments.
+      void pose.nudgeYawStep(1);
     } else if (e.shiftKey && e.key === "ArrowRight") {
       e.preventDefault();
-      void pose.nudgeYawStep(1);
+      void pose.nudgeYawStep(-1);
     } else if (e.shiftKey && e.key === "ArrowUp") {
       e.preventDefault();
       void pose.nudgePitchStep(1);

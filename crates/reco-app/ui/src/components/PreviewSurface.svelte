@@ -22,6 +22,12 @@
   } = $props();
 
   const isNative = $derived(presenterKind === "native");
+  // UI-SPEC "Pose input mapping (panorama mode only)": pan and zoom are gated on
+  // the VIEW, not the presenter. Gating on presenter kind instead would leave
+  // pan dead in the readback arm - where the panorama is just as much under the
+  // cursor - and would mutate the pose in source view, which `render_source`
+  // ignores, so the pan would be silently invisible.
+  const poseActive = $derived(viewMode === "panorama");
   const isSeparateWindow = $derived(presenterKind === "separate_window");
   const isReadback = $derived(presenterKind === "readback");
 
@@ -54,9 +60,7 @@
   }
 
   function handlePointerDown(e: PointerEvent): void {
-    // Only the native presenter pans: it is the mode where the panorama is live
-    // under the cursor. Matches the wheel handler's gate.
-    if (!isNative || e.button !== 0) return;
+    if (!poseActive || e.button !== 0) return;
     panning = true;
     lastX = e.clientX;
     lastY = e.clientY;
@@ -125,6 +129,7 @@
   class:native={isNative}
   class:separate-window={isSeparateWindow}
   class:readback={isReadback}
+  class:pose-active={poseActive}
   role="img"
   aria-label={viewMode === "source" ? "Source" : "Panorama"}
   class:panning
@@ -134,7 +139,7 @@
   onpointerup={endPan}
   onpointercancel={endPan}
   onwheel={(e) => {
-    if (isNative) {
+    if (poseActive) {
       e.preventDefault();
       const delta = e.deltaY > 0 ? -1 : 1;
       void pose.nudgeFov(delta);
@@ -206,13 +211,14 @@
   }
 
   /* A drag pans, so the region must not also scroll/zoom the page, and the
-     cursor should say so. */
-  .preview-surface.native {
+     cursor should say so. Keyed on the panorama view rather than `.native`,
+     matching the `poseActive` gate the handlers use. */
+  .preview-surface.pose-active {
     touch-action: none;
     cursor: grab;
   }
 
-  .preview-surface.native.panning {
+  .preview-surface.pose-active.panning {
     cursor: grabbing;
   }
 

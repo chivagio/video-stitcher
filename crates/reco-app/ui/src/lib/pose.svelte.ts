@@ -134,20 +134,24 @@ class PoseStore {
   /**
    * Arrow-key nudge: yaw by one step.
    *
-   * `direction` is -1 for left, +1 for right. The default keeps the previous
-   * "always positive step" behaviour for any caller that does not care.
+   * `dir` is the sign of the yaw DELTA, not the screen direction. `PoseControl`
+   * treats +yaw as looking LEFT (verified against `view_matrix`, and matching
+   * the CLI's arrow mapping), so Left passes +1 and Right passes -1. The
+   * default keeps the previous always-positive behaviour for callers that do
+   * not care.
    */
-  async nudgeYawStep(direction: 1 | -1 = 1): Promise<void> {
-    await this.nudgeYaw(direction * NUDGE_STEP_RAD);
+  async nudgeYawStep(dir: 1 | -1 = 1): Promise<void> {
+    await this.nudgeYaw(dir * NUDGE_STEP_RAD);
   }
 
   /**
    * Arrow-key nudge: pitch by one step.
    *
-   * `direction` is -1 for down (look down), +1 for up (look up).
+   * `dir` is the sign of the pitch DELTA. +pitch looks UP, so Up passes +1 and
+   * Down passes -1.
    */
-  async nudgePitchStep(direction: 1 | -1 = 1): Promise<void> {
-    await this.nudgePitch(direction * NUDGE_STEP_RAD);
+  async nudgePitchStep(dir: 1 | -1 = 1): Promise<void> {
+    await this.nudgePitch(dir * NUDGE_STEP_RAD);
   }
 
   /** The current FOV value for the slider, or 75 (default) when unknown. */
