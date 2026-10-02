@@ -204,6 +204,59 @@ pub fn recovery_action(kind: crate::presenter::SurfaceErrorKind) -> RecoveryActi
     }
 }
 
+/// Format the one log line that ties a requested native viewport to the
+/// geometry the OS window actually has.
+///
+/// `ViewportRect::for_chrome` is the geometry authority (UI-SPEC "Geometry
+/// authority"), so `requested` is what the native window **must** be.
+/// `observed` is the server-side size read back from the platform (see
+/// `SurfacePresenter::child_geometry`) — `None` when the presenter has no
+/// window of its own, or the window has been released.
+///
+/// Reporting both numbers in one line is what makes a stale window visible.
+/// Before this line existed, a surface could be configured correctly while the
+/// X window kept its old size, and every Rust test stayed green because the
+/// render path only ever knew what it had *asked* for — the panorama painted
+/// over the expanded controls panel and the only symptom was on screen.
+///
+/// Pure and free so the agree / disagree / unavailable shapes are unit-testable
+/// with no GPU and no X server.
+pub fn native_geometry_line(
+    requested: crate::presenter::ViewportRect,
+    observed: Option<(u32, u32)>,
+    chrome: crate::presenter::ChromeState,
+) -> String {
+    let chrome_label = format!(
+        "panel {}, drawer {}",
+        if chrome.panel_expanded {
+            "expanded"
+        } else {
+            "collapsed"
+        },
+        if chrome.drawer_expanded {
+            "expanded"
+        } else {
+            "collapsed"
+        }
+    );
+    let requested_label = format!("{}x{}", requested.width, requested.height);
+    match observed {
+        None => format!(
+            "native viewport: requested {requested_label}, child window geometry unavailable \
+             ({chrome_label})"
+        ),
+        Some((width, height)) if width == requested.width && height == requested.height => {
+            format!(
+                "native viewport: requested {requested_label}, child window {width}x{height} ({chrome_label})"
+            )
+        }
+        Some((width, height)) => format!(
+            "native viewport: requested {requested_label}, child window {width}x{height} — \
+             mismatch with the requested rect ({chrome_label})"
+        ),
+    }
+}
+
 /// The engine side of the worker, behind a trait so the protocol is testable
 /// without a GPU.
 ///
@@ -1009,10 +1062,22 @@ impl GpuEngineBackend {
                 }
             });
         match result {
-            Ok(()) => events.info(format!(
-                "viewport reconfigured to {}x{}",
-                rect.width, rect.height
-            )),
+            Ok(()) => {
+                // Byte-identical to the line 02-08's probe asserts. Do not
+                // reword it; add the geometry line below instead.
+                events.info(format!(
+                    "viewport reconfigured to {}x{}",
+                    rect.width, rect.height
+                ));
+                // Read the window's server-side geometry back so a stale X
+                // window is visible in the log rather than invisible on screen.
+                let line = native_geometry_line(rect, self.presenter.child_geometry(), self.chrome);
+                if line.contains("mismatch") {
+                    events.log(Level::Warn, line);
+                } else {
+                    events.info(line);
+                }
+            }
             Err(e) => events.failed(WorkerError::Engine(e.to_string())),
         }
     }
@@ -2388,6 +2453,57 @@ mod tests {
         assert_eq!(recovery_action(K::Timeout), RecoveryAction::SkipFrame);
         assert_eq!(recovery_action(K::OutOfMemory), RecoveryAction::SkipFrame);
         assert_eq!(recovery_action(K::Other), RecoveryAction::SkipFrame);
+    }
+
+    #[test]
+    fn native_geometry_line_reports_agreement_with_both_sizes() {
+        // The agree case: one line naming the requested rect, the observed child
+        // window size, and the chrome state that produced them.
+        let rect = crate::presenter::ViewportRect::for_chrome(
+            1280,
+            800,
+            &crate::presenter::ChromeState {
+                panel_expanded: true,
+                drawer_expanded: false,
+            },
+        );
+        let line = native_geometry_line(rect, Some((1000, 728)), rect_chrome_expanded());
+        assert!(line.contains("requested 1000x728"), "{line}");
+        assert!(line.contains("child window 1000x728"), "{line}");
+        assert!(line.contains("panel expanded"), "{line}");
+        assert!(line.contains("drawer collapsed"), "{line}");
+        assert!(!line.contains("mismatch"), "{line}");
+    }
+
+    /// The chrome state that produces a 1000x728 rect at 1280x800.
+    fn rect_chrome_expanded() -> crate::presenter::ChromeState {
+        crate::presenter::ChromeState {
+            panel_expanded: true,
+            drawer_expanded: false,
+        }
+    }
+
+    #[test]
+    fn native_geometry_line_names_the_mismatch_instead_of_hiding_it() {
+        // A window that kept its old size must be visible in the log, because
+        // this is exactly the UAT gap: the surface was reconfigured correctly
+        // and the OS window was not, and nothing inside Rust could tell.
+        let rect = crate::presenter::ViewportRect::for_chrome(1280, 800, &rect_chrome_expanded());
+        let line = native_geometry_line(rect, Some((1240, 728)), rect_chrome_expanded());
+        assert!(line.contains("requested 1000x728"), "{line}");
+        assert!(line.contains("child window 1240x728"), "{line}");
+        assert!(line.contains("mismatch"), "{line}");
+    }
+
+    #[test]
+    fn native_geometry_line_says_unavailable_rather_than_reporting_success() {
+        // A presenter with no window of its own (readback/fallback) must not
+        // read as though the request was achieved.
+        let rect = crate::presenter::ViewportRect::for_chrome(1280, 800, &Default::default());
+        let line = native_geometry_line(rect, None, Default::default());
+        assert!(line.contains("requested 1240x728"), "{line}");
+        assert!(line.contains("unavailable"), "{line}");
+        assert!(!line.contains("mismatch"), "{line}");
     }
 
     #[test]

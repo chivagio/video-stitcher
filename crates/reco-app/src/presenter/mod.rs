@@ -646,6 +646,23 @@ pub trait SurfacePresenter {
     #[cfg_attr(not(test), allow(dead_code))]
     fn viewport(&self) -> ViewportRect;
 
+    /// The OS window's **server-side** size after the last
+    /// [`resize`](Self::resize), read back from the platform rather than
+    /// echoed from the request.
+    ///
+    /// `ViewportRect::for_chrome` is the geometry authority (UI-SPEC), so the
+    /// requested rect is what the window *must* get. This answers the separate
+    /// question of whether it *did* — a presenter that returns `Some((w, h))`
+    /// different from what it was asked for has a stale window, and the worker
+    /// logs that as a WARN instead of leaving it invisible on screen.
+    ///
+    /// `None` for a presenter with no window of its own inside the main window
+    /// (readback, fallback) or whose window has been released. Additive default
+    /// so no other impl changes.
+    fn child_geometry(&self) -> Option<(u32, u32)> {
+        None
+    }
+
     /// Release the platform child window now, while its parent is still alive
     /// (FOUND-06).
     ///
@@ -733,6 +750,33 @@ mod tests {
         assert_eq!(rect.y, 0);
         assert_eq!(rect.width, 1280 - 40);
         assert_eq!(rect.height, 800 - 72);
+    }
+
+    #[test]
+    fn for_chrome_geometry_is_locked_for_the_two_panel_states() {
+        // Regression lock for the UAT gap where the controls panel expanded but
+        // the panorama still painted over x=1000..1240: these two numbers are
+        // the rect Rust computes, and therefore the size the X11 child window
+        // must end up with. The 02-08 probe asserts the same pair from the
+        // worker log, so a change here breaks that probe too.
+        let collapsed = ViewportRect::for_chrome(1280, 800, &ChromeState::default());
+        assert_eq!(
+            (collapsed.x, collapsed.y, collapsed.width, collapsed.height),
+            (0, 0, 1240, 728)
+        );
+
+        let expanded = ViewportRect::for_chrome(
+            1280,
+            800,
+            &ChromeState {
+                panel_expanded: true,
+                drawer_expanded: false,
+            },
+        );
+        assert_eq!(
+            (expanded.x, expanded.y, expanded.width, expanded.height),
+            (0, 0, 1000, 728)
+        );
     }
 
     #[test]

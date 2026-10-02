@@ -322,6 +322,61 @@ impl X11Presenter {
             (xlib.XFlush)(display);
         }
     }
+
+    /// Read the **server-side** size of the child window.
+    ///
+    /// Static helper so the trait method ([`SurfacePresenter::child_geometry`])
+    /// and any construction-time caller share one implementation. Returns
+    /// `None` when there is no child window (released, or never created).
+    ///
+    /// This exists because a *correct* wgpu surface configuration and a
+    /// *stale* X window look identical from inside Rust: the render path only
+    /// knows what it asked for. Reading the geometry back makes a window that
+    /// did not take the request visible in the worker's log instead of invisible
+    /// on screen (the UAT gap where the panorama painted over the expanded
+    /// controls panel while every Rust test stayed green).
+    ///
+    /// A destroyed window does not abort: [`install_benign_x_error_handler`]
+    /// logs the protocol error and returns, and the call's `Status` return is
+    /// `0` in that case, which maps to `None` here.
+    ///
+    /// SAFETY contract of the caller: `display` must be the live connection
+    /// that owns `child_window`.
+    fn child_geometry(
+        xlib: &xlib::Xlib,
+        display: *mut xlib::Display,
+        child_window: Option<std::num::NonZeroU64>,
+    ) -> Option<(u32, u32)> {
+        let child = child_window?;
+        let mut root = 0 as std::os::raw::c_ulong;
+        let mut x = 0 as std::os::raw::c_int;
+        let mut y = 0 as std::os::raw::c_int;
+        let mut width = 0 as std::os::raw::c_uint;
+        let mut height = 0 as std::os::raw::c_uint;
+        let mut border_width = 0 as std::os::raw::c_uint;
+        let mut depth = 0 as std::os::raw::c_uint;
+        // SAFETY: `display` is the live connection GTK and this presenter share,
+        // `child` is a valid window id on it, and every out-parameter is a live
+        // local of the exact type the C signature requires. The call only
+        // writes through those pointers.
+        let status = unsafe {
+            (xlib.XGetGeometry)(
+                display,
+                child.get(),
+                &mut root,
+                &mut x,
+                &mut y,
+                &mut width,
+                &mut height,
+                &mut border_width,
+                &mut depth,
+            )
+        };
+        if status == 0 {
+            return None;
+        }
+        Some((width as u32, height as u32))
+    }
 }
 
 impl X11Presenter {
@@ -612,17 +667,31 @@ impl SurfacePresenter for X11Presenter {
         let Some(child) = self.child_window else {
             return Ok(());
         };
+        // One server request sets origin AND extent, so there is no window in
+        // which the position and the size disagree — and both `x` and `y` are
+        // honoured, because `ViewportRect` is the geometry authority (UI-SPEC
+        // "Geometry authority"), not an assumed top-left anchor.
+        //
+        // `XSync` (not `XFlush`) is what makes a follow-up readback meaningful:
+        // `XFlush` only pushes the request bytes into the socket buffer and
+        // returns, so any later observation — including another client's
+        // `xwininfo` — can still see the OLD geometry. `XSync` round-trips, so
+        // `child_geometry` below observes what the server actually applied.
+        //
         // SAFETY: `display` and `child` are valid for this presenter's lifetime
-        // (the window is released only in `release_child_window`/`Drop`);
-        // XResizeWindow is safe to call with them.
+        // (the window is released only in `release_child_window`/`Drop`), and
+        // only the worker thread touches this connection. The extents are
+        // saturated to at least 1x1, so X11 never receives a zero size.
         unsafe {
-            (self.xlib.XResizeWindow)(
+            (self.xlib.XMoveResizeWindow)(
                 self.display,
                 child.get(),
+                rect.x as std::os::raw::c_int,
+                rect.y as std::os::raw::c_int,
                 rect.width.max(1),
                 rect.height.max(1),
             );
-            (self.xlib.XFlush)(self.display);
+            (self.xlib.XSync)(self.display, 0);
         }
         self.viewport = rect;
         Ok(())
@@ -630,6 +699,10 @@ impl SurfacePresenter for X11Presenter {
 
     fn viewport(&self) -> ViewportRect {
         self.viewport
+    }
+
+    fn child_geometry(&self) -> Option<(u32, u32)> {
+        X11Presenter::child_geometry(&self.xlib, self.display, self.child_window)
     }
 
     fn configured_format(&self) -> Option<reco_core::wgpu::TextureFormat> {
