@@ -257,6 +257,34 @@ pub fn native_geometry_line(
     }
 }
 
+/// Build the transport a preview session starts on, carrying user-set state
+/// across the session boundary.
+///
+/// **Both** backends build their session transport here — the GPU-touching
+/// [`GpuEngineBackend::begin_preview`] and the GPU-free `MockBackend` the
+/// worker-loop tests drive. That is deliberate: the previous shape gave each
+/// backend its own construction, so a test that proved the mock carried the
+/// Loop flag said nothing about the real backend, and deleting the real
+/// backend's carry left every gate green. One shared constructor makes the mock
+/// incapable of drifting from the real behaviour, and makes the mutation
+/// proof (`new_session_transport` dropping its `carry_user_state` call) fail
+/// the mock-driven tests.
+///
+/// `session` is preferred over `loaded`, matching the precedence
+/// [`EngineBackend::transport`] uses, so a `SetLoop` command sees the same
+/// choice here as it did when it stored the flag.
+pub fn new_session_transport(
+    fps: f64,
+    fps_rational: Option<(i32, i32)>,
+    total_frames: Option<u64>,
+    session: Option<&crate::transport::Transport>,
+    loaded: Option<&crate::transport::Transport>,
+) -> crate::transport::Transport {
+    let mut transport = crate::transport::Transport::new(fps, fps_rational, total_frames);
+    crate::transport::carry_user_state(session.or(loaded), &mut transport);
+    transport
+}
+
 /// The engine side of the worker, behind a trait so the protocol is testable
 /// without a GPU.
 ///
@@ -1280,7 +1308,20 @@ impl EngineBackend for GpuEngineBackend {
             let info = source.info();
             (info.fps, info.fps_rational, source.total_frames())
         };
-        let transport = crate::transport::Transport::new(fps, fps_rational, total_frames);
+        // Carry the user's Loop setting across the session boundary BEFORE anything
+        // observes the new transport. `transport()` prefers the live session and
+        // falls back to `loaded`, so this matches the precedence a `SetLoop`
+        // command saw; without it a user who ticked Loop before pressing Play
+        // watched the clip stop at its end instead of wrapping. The shared
+        // constructor is what keeps the mock and the real backend from drifting
+        // apart here — see `new_session_transport`.
+        let transport = new_session_transport(
+            fps,
+            fps_rational,
+            total_frames,
+            self.session.as_ref(),
+            self.loaded.as_ref(),
+        );
         events.position(
             transport.frame(),
             transport.total_frames(),
@@ -1540,6 +1581,13 @@ impl EngineBackend for GpuEngineBackend {
     }
 
     fn end_preview(&mut self, _events: &EventSink) {
+        // Mirror user-set state back into the import-built transport before the
+        // session is dropped, so a flag set DURING a session survives that
+        // session ending for any reason — not just the clip running out (a
+        // failed tick ends the session too).
+        if let (Some(loaded), Some(session)) = (self.loaded.as_mut(), self.session.as_ref()) {
+            crate::transport::carry_user_state(Some(session), loaded);
+        }
         self.session = None;
     }
 
@@ -1949,7 +1997,17 @@ mod tests {
 
         fn begin_preview(&mut self, events: &EventSink) -> Result<(), WorkerError> {
             self.record("begin_preview");
-            let t = crate::transport::Transport::new(30.0, Some((30, 1)), self.total_frames);
+            // Mirror the real backend exactly: the session transport is built
+            // through the shared `new_session_transport`, so user-set state
+            // survives the session boundary here too and the mock cannot hide
+            // the same defect from these tests.
+            let t = new_session_transport(
+                30.0,
+                Some((30, 1)),
+                self.total_frames,
+                self.session.as_ref(),
+                self.loaded.as_ref(),
+            );
             events.position(t.frame(), t.total_frames(), t.fps_rational());
             events.transport(t.state(), t.loop_enabled());
             self.session = Some(t);
@@ -2010,6 +2068,11 @@ mod tests {
 
         fn end_preview(&mut self, _events: &EventSink) {
             self.record("end_preview");
+            // Mirror the real backend's mirror-back, so a flag set during a
+            // session is still there for the next one.
+            if let (Some(loaded), Some(session)) = (self.loaded.as_mut(), self.session.as_ref()) {
+                crate::transport::carry_user_state(Some(session), loaded);
+            }
             self.session = None;
         }
 
@@ -2018,8 +2081,18 @@ mod tests {
         }
 
         fn transport(&mut self) -> &mut crate::transport::Transport {
+            // Mirror the real backend's precedence exactly: prefer the live
+            // session, fall back to the import-built transport. Without this the
+            // mock materialized a placeholder session, so a `SetLoop` issued
+            // before Play landed somewhere the real backend never uses and the
+            // session-boundary carry was never exercised.
+            if self.session.is_none() && self.loaded.is_none() {
+                self.session = Some(crate::transport::Transport::new(30.0, None, None));
+            }
             self.session
-                .get_or_insert_with(|| crate::transport::Transport::new(30.0, None, None))
+                .as_mut()
+                .or(self.loaded.as_mut())
+                .expect("a session or an import-built transport is present")
         }
 
         fn loaded_transport(&self) -> Option<&crate::transport::Transport> {
@@ -2504,6 +2577,118 @@ mod tests {
         assert!(line.contains("requested 1240x728"), "{line}");
         assert!(line.contains("unavailable"), "{line}");
         assert!(!line.contains("mismatch"), "{line}");
+    }
+
+    #[test]
+    fn new_session_transport_carries_from_the_session_then_the_loaded_transport() {
+        // The shared constructor both backends use, asserted directly so the
+        // precedence is pinned without a GPU: a live session wins over the
+        // import-built transport, exactly as `EngineBackend::transport()` does.
+        let mut loaded = crate::transport::Transport::new(30.0, Some((30, 1)), Some(5));
+        crate::transport::carry_user_state(None, &mut loaded);
+        loaded.set_loop(true);
+
+        let mut session = crate::transport::Transport::new(30.0, Some((30, 1)), Some(5));
+        session.set_loop(false);
+
+        // Session present: its flag wins, so a user who turned Loop OFF during
+        // a session is not overruled by the older import-time value.
+        let t = new_session_transport(30.0, Some((30, 1)), Some(5), Some(&session), Some(&loaded));
+        assert!(!t.loop_enabled());
+        // No session: fall back to the import-built transport.
+        let t = new_session_transport(30.0, Some((30, 1)), Some(5), None, Some(&loaded));
+        assert!(t.loop_enabled());
+        // Neither: a first-ever session keeps the constructor's defaults.
+        let t = new_session_transport(30.0, Some((30, 1)), Some(5), None, None);
+        assert!(!t.loop_enabled());
+        assert_eq!(t.state(), crate::transport::TransportState::Paused);
+        assert_eq!(t.frame(), 0);
+    }
+
+    #[test]
+    fn loop_enabled_before_play_is_carried_into_the_session_play_creates() {
+        // UAT gap 3, through the real command path: Import → SetLoop(true) →
+        // Preview. `SetLoop` with no session active lands on the import-built
+        // transport, and `Preview` then builds a brand-new one — which used to
+        // default `loop_enabled` to false and silently drop the setting. The
+        // worker must therefore project `loop_enabled: true` for the session it
+        // just created, or the UI shows Loop off while the user left it on.
+        let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (evt_tx, evt_rx) = std::sync::mpsc::channel();
+        let events = EventSink { tx: evt_tx };
+        let interrupted = AtomicBool::new(false);
+        let mut mock = MockBackend::new(Arc::clone(&ops));
+
+        for cmd in [
+            WorkerCommand::Import,
+            WorkerCommand::SetLoop(true),
+            WorkerCommand::Preview,
+        ] {
+            assert!(handle_command(cmd, &mut mock, &events, &interrupted));
+        }
+
+        // The session Play created must itself carry the flag...
+        assert!(mock.session.as_ref().expect("session").loop_enabled());
+        // ...and the worker must have told the UI about it AFTER `Preview`, so
+        // the frontend mirrors the loop state the new session actually has.
+        let projected: Vec<_> = evt_rx
+            .try_iter()
+            .filter_map(|e| match e {
+                WorkerEvent::Transport { loop_enabled, .. } => Some(loop_enabled),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            projected.last().copied(),
+            Some(true),
+            "no post-Preview Transport projection with loop on: {projected:?}"
+        );
+    }
+
+    #[test]
+    fn loop_enabled_during_a_session_survives_that_session_ending() {
+        // The failure paths drop a session too (a failed tick calls
+        // `end_preview`), so a flag set DURING a session has to be mirrored
+        // back into the import-built transport or it is lost for the next Play.
+        let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (evt_tx, _evt_rx) = std::sync::mpsc::channel();
+        let events = EventSink { tx: evt_tx };
+        let interrupted = AtomicBool::new(false);
+        let mut mock = MockBackend::new(Arc::clone(&ops));
+
+        assert!(handle_command(
+            WorkerCommand::Import,
+            &mut mock,
+            &events,
+            &interrupted
+        ));
+        assert!(handle_command(
+            WorkerCommand::Preview,
+            &mut mock,
+            &events,
+            &interrupted
+        ));
+        assert!(handle_command(
+            WorkerCommand::SetLoop(true),
+            &mut mock,
+            &events,
+            &interrupted
+        ));
+
+        // The session ends for a reason other than the clip running out.
+        mock.end_preview(&events);
+        assert!(!mock.session_active());
+
+        assert!(handle_command(
+            WorkerCommand::Preview,
+            &mut mock,
+            &events,
+            &interrupted
+        ));
+        assert!(
+            mock.session.as_ref().expect("session").loop_enabled(),
+            "loop set during a session must survive the session ending"
+        );
     }
 
     #[test]

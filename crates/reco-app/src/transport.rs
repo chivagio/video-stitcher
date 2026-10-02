@@ -232,6 +232,32 @@ impl Transport {
     }
 }
 
+/// Copy the state a USER set from `previous` into a freshly built `next`.
+///
+/// This is the single named seam for state that must **survive a session
+/// boundary**. It exists because `Transport::new` is a constructor, not an
+/// inheriting one: it hard-codes `loop_enabled: false`, so a session that was
+/// started after the user ticked Loop silently discarded the setting — the flag
+/// was stored correctly (on the import-built transport) and then thrown away at
+/// `begin_preview`, with no error anywhere (the UAT gap where the clip stopped
+/// at its end instead of wrapping).
+///
+/// Today this carries exactly `loop_enabled`, which is the only field a user
+/// sets directly. It deliberately does **not** copy `state`, `frame` or
+/// `pending_seek`: a new session starts paused at frame 0, which is the
+/// existing documented contract, and carrying the playhead would silently
+/// rewind or jump the user.
+///
+/// **If you add a new user-settable field to `Transport`, add it here.** That
+/// sentence is the actual fix for the class of bug: a field set in one place
+/// and defaulted in the constructor is invisible until someone is looking for it.
+pub fn carry_user_state(previous: Option<&Transport>, next: &mut Transport) {
+    let Some(previous) = previous else {
+        return;
+    };
+    next.loop_enabled = previous.loop_enabled;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -371,5 +397,40 @@ mod tests {
     fn frame_duration_is_zero_for_degenerate_rate() {
         let t = Transport::new(0.0, None, None);
         assert_eq!(t.frame_duration(), Duration::ZERO);
+    }
+
+    #[test]
+    fn carry_user_state_moves_loop_onto_a_fresh_transport() {
+        // The UAT gap: `Transport::new` hard-codes `loop_enabled: false`, so a
+        // user who ticked Loop before pressing Play had the flag stored
+        // correctly and then silently discarded when the session was built.
+        let mut previous = transport();
+        previous.set_loop(true);
+        previous.play();
+        previous.step(1);
+
+        let mut next = Transport::new(30.0, Some((30, 1)), Some(300));
+        assert!(!next.loop_enabled());
+
+        carry_user_state(Some(&previous), &mut next);
+        assert!(next.loop_enabled());
+        // Everything else is a NEW session's business: it starts paused at
+        // frame 0 with no pending seek. That is the documented contract, and
+        // copying position across would silently rewind the user's playhead.
+        assert_eq!(next.state(), TransportState::Paused);
+        assert_eq!(next.frame(), 0);
+        assert_eq!(next.take_pending_seek(), None);
+    }
+
+    #[test]
+    fn carry_user_state_without_a_previous_transport_keeps_the_new_defaults() {
+        // First ever session (no import yet, or the mock's idle placeholder):
+        // nothing to carry, so the fresh defaults must survive untouched.
+        let mut next = Transport::new(25.0, Some((25, 1)), Some(100));
+        carry_user_state(None, &mut next);
+        assert!(!next.loop_enabled());
+        assert_eq!(next.state(), TransportState::Paused);
+        assert_eq!(next.frame(), 0);
+        assert_eq!(next.total_frames(), Some(100));
     }
 }
