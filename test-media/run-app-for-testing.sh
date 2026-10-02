@@ -99,7 +99,9 @@ What you should see (Phase 2):
 
 Drive it in this order:
   1. DO NOT look for an Import button - there isn't one. The app imports the
-     hardcoded clips at startup. The log drawer should show, in order:
+     hardcoded clips at startup. Open the log drawer IN THE APP (the [Log]
+     button on the transport bar) - the terminal does NOT show position/pose
+     lines, only import/session/A1 ones. The drawer should show, in order:
          import started
          import finished
          transport: Paused, loop off
