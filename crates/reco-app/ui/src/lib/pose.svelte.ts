@@ -131,14 +131,23 @@ class PoseStore {
     });
   }
 
-  /** Arrow-key nudge: yaw. */
-  async nudgeYawStep(): Promise<void> {
-    await this.nudgeYaw(NUDGE_STEP_RAD);
+  /**
+   * Arrow-key nudge: yaw by one step.
+   *
+   * `direction` is -1 for left, +1 for right. The default keeps the previous
+   * "always positive step" behaviour for any caller that does not care.
+   */
+  async nudgeYawStep(direction: 1 | -1 = 1): Promise<void> {
+    await this.nudgeYaw(direction * NUDGE_STEP_RAD);
   }
 
-  /** Arrow-key nudge: pitch. */
-  async nudgePitchStep(): Promise<void> {
-    await this.nudgePitch(NUDGE_STEP_RAD);
+  /**
+   * Arrow-key nudge: pitch by one step.
+   *
+   * `direction` is -1 for down (look down), +1 for up (look up).
+   */
+  async nudgePitchStep(direction: 1 | -1 = 1): Promise<void> {
+    await this.nudgePitch(direction * NUDGE_STEP_RAD);
   }
 
   /** The current FOV value for the slider, or 75 (default) when unknown. */

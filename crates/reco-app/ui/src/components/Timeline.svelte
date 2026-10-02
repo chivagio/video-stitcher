@@ -32,6 +32,9 @@
   }
 
   function handleKeyDown(e: KeyboardEvent): void {
+    // Shift+Arrow is the pose nudge (App.svelte routes it to pose), so the
+    // scrubber must not also seek a frame on the same keypress.
+    if (e.shiftKey) return;
     if (e.key === "ArrowLeft") {
       e.preventDefault();
       onSeek(Math.max(0, frame - 1));

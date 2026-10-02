@@ -147,6 +147,21 @@
     } else if (e.key === "v" || e.key === "V") {
       e.preventDefault();
       handleViewToggle();
+    } else if (e.shiftKey && e.key === "ArrowLeft") {
+      // CONTEXT D-03 "arrow-key nudge". Shift is required because bare
+      // Left/Right belong to the timeline (frame stepping) whenever it has
+      // focus, and a bare arrow reaching here too would seek and pan at once.
+      e.preventDefault();
+      void pose.nudgeYawStep(-1);
+    } else if (e.shiftKey && e.key === "ArrowRight") {
+      e.preventDefault();
+      void pose.nudgeYawStep(1);
+    } else if (e.shiftKey && e.key === "ArrowUp") {
+      e.preventDefault();
+      void pose.nudgePitchStep(1);
+    } else if (e.shiftKey && e.key === "ArrowDown") {
+      e.preventDefault();
+      void pose.nudgePitchStep(-1);
     }
   }
 

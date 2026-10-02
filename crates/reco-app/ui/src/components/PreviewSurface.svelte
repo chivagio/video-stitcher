@@ -26,6 +26,64 @@
   const isReadback = $derived(presenterKind === "readback");
 
   let canvasEl = $state<HTMLCanvasElement | null>(null);
+  let surfaceEl = $state<HTMLDivElement | null>(null);
+
+  // --- Drag to pan (CONTEXT D-03: "mouse drag = pan (yaw/pitch)") -------------
+  //
+  // The px -> rad conversion is zoom-relative: dragging the full width of the
+  // preview sweeps one horizontal FOV, so panning feels the same at 40 deg and
+  // at 150 deg. The pose store stays protocol-typed (radians) and does no
+  // layout math — the viewport width is only known here.
+  //
+  // Signs are grab-the-world (direct manipulation), and they DIFFER:
+  //   drag right -> reveal content to the left  -> camera turns left  -> yaw down
+  //   drag down  -> reveal content above        -> camera pitches up  -> pitch up
+  // They are named constants so the convention is one obvious place to flip.
+  const YAW_DRAG_SIGN = -1;
+  const PITCH_DRAG_SIGN = 1;
+
+  let panning = $state(false);
+  let lastX = 0;
+  let lastY = 0;
+
+  function radPerPixel(): number {
+    const width = surfaceEl?.clientWidth ?? 0;
+    if (width <= 0) return 0;
+    const fovRad = (pose.fovValue * Math.PI) / 180;
+    return fovRad / width;
+  }
+
+  function handlePointerDown(e: PointerEvent): void {
+    // Only the native presenter pans: it is the mode where the panorama is live
+    // under the cursor. Matches the wheel handler's gate.
+    if (!isNative || e.button !== 0) return;
+    panning = true;
+    lastX = e.clientX;
+    lastY = e.clientY;
+    // Keep receiving moves if the cursor leaves the region mid-drag.
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+  }
+
+  function handlePointerMove(e: PointerEvent): void {
+    if (!panning) return;
+    const k = radPerPixel();
+    if (k === 0) return;
+    const dx = e.clientX - lastX;
+    const dy = e.clientY - lastY;
+    lastX = e.clientX;
+    lastY = e.clientY;
+    // Deltas are additive on the worker, so one intent per axis per move is
+    // correct; the pose eases toward the accumulated target each tick.
+    void pose.nudgeYaw(YAW_DRAG_SIGN * dx * k);
+    void pose.nudgePitch(PITCH_DRAG_SIGN * dy * k);
+  }
+
+  function endPan(e: PointerEvent): void {
+    if (!panning) return;
+    panning = false;
+    const el = e.currentTarget as HTMLElement;
+    if (el.hasPointerCapture(e.pointerId)) el.releasePointerCapture(e.pointerId);
+  }
 
   function paintFrame(buffer: ArrayBuffer): void {
     if (!canvasEl) return;
@@ -69,6 +127,12 @@
   class:readback={isReadback}
   role="img"
   aria-label={viewMode === "source" ? "Source" : "Panorama"}
+  class:panning
+  bind:this={surfaceEl}
+  onpointerdown={handlePointerDown}
+  onpointermove={handlePointerMove}
+  onpointerup={endPan}
+  onpointercancel={endPan}
   onwheel={(e) => {
     if (isNative) {
       e.preventDefault();
@@ -139,6 +203,17 @@
     flex-direction: column;
     align-items: center;
     justify-content: center;
+  }
+
+  /* A drag pans, so the region must not also scroll/zoom the page, and the
+     cursor should say so. */
+  .preview-surface.native {
+    touch-action: none;
+    cursor: grab;
+  }
+
+  .preview-surface.native.panning {
+    cursor: grabbing;
   }
 
   .preview-surface.readback {

@@ -229,6 +229,14 @@ pub trait EngineBackend: Send {
     /// Must be a no-op when [`session_active`](Self::session_active) is false.
     fn tick_session(&mut self, events: &EventSink) -> Result<(), WorkerError>;
 
+    /// Publish the transport's authoritative position to the frontend.
+    ///
+    /// A no-op when no transport is loaded. Used to re-assert the worker's
+    /// position at command and error boundaries, where the frontend may be
+    /// showing an optimistic value (a drag, or a rejected seek) that the engine
+    /// has not reached.
+    fn publish_position(&mut self, events: &EventSink);
+
     /// End the active session and return to idle.
     fn end_preview(&mut self, events: &EventSink);
 
@@ -507,6 +515,14 @@ fn worker_loop<B: EngineBackend>(
         // Pause/Seek/Intent land between frames).
         if backend.session_active() {
             if let Err(e) = backend.tick_session(&events) {
+                // A failed tick (a rejected seek is the realistic case) must not
+                // leave the UI showing a playhead the engine never reached: the
+                // frontend mirrors the worker and never owns the position
+                // (UI-SPEC Interaction rule 1), and E3/error requires the
+                // playhead to revert to the last worker position. Publish it
+                // before the session is dropped, while the transport still holds
+                // the real frame.
+                backend.publish_position(&events);
                 events.failed(e);
                 // A failed tick must not leave the loop spinning on a session
                 // that cannot advance: end it and return to the idle path.
@@ -1490,6 +1506,19 @@ impl EngineBackend for GpuEngineBackend {
         self.loaded.as_ref()
     }
 
+    fn publish_position(&mut self, events: &EventSink) {
+        // Prefer the live session; fall back to the import-built transport so a
+        // position is still published after the session has been dropped.
+        let published = self
+            .session
+            .as_ref()
+            .or(self.loaded.as_ref())
+            .map(|t| (t.frame(), t.total_frames(), t.fps_rational()));
+        if let Some((frame, total, fps_rational)) = published {
+            events.position(frame, total, fps_rational);
+        }
+    }
+
     fn set_chrome(&mut self, chrome: crate::presenter::ChromeState, events: &EventSink) {
         self.chrome = chrome;
         self.reconfigure_viewport(events);
@@ -1774,6 +1803,11 @@ const _: fn() = || {
 
 #[cfg(test)]
 mod tests {
+
+    /// The frame a failing tick advances to before erroring. Distinct from 0 so
+    /// a re-publish on the failure path is distinguishable from the
+    /// session-start projection.
+    const FAILING_TICK_FRAME: u64 = 7;
     use super::*;
     use std::sync::mpsc::RecvTimeoutError;
 
@@ -1793,6 +1827,9 @@ mod tests {
         /// Records the FOV value the mock "pushed onto the pipeline" each tick.
         last_pushed_fov: Arc<std::sync::Mutex<Option<f32>>>,
         import_fails: bool,
+        /// Make `tick_session` fail, standing in for a rejected seek or a
+        /// decode error so the failure path can be exercised without a GPU.
+        tick_fails: bool,
         /// Mirrors the real backend's device-lost flag (FOUND-05).
         lost: Arc<AtomicBool>,
         /// The mock's active presenter (PREV-05).
@@ -1816,6 +1853,7 @@ mod tests {
                 total_frames: Some(5),
                 last_pushed_fov: Arc::new(std::sync::Mutex::new(None)),
                 import_fails: false,
+                tick_fails: false,
                 lost: Arc::new(AtomicBool::new(false)),
                 active_kind: crate::presenter::PresenterKind::Native,
                 view_mode: crate::presenter::ViewMode::Panorama,
@@ -1855,6 +1893,18 @@ mod tests {
 
         fn tick_session(&mut self, events: &EventSink) -> Result<(), WorkerError> {
             self.record("tick");
+            if self.tick_fails {
+                // Advance to a distinctive frame *before* failing. A re-publish on
+                // the failure path must then carry this frame; a re-publish that
+                // is missing (or fires before the advance) is distinguishable
+                // from begin_preview's frame 0.
+                if let Some(t) = self.session.as_mut() {
+                    for _ in 0..FAILING_TICK_FRAME {
+                        t.on_frame_advanced();
+                    }
+                }
+                return Err(WorkerError::Engine("synthetic tick failure".to_string()));
+            }
             // Record which render path the view mode selected (PREV-03): the
             // mock has no GPU, so it records the path the real backend's
             // `tick_session` would take. Done before the mutable session borrow
@@ -1909,6 +1959,14 @@ mod tests {
 
         fn loaded_transport(&self) -> Option<&crate::transport::Transport> {
             self.loaded.as_ref()
+        }
+
+        fn publish_position(&mut self, events: &EventSink) {
+            if let Some(t) = self.session.as_ref() {
+                events.position(t.frame(), t.total_frames(), t.fps_rational());
+            } else if let Some(t) = self.loaded.as_ref() {
+                events.position(t.frame(), t.total_frames(), t.fps_rational());
+            }
         }
 
         fn set_chrome(&mut self, _chrome: crate::presenter::ChromeState, _events: &EventSink) {
@@ -2106,6 +2164,68 @@ mod tests {
             state,
             crate::transport::TransportState::Paused,
             "import must not begin playback"
+        );
+    }
+
+    #[test]
+    fn failed_tick_republishes_the_authoritative_position_before_ending() {
+        // E3/error: "On a rejected seek the playhead reverts to the last worker
+        // position and an ERROR line is appended." The frontend mirrors the
+        // worker and never owns the position (UI-SPEC Interaction rule 1), so a
+        // failed tick that dropped the session WITHOUT re-publishing would leave
+        // the UI showing a playhead the engine never reached -- permanently, since
+        // a paused session emits no further ticks to correct it.
+        let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut mock = MockBackend::new(Arc::clone(&ops));
+        // A large total so the failing tick's advance is not clamped at the
+        // mock's default 5-frame clip.
+        mock.total_frames = Some(1_000_000);
+        mock.tick_fails = true;
+        let (worker, events) = EngineWorker::spawn(mock);
+        let handle = worker.handle();
+        handle.send(WorkerCommand::Preview).unwrap();
+
+        // The loop drains queued commands before ticking, so a Shutdown sent
+        // immediately would be drained in the same pass and the failing tick
+        // would never happen. Wait for the tick to have been attempted.
+        let start = std::time::Instant::now();
+        while start.elapsed() < Duration::from_secs(2) {
+            if ops.lock().unwrap().contains(&"tick") {
+                break;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        handle.send(WorkerCommand::Shutdown).unwrap();
+
+        let seen = drain_until_shutdown(&events);
+
+        let failed_idx = seen
+            .iter()
+            .position(|e| matches!(e, WorkerEvent::Failed(_)))
+            .expect("a failed tick emits a Failed event");
+        // The LAST position published before the failure must be the frame the
+        // transport actually reached. Without the re-publish it would still be
+        // begin_preview's frame 0, leaving the UI's playhead on a frame the
+        // engine never reached.
+        let last_position_before_failure = seen
+            .iter()
+            .take(failed_idx)
+            .filter_map(|e| match e {
+                WorkerEvent::Position { frame, .. } => Some(*frame),
+                _ => None,
+            })
+            .next_back();
+        assert_eq!(
+            last_position_before_failure,
+            Some(FAILING_TICK_FRAME),
+            "the worker must re-publish its authoritative position before reporting \
+             the failure, so the frontend playhead reverts"
+        );
+
+        // The session is dropped so the loop cannot spin on a dead session.
+        assert!(
+            ops.lock().unwrap().contains(&"end_preview"),
+            "a failed tick must end the session"
         );
     }
 
