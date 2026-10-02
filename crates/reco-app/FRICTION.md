@@ -192,3 +192,38 @@ test runner in `package.json`, and no automated signal exists for this class of 
 options worth taking later: a tiny test that asserts the four arrow signs against the CLI
 mapping, and a `reco-control` doc line on `ViewportPosition` stating that +yaw looks left.
 
+### A7. A `#[tauri::command]` with a snake_case argument silently never fires
+
+**Impact:** High (PREV-01 / PREV-02 chrome), and it was the real cause of the UAT gap
+recorded as "the native child window is never resized". Tauri resolves each command
+argument by **one** payload key — `InvokeBody::Json(v) => v.get(self.key)` in
+`tauri/src/ipc/command.rs` — and `#[tauri::command]` defaults that key to **camelCase**.
+`commands::set_chrome` took `panel_expanded` / `drawer_expanded`, so the generated key was
+`panelExpanded`, while `App.svelte` sent `{ panel_expanded, drawer_expanded }` to match the
+rest of the typed protocol (which is snake_case everywhere: `WorkerCommand::SetChrome`,
+`ViewMode`/`PresenterKind`'s `serde(rename_all = "snake_case")`, every other payload).
+
+Deserialization therefore failed with `command set_chrome missing required key
+panelExpanded` and the handler never ran. The frontend does `void invoke("set_chrome", …)`,
+which swallows the rejection, so there was **no error anywhere**: the controls panel visibly
+expanded in the webview while the panorama kept painting over it, `xwininfo` kept reporting
+the child as 1240x728, and every Rust unit test stayed green because none of them cross the
+IPC boundary. `set_view` was unaffected only because `mode` is a single word — the only other
+multi-word argument in the app (`preview_attach_readback`'s `on_frame`) happened to be called
+camelCase from JS, so the crate was inconsistent *and* broken at the same time.
+
+**Resolution (Phase 2, gap closure):** `commands::set_chrome` now carries
+`#[tauri::command(rename_all = "snake_case")]`, which pins the IPC key names to the crate's
+established snake_case protocol. Verified by driving the real app: the panel-toggle click now
+produces `viewport reconfigured to 1000x728` in the worker log and
+`xwininfo -id <child>` reports the child at 1000x728, where before the fix no `set_chrome`
+line appeared at all. `scripts/phase2-chrome-probe.sh` asserts that log line, so the seam is
+now covered end-to-end.
+
+**Residual gap:** nothing type-checks the JS payload keys against the Rust parameter names —
+`crates/reco-app/ui` has no test runner, and `svelte-check` cannot see it. The same class of
+breakage will reappear the next time a multi-word argument is added. The durable fix is one
+`rename_all = "snake_case"` at the app level (e.g. on the `Builder`) so the whole IPC surface
+is snake_case by construction and the crate stops carrying two spellings; the residual risk
+until then is only for newly added multi-word arguments.
+

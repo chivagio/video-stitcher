@@ -175,10 +175,25 @@ pub async fn set_loop(
 /// Thin: posts `SetChrome`; the worker recomputes the native viewport. Names no
 /// engine type.
 ///
+/// # Why `rename_all = "snake_case"`
+///
+/// Tauri resolves each command argument by a single payload key
+/// (`v.get(key)` in `tauri::ipc::command`), and `#[tauri::command]` defaults that
+/// key to **camelCase**. The frontend reports chrome state with snake_case keys
+/// (`{ panel_expanded, drawer_expanded }`) to match the rest of the typed
+/// protocol — `WorkerCommand::SetChrome`, `ViewMode`'s `serde(rename_all =
+/// "snake_case")`, `PresenterKind`, and every other payload in this crate. Left
+/// at the default, the command deserialization fails with `missing required key
+/// panelExpanded`, the worker's `set_chrome` never runs, and the native child
+/// window keeps its stale geometry: the controls panel expands in the webview
+/// while the panorama keeps painting over it. `void invoke(...)` in the frontend
+/// swallows the rejection, so the only symptom is a silently wrong viewport —
+/// see `crates/reco-app/FRICTION.md` A7.
+///
 /// # Errors
 ///
 /// Returns [`WorkerError::ChannelClosed`] if the worker has already exited.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn set_chrome(
     state: tauri::State<'_, WorkerHandle>,
     panel_expanded: bool,
