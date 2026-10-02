@@ -352,6 +352,15 @@ pub trait EngineBackend: Send {
     /// Dispatch a transport-agnostic input intent to the worker's pose state.
     fn dispatch_intent(&mut self, intent: reco_control::ControlIntent);
 
+    /// Drain the active presenter's own pointer input and dispatch it to the
+    /// worker's pose (PREV-04, native path).
+    ///
+    /// Called by the worker loop once per iteration — every tick while a session
+    /// is playing, and every iteration an idle command wakes — so the platform
+    /// event queue is never left to accumulate. Defaulted so the loop's shape
+    /// does not force a backend that owns no window (or a test double) to care.
+    fn drain_pointer_input(&mut self, _events: &EventSink) {}
+
     /// Swap the active presenter to `kind` at a command boundary (PREV-05).
     ///
     /// Reuses the existing device (never a second one), releases the outgoing
@@ -590,6 +599,14 @@ fn worker_loop<B: EngineBackend>(
                 Err(TryRecvError::Disconnected) => return,
             }
         }
+
+        // Native pose input: the presenter's own window owns the preview
+        // rectangle, so its gestures are drained here — after the command drain
+        // (so a SetView/SetChrome in the same batch is already applied) and
+        // before the tick (so the tick renders the panned pose). NOT inside
+        // `tick_session`: that never runs when idle, and a drag while paused
+        // must still pan.
+        backend.drain_pointer_input(&events);
 
         // An active session is paced by the loop: advance exactly one tick,
         // then loop again to re-drain (never block — that is what lets a
@@ -1664,6 +1681,32 @@ impl EngineBackend for GpuEngineBackend {
         dispatch_intent(&mut self.pose, intent);
     }
 
+    fn drain_pointer_input(&mut self, _events: &EventSink) {
+        let Some(gesture) = self.presenter.take_pointer_gesture() else {
+            return;
+        };
+        // Pose applies to the panorama only (UI-SPEC "Pose input mapping
+        // (panorama mode only)"). The gesture is still drained in Source mode —
+        // it is consumed and dropped rather than left to accumulate — so
+        // toggling back to the panorama cannot apply one huge stale delta.
+        if self.view_mode != crate::presenter::ViewMode::Panorama {
+            return;
+        }
+        // Read the pose's FOV and the viewport width BEFORE the mutable borrow,
+        // so the rad-per-pixel scale matches the scale the frontend uses.
+        let fov_degrees = self.pose.current_fov_deg();
+        let viewport_width = self.viewport.width;
+        for intent in crate::presenter::pointer_input::pointer_gesture_to_intents(
+            gesture,
+            fov_degrees,
+            viewport_width,
+        ) {
+            // The SAME dispatch point `WorkerCommand::Intent` uses, so a drag and
+            // an arrow key cannot diverge.
+            dispatch_intent(&mut self.pose, intent);
+        }
+    }
+
     fn set_presenter(&mut self, kind: crate::presenter::PresenterKind, events: &EventSink) {
         // A manual override re-runs the chain from the requested step: attempt it,
         // and on a fall-through error continue to the next weaker presenter. The
@@ -1921,6 +1964,30 @@ mod tests {
     /// a re-publish on the failure path is distinguishable from the
     /// session-start projection.
     const FAILING_TICK_FRAME: u64 = 7;
+
+    /// The recorded ops, minus the per-iteration pointer drain.
+    ///
+    /// `worker_loop` calls `drain_pointer_input` once per iteration, so the op
+    /// log interleaves it with whatever the iteration's command batch did.
+    /// Tests that assert a COMMAND ordering filter it out; the pointer tests
+    /// assert on it directly.
+    fn ops_without_pointer_drain(
+        ops: &Arc<std::sync::Mutex<Vec<&'static str>>>,
+    ) -> Vec<&'static str> {
+        ops.lock()
+            .unwrap()
+            .iter()
+            .copied()
+            .filter(|o| *o != "drain_pointer_input")
+            .collect()
+    }
+
+    /// The viewport width the mock's pose scaling uses.
+    ///
+    /// A fixed, named constant (rather than the backend's real 1280x800-derived
+    /// rect) so a pointer test asserts an exact expected angle: 1000 px of drag
+    /// sweeps exactly one FOV at this width.
+    const VIEWPORT_WIDTH: u32 = 1000;
     use super::*;
     use std::sync::mpsc::RecvTimeoutError;
 
@@ -1952,6 +2019,10 @@ mod tests {
         /// The transport built by the mock's `import`, mirroring the real
         /// backend so `loaded_transport` has something to report.
         loaded: Option<crate::transport::Transport>,
+        /// A pointer gesture the test stages, standing in for what the native
+        /// child's own window would have produced. `None` means "the user did
+        /// not touch the panorama", so the ordinary idle case stays free.
+        pending_gesture: Option<crate::presenter::pointer_input::PointerGesture>,
     }
 
     impl MockBackend {
@@ -1970,7 +2041,19 @@ mod tests {
                 lost: Arc::new(AtomicBool::new(false)),
                 active_kind: crate::presenter::PresenterKind::Native,
                 view_mode: crate::presenter::ViewMode::Panorama,
+                pending_gesture: None,
             }
+        }
+
+        /// Stage a pointer gesture for the next
+        /// [`EngineBackend::drain_pointer_input`], standing in for the native
+        /// child's own event queue.
+        fn with_pointer_gesture(
+            mut self,
+            gesture: crate::presenter::pointer_input::PointerGesture,
+        ) -> Self {
+            self.pending_gesture = Some(gesture);
+            self
         }
 
         fn record(&self, op: &'static str) {
@@ -2131,6 +2214,30 @@ mod tests {
             dispatch_intent(&mut pose, intent);
         }
 
+        fn drain_pointer_input(&mut self, _events: &EventSink) {
+            self.record("drain_pointer_input");
+            let Some(gesture) = self.pending_gesture.take() else {
+                return;
+            };
+            // Mirror the real backend: drained-and-dropped in Source mode, and
+            // routed through the SAME pure converter and the SAME
+            // `dispatch_intent` as `WorkerCommand::Intent`.
+            if self.view_mode != crate::presenter::ViewMode::Panorama {
+                return;
+            }
+            let fov_degrees = self.pose.lock().unwrap().current_fov_deg();
+            let viewport_width = VIEWPORT_WIDTH;
+            let intents = crate::presenter::pointer_input::pointer_gesture_to_intents(
+                gesture,
+                fov_degrees,
+                viewport_width,
+            );
+            let mut pose = self.pose.lock().unwrap();
+            for intent in intents {
+                dispatch_intent(&mut pose, intent);
+            }
+        }
+
         fn set_presenter(&mut self, kind: crate::presenter::PresenterKind, events: &EventSink) {
             self.record("set_presenter");
             self.active_kind = kind;
@@ -2226,7 +2333,7 @@ mod tests {
         handle.send(WorkerCommand::Shutdown).unwrap();
 
         let seen = drain_until_shutdown(&events);
-        assert_eq!(&*ops.lock().unwrap(), &["import", "shutdown"]);
+        assert_eq!(ops_without_pointer_drain(&ops), ["import", "shutdown"]);
 
         // The event sequence is: started → import started → import finished → shutdown.
         let messages: Vec<_> = seen
@@ -2477,11 +2584,10 @@ mod tests {
         handle.send(WorkerCommand::Shutdown).unwrap();
 
         let seen = drain_until_shutdown(&events);
-        let recorded = ops.lock().unwrap().clone();
         // `simulate_device_loss` runs, then recovery fires, then shutdown.
         assert_eq!(
-            recorded,
-            vec!["simulate_device_loss", "recover", "shutdown"]
+            ops_without_pointer_drain(&ops),
+            ["simulate_device_loss", "recover", "shutdown"]
         );
         let messages: Vec<_> = seen
             .iter()
@@ -2688,6 +2794,99 @@ mod tests {
         assert!(
             mock.session.as_ref().expect("session").loop_enabled(),
             "loop set during a session must survive the session ending"
+        );
+    }
+
+    #[test]
+    fn pointer_drain_moves_pose_in_the_direction_the_cli_says_a_right_drag_should() {
+        // The end-to-end seam: a gesture staged on the mock (standing in for the
+        // native child's own event queue) is drained by `worker_loop` and lands
+        // in the mock's PoseControl with the yaw sign the CLI authority gives a
+        // rightward drag. +yaw looks LEFT, so drag right must yaw NEGATIVE.
+        let ops = Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
+        let backend = MockBackend::new(Arc::clone(&ops)).with_pointer_gesture(
+            crate::presenter::pointer_input::PointerGesture {
+                drag_dx: 400.0,
+                ..Default::default()
+            },
+        );
+        let pose = Arc::clone(&backend.pose);
+        let (worker, _events) = EngineWorker::spawn(backend);
+        let handle = worker.handle();
+        handle.send(WorkerCommand::Import).unwrap();
+        handle.send(WorkerCommand::Preview).unwrap();
+        // Wait for the loop to have drained before shutting down. A `Shutdown`
+        // queued in the same batch as the gesture returns from the command drain
+        // before the drain call is ever reached, which would let this test pass
+        // for the wrong reason on a regression.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < deadline
+            && !ops.lock().unwrap().contains(&"drain_pointer_input")
+        {
+            thread::sleep(Duration::from_millis(2));
+        }
+        handle.send(WorkerCommand::Shutdown).unwrap();
+        let _ = worker.join(Duration::from_secs(2));
+
+        let recorded = ops.lock().unwrap().clone();
+        assert!(
+            recorded.contains(&"drain_pointer_input"),
+            "the worker loop must drain pointer input: {recorded:?}"
+        );
+        let yaw = pose.lock().unwrap().target_pose().yaw;
+        assert!(
+            yaw < 0.0,
+            "a rightward drag must yaw negative (CLI: Right = -yaw), got {yaw}"
+        );
+        // Zoom-relative sensitivity: 400 px of a 1000 px viewport is 0.4 FOV, from
+        // the same `fov / viewport_width` scale the frontend uses.
+        let expected = -0.4_f32 * 75.0_f32.to_radians();
+        assert!(
+            (yaw - expected).abs() < 1e-5,
+            "yaw {yaw} != expected {expected}"
+        );
+    }
+
+    #[test]
+    fn wheel_drain_zooms_and_a_source_mode_drain_is_discarded() {
+        // The wheel axis, and the view-mode gate: a gesture drained while the
+        // preview shows the raw source tiles must not move the pose (the tiles
+        // ignore it), but must still be consumed.
+        let wheel = crate::presenter::pointer_input::PointerGesture {
+            wheel_notches: 3.0,
+            ..Default::default()
+        };
+
+        let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut backend = MockBackend::new(Arc::clone(&ops)).with_pointer_gesture(wheel);
+        let (evt_tx, _rx) = std::sync::mpsc::channel();
+        let events = EventSink { tx: evt_tx };
+        let fov_before = backend.pose.lock().unwrap().target_pose().fov_degrees;
+        backend.drain_pointer_input(&events);
+        let (yaw, fov_after) = {
+            let pose = backend.pose.lock().unwrap();
+            (pose.target_pose().yaw, pose.target_pose().fov_degrees)
+        };
+        assert_eq!(yaw, 0.0, "a wheel notch must not move yaw");
+        assert!(
+            fov_after > fov_before,
+            "scroll up must widen the view: {fov_before:?} -> {fov_after:?}"
+        );
+
+        // Same gesture, but the preview is showing the source tiles.
+        let mut source = MockBackend::new(Arc::new(std::sync::Mutex::new(Vec::new())))
+            .with_pointer_gesture(wheel);
+        source.view_mode = crate::presenter::ViewMode::Source;
+        let before = source.pose.lock().unwrap().target_pose().fov_degrees;
+        source.drain_pointer_input(&events);
+        let after = source.pose.lock().unwrap().target_pose().fov_degrees;
+        assert_eq!(
+            before, after,
+            "pose input must not mutate the pose in source view"
+        );
+        assert!(
+            source.pending_gesture.is_none(),
+            "the gesture is drained and discarded, not left to accumulate"
         );
     }
 

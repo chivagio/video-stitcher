@@ -7,19 +7,101 @@
 //! All raw-handle access stays inside this module: the parent handle is turned
 //! into a child window id here and never escapes (D-02).
 //!
+//! # The real arrangement, and why this presenter owns pose input
+//!
+//! The panorama is a **child window of the main window**, and the WebKitGTK
+//! webview is **not** a separate X window: GTK draws it into the main window's
+//! own surface. An X child window always composites *above* its parent's own
+//! drawing and receives every pointer event in its area. So over the preview
+//! region the panorama is on top and takes all input, and the webview can only
+//! be reached in the L-shaped complement (transport bar, controls rail, log
+//! drawer). `XLowerWindow` can reorder sibling child windows, and there is no
+//! sibling webview window to reorder against.
+//!
+//! That is why the child **owns** pose input: the `XSelectInput` and
+//! [`SurfacePresenter::take_pointer_gesture`] below turn the child's own button,
+//! motion and wheel events into a [`super::pointer_input::PointerGesture`], which
+//! the worker translates into `ControlIntent`s and dispatches to its
+//! authoritative `PoseControl`. The webview's own pointer handlers stay live for
+//! the presenters that draw *no* native window over the preview region (readback,
+//! separate window), where nothing else can own them.
+//!
 //! # Why a child window
 //!
 //! The webview leaves the top region uncovered (UI-SPEC). This presenter
 //! creates an X11 child window covering that region so the `wgpu::Surface`
-//! renders into a native layer *under* the webview. See [`super`] for the
-//! two-layer model and D-01/D-02/D-03.
+//! renders the stitched panorama there. See [`super`] for the two-layer model
+//! and D-01/D-02/D-03.
+
+use std::os::raw::{c_long, c_uint};
 
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawWindowHandle};
 use reco_core::render::stitch_renderer::StitchRenderer;
 use reco_core::source::YuvData;
 use x11_dl::xlib;
 
+use super::pointer_input::PointerGesture;
 use super::{FrameOutcome, PresenterError, SurfacePresenter, ViewportRect};
+
+/// X11's `ButtonPressWheel` event mask: the wheel arriving as a *button press*.
+///
+/// X11 encodes the wheel by reusing two mask bits (X.h: `ButtonPressWheel =
+/// 1<<8`, `ButtonReleaseWheel = 1<<9`). Those are numerically identical to
+/// `Button1MotionMask` / `Button2MotionMask`, which x11-dl *does* export — but
+/// those names describe a completely different event. Selecting the numeric
+/// value under the wrong name is exactly what would mislead the next reader
+/// into deleting it, so the correct name is declared locally instead.
+const BUTTON_PRESS_WHEEL_MASK: c_long = 1 << 8;
+
+/// X11's `ButtonReleaseWheel` event mask: the wheel arriving as a *button
+/// release*. See [`BUTTON_PRESS_WHEEL_MASK`] for why this is declared locally.
+const BUTTON_RELEASE_WHEEL_MASK: c_long = 1 << 9;
+
+/// X11 `button` detail value for "wheel scrolled away from the user".
+const WHEEL_UP_BUTTON: c_uint = 4;
+
+/// X11 `button` detail value for "wheel scrolled toward the user".
+const WHEEL_DOWN_BUTTON: c_uint = 5;
+
+/// Hard cap on events removed from the X queue in one drain.
+///
+/// The drain must provably terminate. A few hundred events is far more than one
+/// worker-loop iteration accumulates at a playable frame rate, so reaching the
+/// cap means the loop is being outrun — not that input should be consumed
+/// without bound.
+const MAX_DRAIN_EVENTS: usize = 512;
+
+/// The event masks this presenter selects on its child window.
+///
+/// `ButtonMotionMask` (never `PointerMotionMask`) delivers motion only while a
+/// button is held, which is exactly the drag that pans and avoids a permanent
+/// high-rate motion stream. Nothing selects enter/leave/key/pointer-motion: this
+/// window has no business taking that input from the chrome around it.
+const POINTER_EVENT_MASK: c_long = xlib::ButtonPressMask
+    | xlib::ButtonReleaseMask
+    | xlib::ButtonMotionMask
+    | BUTTON_PRESS_WHEEL_MASK
+    | BUTTON_RELEASE_WHEEL_MASK;
+
+/// The pointer state accumulated on the child window between two drains.
+///
+/// Reset by [`X11Presenter::take_pointer_gesture`] as the gesture is returned,
+/// so each drain reports exactly the motion that happened since the last one.
+#[derive(Debug, Default, Clone, Copy)]
+struct PointerState {
+    /// Whether the primary button is currently held on the child window.
+    pressed: bool,
+    /// Last pointer x in child-window coordinates, valid while `pressed`.
+    last_x: f32,
+    /// Last pointer y in child-window coordinates, valid while `pressed`.
+    last_y: f32,
+    /// Accumulated horizontal travel in pixels since the last drain.
+    drag_dx: f32,
+    /// Accumulated vertical travel in pixels since the last drain.
+    drag_dy: f32,
+    /// Accumulated wheel notches since the last drain; positive is scroll up.
+    wheel_notches: f32,
+}
 
 /// Install an X error handler that logs and swallows the benign teardown errors
 /// our foreign child window can provoke, instead of letting GDK abort.
@@ -103,6 +185,11 @@ pub struct X11Presenter {
     device: Option<reco_core::wgpu::Device>,
     /// The shared command queue (see [`Self::device`]).
     queue: Option<reco_core::wgpu::Queue>,
+    /// Pointer input accumulated on the child window since the last drain.
+    ///
+    /// See [`SurfacePresenter::take_pointer_gesture`]. Reset as each gesture is
+    /// returned, so a drain never reports the same motion twice.
+    pointer_state: PointerState,
 }
 
 // SAFETY: the Xlib `Display*` is only touched from the thread that creates the
@@ -245,6 +332,22 @@ impl X11Presenter {
                 reason: "child window id was zero".to_string(),
             })?;
 
+        // Select the pointer events THIS presenter will own. An X child window
+        // already receives every pointer event in its rectangle whether or not
+        // anyone selects them (the server routes by geometry); selecting them is
+        // what delivers them to *this* client's queue so
+        // `take_pointer_gesture` can drain them. Only the button/motion/wheel
+        // masks are selected: nothing here should take key, enter/leave or
+        // bare pointer motion from the chrome.
+        //
+        // SAFETY: `display` is the live connection that owns `child_window`
+        // (created on it a few lines above), and `POINTER_EVENT_MASK` is a
+        // constant. No other client has selected on this window, so this cannot
+        // override a foreign event mask.
+        unsafe {
+            (xlib.XSelectInput)(display, child_nonzero.get(), POINTER_EVENT_MASK);
+        }
+
         // SAFETY: the child window id is a valid X11 window for the lifetime of
         // this presenter (destroyed only in Drop), and the display connection is
         // owned by the parent window which outlives the surface. wgpu's unsafe
@@ -277,6 +380,7 @@ impl X11Presenter {
             alpha_mode: reco_core::wgpu::CompositeAlphaMode::Auto,
             device: None,
             queue: None,
+            pointer_state: PointerState::default(),
         })
     }
 
@@ -703,6 +807,115 @@ impl SurfacePresenter for X11Presenter {
 
     fn child_geometry(&self) -> Option<(u32, u32)> {
         X11Presenter::child_geometry(&self.xlib, self.display, self.child_window)
+    }
+
+    fn take_pointer_gesture(&mut self) -> Option<PointerGesture> {
+        // No window, nothing to drain: the teardown path is a no-op.
+        let child = self.child_window?;
+
+        // Drain with `XCheckWindowEvent`, scoped to THIS window and THIS mask.
+        //
+        // This presenter shares one `Display*` with GTK (it came from the parent
+        // window's `RawDisplayHandle::Xlib`), so `XPending` + `XNextEvent` here
+        // would drain *GTK's own* event queue — silently breaking the entire UI
+        // with no error anywhere. `XCheckWindowEvent` removes only the first
+        // event matching BOTH this window and this mask, leaves everything else
+        // queued, and returns 0 immediately when there is none.
+        //
+        // The synthetic events a headless probe produces (`xdotool`) may arrive
+        // as XTest or as `SendEvent` depending on the build, so
+        // `event.any.send_event` is deliberately NOT used to reject either.
+        let mut state = self.pointer_state;
+        for _ in 0..MAX_DRAIN_EVENTS {
+            // The `XEvent` buffer must be zero-initialised: Xlib reads the
+            // `pad` array of the union for fields it does not fill in.
+            let mut event: xlib::XEvent = unsafe { std::mem::zeroed() };
+            // SAFETY: `display` is the live connection that owns `child`, and
+            // `event` is a live, zeroed local of exactly the type the C
+            // signature requires. The call only writes through the pointer and
+            // removes at most one matching event from the queue.
+            let got = unsafe {
+                (self.xlib.XCheckWindowEvent)(
+                    self.display,
+                    child.get(),
+                    POINTER_EVENT_MASK,
+                    &mut event,
+                )
+            };
+            if got == 0 {
+                break;
+            }
+            // SAFETY: reading the union's discriminant and, for the button /
+            // motion / wheel event types below, its payload. The union was
+            // written by `XCheckWindowEvent` for a matching event, and each
+            // payload read is gated on that event's own type, so the correct
+            // variant is active.
+            let (kind, detail, button, x, y) = unsafe {
+                (
+                    event.type_,
+                    event.any.send_event,
+                    event.button.button,
+                    event.button.x,
+                    event.button.y,
+                )
+            };
+            let _ = detail;
+            match kind {
+                xlib::ButtonPress => {
+                    // Only the primary button pans; 4/5 are the wheel, handled
+                    // below, and anything else (buttons 2/3 and up) is ignored.
+                    if button == 1 {
+                        state.pressed = true;
+                        state.last_x = x as f32;
+                        state.last_y = y as f32;
+                    }
+                }
+                xlib::MotionNotify => {
+                    if state.pressed {
+                        state.drag_dx += x as f32 - state.last_x;
+                        state.drag_dy += y as f32 - state.last_y;
+                        state.last_x = x as f32;
+                        state.last_y = y as f32;
+                    }
+                }
+                xlib::ButtonRelease => {
+                    // A release must NOT discard the last few pixels of a drag,
+                    // so the accumulators are left alone for this drain. The
+                    // release of the wheel arrives here too and is ignored.
+                    if button == 1 {
+                        state.pressed = false;
+                    }
+                }
+                _ => match button {
+                    // Wheel arrives as a press (4 = up, 5 = down) followed by a
+                    // release; only the press carries the direction.
+                    WHEEL_UP_BUTTON => state.wheel_notches += 1.0,
+                    WHEEL_DOWN_BUTTON => state.wheel_notches -= 1.0,
+                    _ => {}
+                },
+            }
+        }
+
+        let gesture = PointerGesture {
+            drag_dx: state.drag_dx,
+            drag_dy: state.drag_dy,
+            wheel_notches: state.wheel_notches,
+        };
+        // Reset as the gesture is returned: a drain reports each piece of motion
+        // once. `pressed`/`last_*` deliberately persist so a drag spanning two
+        // worker-loop iterations is one continuous drag.
+        self.pointer_state.drag_dx = 0.0;
+        self.pointer_state.drag_dy = 0.0;
+        self.pointer_state.wheel_notches = 0.0;
+        self.pointer_state.pressed = state.pressed;
+        self.pointer_state.last_x = state.last_x;
+        self.pointer_state.last_y = state.last_y;
+
+        if gesture.is_empty() {
+            None
+        } else {
+            Some(gesture)
+        }
     }
 
     fn configured_format(&self) -> Option<reco_core::wgpu::TextureFormat> {
