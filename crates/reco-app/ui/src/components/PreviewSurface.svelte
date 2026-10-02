@@ -4,6 +4,9 @@
   readback canvas (degraded).
 -->
 <script lang="ts">
+  import { onMount } from "svelte";
+  import { Channel } from "@tauri-apps/api/core";
+  import { pose } from "../lib/pose.svelte";
   import StateOverlay from "./StateOverlay.svelte";
   import type { PresenterKind } from "../lib/types";
 
@@ -22,6 +25,27 @@
   const isNative = $derived(presenterKind === "native");
   const isSeparateWindow = $derived(presenterKind === "separate_window");
   const isReadback = $derived(presenterKind === "readback");
+
+  let canvasEl: HTMLCanvasElement | null = null;
+
+  function paintFrame(buffer: ArrayBuffer): void {
+    if (!canvasEl) return;
+    const ctx = canvasEl.getContext("2d");
+    if (!ctx) return;
+    const w = canvasEl.width;
+    const h = canvasEl.height;
+    const imageData = new ImageData(new Uint8ClampedArray(buffer), w, h);
+    ctx.putImageData(imageData, 0, 0);
+  }
+
+  onMount(() => {
+    if (!isReadback) return;
+    const channel = new Channel<ArrayBuffer>();
+    channel.onmessage = (buffer: ArrayBuffer) => {
+      paintFrame(buffer);
+    };
+    onAttachReadback(channel);
+  });
 </script>
 
 <div
@@ -36,7 +60,7 @@
     if (isNative) {
       e.preventDefault();
       const delta = e.deltaY > 0 ? -1 : 1;
-      onAttachReadback({ delta } as any);
+      void pose.nudgeFov(delta);
     }
   }}
 >
@@ -70,6 +94,7 @@
       </p>
     </div>
     <canvas
+      bind:this={canvasEl}
       class="readback-canvas"
       width={1240}
       height={728}

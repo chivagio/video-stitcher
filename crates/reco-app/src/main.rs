@@ -121,14 +121,17 @@ fn run_skeleton(app: &mut tauri::App) -> Result<(), SkeletonError> {
     // pre-built presenter, never constructs one. The presenter chain (Task 3)
     // selects among these; here they are prepared and handed to the app.
     let preview_window = build_preview_window(app)?;
-    let separate_window_presenter =
-        match presenter::separate_window::SeparateWindowPresenter::new(preview_window, &instance, rect) {
-            Ok(p) => Some(p),
-            Err(e) => {
-                log::warn!("separate-window presenter unavailable, falling back to readback: {e}");
-                None
-            }
-        };
+    let separate_window_presenter = match presenter::separate_window::SeparateWindowPresenter::new(
+        preview_window,
+        &instance,
+        rect,
+    ) {
+        Ok(p) => Some(p),
+        Err(e) => {
+            log::warn!("separate-window presenter unavailable, falling back to readback: {e}");
+            None
+        }
+    };
 
     // Full-window transparent chrome webview: it is an absolutely positioned set
     // of opaque panels that tiles around the transparent preview hole. Pointer
@@ -139,9 +142,8 @@ fn run_skeleton(app: &mut tauri::App) -> Result<(), SkeletonError> {
     // three are pre-created here on the setup thread; the worker installs the
     // active one and can swap at a tick boundary on a manual override (Task 3).
     // Readback is trivially cheap (no surface; it shares the worker's device).
-    let mut presenter_chain: worker::PresenterChain = vec![
-        (presenter::PresenterKind::Native, Box::new(presenter)),
-    ];
+    let mut presenter_chain: worker::PresenterChain =
+        vec![(presenter::PresenterKind::Native, Box::new(presenter))];
     if let Some(separate) = separate_window_presenter {
         presenter_chain.push((presenter::PresenterKind::SeparateWindow, Box::new(separate)));
     }

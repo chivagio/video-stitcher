@@ -19,6 +19,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
+  import type { Channel as ChannelType } from "@tauri-apps/api/core";
   import { transport } from "./lib/transport.svelte";
   import { pose } from "./lib/pose.svelte";
   import { presenter } from "./lib/presenter.svelte";
@@ -120,9 +121,8 @@
   }
 
   // Readback attach.
-  function handleAttachReadback(): void {
-    // The Channel is created by the readback presenter attach command.
-    // This is a placeholder for the actual channel creation.
+  function handleAttachReadback(channel: ChannelType<ArrayBuffer>): void {
+    void presenter.attachReadback(channel);
   }
 
   // Show preview window.
