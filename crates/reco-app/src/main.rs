@@ -185,7 +185,13 @@ fn run_skeleton(app: &mut tauri::App) -> Result<(), SkeletonError> {
     // not a file picker (that is Phase 3). The import is fire-and-forget: the
     // worker loads the clips and calibration, and the frontend receives the
     // transport/position events that transition the UI from "empty" to "ready".
-    handle.send(commands::WorkerCommand::Import);
+    //
+    // A closed channel here means the worker already exited during setup; that
+    // is not recoverable from this thread, so log it and let the frontend's
+    // log drawer show the failure rather than panicking in `setup`.
+    if let Err(e) = handle.send(commands::WorkerCommand::Import) {
+        log::warn!("failed to post the startup import to the worker: {e}");
+    }
 
     // The thin path is driven by the WEBVIEW, not from here: the
     // `#[tauri::command]` handlers post Preview / Export / Play / Pause / Seek /
