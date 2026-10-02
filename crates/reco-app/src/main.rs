@@ -70,7 +70,8 @@ fn main() -> anyhow::Result<()> {
             commands::preview_attach_readback,
             commands::show_preview_window,
             commands::set_view,
-            commands::intent
+            commands::intent,
+            commands::republish_projection
         ])
         .setup(|app| {
             if let Err(e) = run_skeleton(app) {

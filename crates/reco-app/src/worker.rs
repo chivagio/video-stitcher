@@ -318,6 +318,18 @@ pub trait EngineBackend: Send {
     /// has not reached.
     fn publish_position(&mut self, events: &EventSink);
 
+    /// Re-assert the *entire* worker-owned projection — position, transport,
+    /// pose, view mode, and active presenter — to the frontend.
+    ///
+    /// The Tauri bridge only reaches listeners registered at emit time. The
+    /// worker boots and imports in `setup()`, so its opening projections fire
+    /// before the webview has subscribed and are dropped; the frontend then
+    /// reports an empty transport and an unknown clip length. This method lets
+    /// the frontend reconcile after subscribing (and restores the UI after a
+    /// webview reload), so the worker stays the single authority on state
+    /// without the frontend having to infer readiness.
+    fn republish_projection(&mut self, events: &EventSink);
+
     /// End the active session and return to idle.
     fn end_preview(&mut self, events: &EventSink);
 
@@ -514,6 +526,7 @@ fn handle_command<B: EngineBackend>(
             }
         }
         WorkerCommand::Intent(intent) => backend.dispatch_intent(intent),
+        WorkerCommand::RepublishProjection => backend.republish_projection(events),
         WorkerCommand::Shutdown => {
             interrupted.store(true, Ordering::SeqCst);
             backend.shutdown();
@@ -1649,6 +1662,23 @@ impl EngineBackend for GpuEngineBackend {
         }
     }
 
+    fn republish_projection(&mut self, events: &EventSink) {
+        self.publish_position(events);
+        if let Some(transport) = self.session.as_ref().or(self.loaded.as_ref()) {
+            events.transport(transport.state(), transport.loop_enabled());
+        }
+        // The pose is read from the control, not from the last render: with no
+        // session there is no tick, so a drag while paused must still be
+        // reflected in what the frontend reconciles.
+        let pose = self.pose.current_pose();
+        events.pose(pose.yaw, pose.pitch, self.pose.current_fov_deg());
+        events.view(self.view_mode);
+        // `reason` is deliberately omitted: the fallback that selected this
+        // presenter already reported its reason, and re-announcing it would
+        // duplicate the warning on every reconcile.
+        events.presenter(self.active_kind, None);
+    }
+
     fn set_chrome(&mut self, chrome: crate::presenter::ChromeState, events: &EventSink) {
         self.chrome = chrome;
         self.reconfigure_viewport(events);
@@ -2190,6 +2220,19 @@ mod tests {
             }
         }
 
+        fn republish_projection(&mut self, events: &EventSink) {
+            self.record("republish_projection");
+            self.publish_position(events);
+            if let Some(t) = self.session.as_ref().or(self.loaded.as_ref()) {
+                events.transport(t.state(), t.loop_enabled());
+            }
+            let pose = self.pose.lock().unwrap().current_pose();
+            let fov = self.pose.lock().unwrap().current_fov_deg();
+            events.pose(pose.yaw, pose.pitch, fov);
+            events.view(self.view_mode);
+            events.presenter(self.active_kind, None);
+        }
+
         fn set_chrome(&mut self, _chrome: crate::presenter::ChromeState, _events: &EventSink) {
             self.record("set_chrome");
         }
@@ -2409,6 +2452,129 @@ mod tests {
             state,
             crate::transport::TransportState::Paused,
             "import must not begin playback"
+        );
+    }
+
+    #[test]
+    fn republish_projection_reasserts_transport_so_play_becomes_reachable() {
+        // Regression: the event bridge is fire-and-forget, so the import's
+        // Position/Transport were emitted before the webview subscribed and
+        // dropped. The frontend then stayed "empty" and Play stayed disabled.
+        // Republishing is what makes the opening state observable. Assert the
+        // transport specifically: it is the one that flips the frontend out of
+        // "empty" (and it must carry the real clip length, not a placeholder).
+        let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (worker, events) = EngineWorker::spawn(MockBackend::new(ops));
+        let handle = worker.handle();
+        handle.send(WorkerCommand::Import).unwrap();
+        // Drain past the import's own projections so only the republish is left
+        // to be observed.
+        handle.send(WorkerCommand::RepublishProjection).unwrap();
+        handle.send(WorkerCommand::Shutdown).unwrap();
+
+        let seen = drain_until_shutdown(&events);
+        let transport_events: Vec<_> = seen
+            .iter()
+            .filter_map(|e| match e {
+                WorkerEvent::Transport {
+                    state,
+                    loop_enabled,
+                } => Some((*state, *loop_enabled)),
+                _ => None,
+            })
+            .collect();
+
+        assert!(
+            transport_events.len() >= 2,
+            "expected the import's Transport plus a republished one, saw {:?}",
+            transport_events.len()
+        );
+        let (state, loop_enabled) = *transport_events.last().unwrap();
+        assert_eq!(
+            state,
+            crate::transport::TransportState::Paused,
+            "the republished transport must leave the frontend ready-but-not-playing"
+        );
+        assert!(
+            !loop_enabled,
+            "loop must not be silently enabled by a reconcile"
+        );
+
+        // And the position it re-asserts must carry the clip's real length, so
+        // the timeline can show an extent instead of an unknown one.
+        let total = seen
+            .iter()
+            .filter_map(|e| match e {
+                WorkerEvent::Position { total, .. } => Some(total),
+                _ => None,
+            })
+            .next_back()
+            .copied()
+            .expect("a Position event");
+        assert_eq!(
+            total,
+            Some(5),
+            "the republished position must carry the loaded clip's frame count"
+        );
+    }
+
+    #[test]
+    fn republish_projection_reports_view_preset_and_pose_without_a_session() {
+        // The reconcile must restore more than transport: a webview reload (or
+        // the startup race) loses the view mode, the presenter, and the pose
+        // too, and each has its own frontend store. With no session there is no
+        // tick, so this is the only thing that publishes a pose at all.
+        let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (worker, events) = EngineWorker::spawn(MockBackend::new(ops));
+        let handle = worker.handle();
+        handle.send(WorkerCommand::RepublishProjection).unwrap();
+        handle.send(WorkerCommand::Shutdown).unwrap();
+
+        let seen = drain_until_shutdown(&events);
+
+        assert!(
+            seen.iter().any(|e| matches!(e, WorkerEvent::View { .. })),
+            "the view mode must be re-asserted"
+        );
+        assert!(
+            seen.iter()
+                .any(|e| matches!(e, WorkerEvent::Presenter { .. })),
+            "the active presenter must be re-asserted"
+        );
+        assert!(
+            seen.iter().any(|e| matches!(e, WorkerEvent::Pose { .. })),
+            "the pose must be re-asserted"
+        );
+    }
+
+    #[test]
+    fn republish_projection_does_not_start_playback_or_a_session() {
+        // A reconcile is a read. If it materialised a transport or began
+        // ticking, the app would enter the session path on startup — with no
+        // renderer, and (per the `loaded_transport` note) with no real timing.
+        //
+        // The import MUST come first: the real reconcile happens after a
+        // successful import (the app imports at startup, then the webview
+        // subscribes and asks). Reconciling with no clip loaded cannot reach the
+        // risky branch at all, so asserting here alone would pass even against a
+        // republish that opened a session.
+        let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (worker, events) = EngineWorker::spawn(MockBackend::new(Arc::clone(&ops)));
+        let handle = worker.handle();
+        handle.send(WorkerCommand::Import).unwrap();
+        handle.send(WorkerCommand::RepublishProjection).unwrap();
+        handle.send(WorkerCommand::Shutdown).unwrap();
+
+        drain_until_shutdown(&events);
+
+        let recorded = ops.lock().unwrap().clone();
+        assert!(
+            !recorded.contains(&"begin_preview"),
+            "a reconcile must not begin a preview session, saw {recorded:?}"
+        );
+        assert!(
+            !recorded.contains(&"tick"),
+            "a reconcile must not tick, saw {recorded:?}"
         );
     }
 

@@ -41,12 +41,25 @@
   // View mode (mirrors the worker's ViewMode).
   let viewMode = $state<ViewMode>("panorama");
 
-  // Initialize stores on mount.
+  // Initialize stores on mount, then reconcile with the worker.
   onMount(() => {
-    void transport.init();
-    void pose.init();
-    void presenter.init();
-    void log.init();
+    void (async () => {
+      await transport.init();
+      await pose.init();
+      await presenter.init();
+      await log.init();
+      // Subscribe first, *then* ask the worker to re-assert its state. The
+      // worker boots and imports before the webview has loaded, and the event
+      // bridge only reaches listeners registered at emit time — so its opening
+      // position/transport/pose/view were dropped and the UI sat empty
+      // (transport disabled, clip length unknown). Ordering matters: the
+      // reconcile must land after the listeners, or it is dropped too.
+      try {
+        await invoke("republish_projection");
+      } catch (e) {
+        console.error("republish_projection failed", e);
+      }
+    })();
     return () => {
       transport.destroy();
       pose.destroy();

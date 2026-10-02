@@ -288,6 +288,34 @@ pub async fn intent(
     state.send(WorkerCommand::Intent(intent))
 }
 
+/// Ask the worker to re-assert its whole projection (position, transport,
+/// pose, view mode, presenter) to the event channel.
+///
+/// This exists because the Tauri bridge is fire-and-forget: `emit` only
+/// reaches the listeners that are registered *at that moment*. The worker is
+/// spawned in `setup()` and imports immediately, so its opening position,
+/// transport, and view projections are emitted roughly a second into startup —
+/// before the webview has finished loading and run its `listen`. Those lines
+/// are dropped, and the frontend sits in its initial `empty` state: transport
+/// controls stay disabled and the clip length reads as unknown.
+///
+/// The frontend therefore subscribes first and *then* calls this, which
+/// reconciles the missed opening state. It is also what restores the UI after
+/// a webview reload, where every projection since boot has been missed.
+///
+/// Thin, same contract as [`play`]: post the command and return; the worker
+/// emits on its own thread.
+///
+/// # Errors
+///
+/// Returns [`WorkerError::ChannelClosed`] if the worker has already exited.
+#[tauri::command]
+pub async fn republish_projection(
+    state: tauri::State<'_, WorkerHandle>,
+) -> Result<(), WorkerError> {
+    state.send(WorkerCommand::RepublishProjection)
+}
+
 /// A command from the UI to the engine worker.
 ///
 /// `Clone + Send + 'static` — the compile-time assertion in `events.rs`
@@ -372,6 +400,14 @@ pub enum WorkerCommand {
 
     /// Show the separate preview window (PREV-05).
     ShowPreviewWindow,
+
+    /// Re-assert the whole worker-owned projection to the event channel.
+    ///
+    /// Sent by the frontend once every store has subscribed, to recover the
+    /// opening position/transport/pose/view that the fire-and-forget bridge
+    /// dropped before the webview was listening (see
+    /// [`republish_projection`]).
+    RepublishProjection,
 
     /// Switch the preview between source tiles and the stitched panorama
     /// (PREV-03).
