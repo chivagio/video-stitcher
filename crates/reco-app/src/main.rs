@@ -178,10 +178,19 @@ fn run_skeleton(app: &mut tauri::App) -> Result<(), SkeletonError> {
     // native view.
     install_close_handler(&window, worker, handle.clone());
 
-    // The thin path is driven by the WEBVIEW, not from here: the three
-    // `#[tauri::command]` handlers post Import / Preview / Export when the user
-    // presses the matching button (D-06/D-09). We deliberately do NOT auto-post
-    // Import/Preview at startup — the whole point of Plan 04's UI is that the
+    // Auto-import the hardcoded clips on startup (D-08). Phase 2's UI has no
+    // Import button — the transport bar is Play/Pause/Step/Loop — so the app
+    // must import automatically for Play to have a session to start. This is
+    // consistent with the hardcoded-clips design: the app is a preview tool,
+    // not a file picker (that is Phase 3). The import is fire-and-forget: the
+    // worker loads the clips and calibration, and the frontend receives the
+    // transport/position events that transition the UI from "empty" to "ready".
+    handle.send(commands::WorkerCommand::Import);
+
+    // The thin path is driven by the WEBVIEW, not from here: the
+    // `#[tauri::command]` handlers post Preview / Export / Play / Pause / Seek /
+    // Step / Loop / SetView / Intent when the user presses the matching button
+    // (D-06/D-09). We deliberately do NOT auto-post Preview at startup — the
     // user drives the engine without a CLI, and the busy/disabled interaction
     // contract proves the single-owner boundary as each command is issued.
 
