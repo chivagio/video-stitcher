@@ -77,3 +77,40 @@ different layout (e.g. stacked vertically, or with per-tile overlays) would stil
 need its own draw path; the new renderer is intentionally fixed to the UI-SPEC's
 "left | right side-by-side" layout.
 
+### A3. The worker/frontend transport contract is implicit, so "ready" is unreachable if any projection is missed
+
+**Impact:** High (PREV-02), and silent. The frontend decides whether the clip is
+playable purely by **string-matching the log projection** the worker emits:
+
+- `transport.svelte.ts` starts in `status: "empty"` and gates `play`, `seek`,
+  `step`, and `set_loop` on leaving it.
+- It leaves only on parsing `"transport: (Playing|Paused|Ended), loop on|off"`
+  (or a `position: frame X` line) out of `WorkerEvent::Log`.
+
+So "playback is available" is not a property the worker declares — it is an
+emergent consequence of which log lines happen to be emitted on which code path.
+Phase 2 hit this immediately: the chrome has no Import button (the app imports at
+startup), and the successful-import path emitted no position/transport, so the
+store stayed `empty` forever and **Play was unreachable** with no error anywhere.
+The defect was invisible to `cargo test` — the Rust unit tests exercise
+`WorkerEvent`s directly and never touch the log text the frontend parses — and
+only surfaced when the headless probe tried to drive a real session.
+
+**Resolution (Phase 2, gap closure):** the worker now projects the loaded clip's
+position + transport from the `Import` command handler, and
+`EngineBackend::loaded_transport` was added as a read-only accessor so reporting
+state cannot materialize a placeholder transport in the `session` slot
+(`session_active()` keys off that slot). Regression test:
+`worker::tests::import_projects_position_and_transport_so_the_frontend_can_play`
+(verified to fail without the fix). The headless probe
+(`scripts/phase2-chrome-probe.sh`) now drives Play end-to-end and reaches
+`PHASE2 PROBE: PASS`.
+
+**Residual gap:** the underlying coupling is still there — the frontend derives
+readiness from human-readable log text rather than from the typed
+`WorkerEvent::Transport { state, .. }` fields it already receives, and the
+`parseTransport` regex must be kept in sync with the worker's formatter by hand.
+Wiring the rune stores to the typed event payloads is the real fix; it is out of
+scope for Phase 2 and is left as the first thing to tighten when the frontend
+protocol next changes.
+
