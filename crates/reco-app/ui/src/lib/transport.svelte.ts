@@ -24,15 +24,26 @@ import { WORKER_EVENT } from "./types";
 export type TransportStatus = "empty" | "loading" | "ready" | "playing" | "ended";
 
 /**
- * Parse a "position: frame X/Y" or "position: frame X" log message.
- * Returns `[frame, total]` where total is null when unknown.
+ * Parse a position log message, with or without the frame-rate rational:
+ *   "position: frame X/Y"      "position: frame X"
+ *   "position: frame X/Y @ n/d" "position: frame X @ n/d"
+ *
+ * Returns `[frame, total, fps]`; `total` and `fps` are null when unknown. The
+ * rational is what lets the timecode be exact instead of assuming 30 fps.
  */
-function parsePosition(message: string): [number, number | null] | null {
-  const m = message.match(/^position: frame (\d+)(?:\/(\d+))?$/);
+function parsePosition(
+  message: string,
+): [number, number | null, number | null] | null {
+  const m = message.match(
+    /^position: frame (\d+)(?:\/(\d+))?(?: @ (\d+)\/(\d+))?$/,
+  );
   if (!m) return null;
   const frame = Number(m[1]);
   const total = m[2] !== undefined ? Number(m[2]) : null;
-  return [frame, total];
+  // Guard a zero/negative denominator rather than producing Infinity.
+  const den = m[4] !== undefined ? Number(m[4]) : NaN;
+  const fps = m[3] !== undefined && den > 0 ? Number(m[3]) / den : null;
+  return [frame, total, fps];
 }
 
 /**
@@ -90,9 +101,10 @@ class TransportStore {
   #onEvent(line: LogLine): void {
     const pos = parsePosition(line.message);
     if (pos !== null) {
-      const [frame, total] = pos;
+      const [frame, total, fps] = pos;
       this.frame = frame;
       if (total !== null) this.total = total;
+      if (fps !== null) this.fps = fps;
       this.seeking = false;
       // A position event implies the session is active.
       if (this.status === "empty" || this.status === "loading") {
@@ -173,7 +185,13 @@ class TransportStore {
     }
   }
 
-  /** Format a frame index as a timecode string (H:MM:SS). */
+  /**
+   * Format a frame index as a timecode string (H:MM:SS).
+   *
+   * Falls back to a nominal 30 fps only when the source reported no rational.
+   * A real rational arrives on every position event, so non-30 material is
+   * converted exactly rather than drifting.
+   */
   formatTimecode(frame: number): string {
     const fps = this.fps ?? 30;
     const totalSeconds = Math.floor(frame / fps);

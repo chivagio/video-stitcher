@@ -2754,10 +2754,15 @@ mod tests {
         // advances it. Those are command-time projections, not ticks. Anything
         // after the first advance — a reset to 0, a skipped or doubled step — is
         // still caught by the windows below.
+        //
+        // Exactly ONE leading zero is kept: the boundary window from the
+        // session-start projection into the first tick is the one a first-tick
+        // double-advance corrupts (0 -> 2), so dropping it would hide that bug.
         let frames: Vec<u64> = {
             let all = collected.lock().unwrap().clone();
             let first_advance = all.iter().position(|f| *f != 0).unwrap_or(all.len());
-            all[first_advance..].to_vec()
+            let keep_from = first_advance.saturating_sub(1);
+            all[keep_from..].to_vec()
         };
         assert!(
             frames.len() >= 4,
@@ -2887,10 +2892,15 @@ mod tests {
         // advances it. Those are command-time projections, not ticks. Anything
         // after the first advance — a reset to 0, a skipped or doubled step — is
         // still caught by the windows below.
+        //
+        // Exactly ONE leading zero is kept: the boundary window from the
+        // session-start projection into the first tick is the one a first-tick
+        // double-advance corrupts (0 -> 2), so dropping it would hide that bug.
         let frames: Vec<u64> = {
             let all = collected.lock().unwrap().clone();
             let first_advance = all.iter().position(|f| *f != 0).unwrap_or(all.len());
-            all[first_advance..].to_vec()
+            let keep_from = first_advance.saturating_sub(1);
+            all[keep_from..].to_vec()
         };
         assert!(
             frames.len() >= 4,

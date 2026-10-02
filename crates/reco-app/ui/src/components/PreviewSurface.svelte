@@ -4,7 +4,6 @@
   readback canvas (degraded).
 -->
 <script lang="ts">
-  import { onMount } from "svelte";
   import { Channel } from "@tauri-apps/api/core";
   import { pose } from "../lib/pose.svelte";
   import StateOverlay from "./StateOverlay.svelte";
@@ -18,7 +17,7 @@
   }: {
     presenterKind: PresenterKind;
     viewMode: "source" | "panorama";
-    onAttachReadback: (channel: any) => void;
+    onAttachReadback: (channel: Channel<ArrayBuffer>) => void;
     onShowPreviewWindow: () => void;
   } = $props();
 
@@ -26,7 +25,7 @@
   const isSeparateWindow = $derived(presenterKind === "separate_window");
   const isReadback = $derived(presenterKind === "readback");
 
-  let canvasEl: HTMLCanvasElement | null = null;
+  let canvasEl = $state<HTMLCanvasElement | null>(null);
 
   function paintFrame(buffer: ArrayBuffer): void {
     if (!canvasEl) return;
@@ -38,13 +37,28 @@
     ctx.putImageData(imageData, 0, 0);
   }
 
-  onMount(() => {
+  // `$effect` keyed on `isReadback`, NOT `onMount`. The session starts on the
+  // native presenter, so `onMount` saw `isReadback === false` and bailed — and
+  // because the presenter is swappable at runtime, the readback arm would have
+  // rendered its canvas with no Channel ever created, leaving a blank frame
+  // under the degraded banner. Re-running on the transition attaches the Channel
+  // exactly when the readback arm becomes active.
+  //
+  // Cleanup only clears the JS handler: `preview_attach_readback` takes a
+  // non-nullable channel, so there is no detach to send. A later attach replaces
+  // the stored channel anyway.
+  $effect(() => {
     if (!isReadback) return;
     const channel = new Channel<ArrayBuffer>();
     channel.onmessage = (buffer: ArrayBuffer) => {
       paintFrame(buffer);
     };
     onAttachReadback(channel);
+    return () => {
+      // A no-op rather than `undefined`: Tauri's Channel types the handler as
+      // required, and detaching is what we mean.
+      channel.onmessage = () => {};
+    };
   });
 </script>
 
@@ -53,7 +67,6 @@
   class:native={isNative}
   class:separate-window={isSeparateWindow}
   class:readback={isReadback}
-  tabindex="0"
   role="img"
   aria-label={viewMode === "source" ? "Source" : "Panorama"}
   onwheel={(e) => {

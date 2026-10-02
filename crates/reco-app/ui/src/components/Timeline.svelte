@@ -60,8 +60,12 @@
     };
   });
 
-  const max = total !== null && total > 0 ? total - 1 : 0;
-  const value = dragging ? dragFrame : frame;
+  // `$derived`, not `const`: Svelte 5 evaluates the component body once, so a
+  // plain `const` would freeze at mount — with `total` null that pinned the
+  // range to `min=0 max=0 value=0`, so the playhead never advanced and a drag
+  // could never seek (PREV-02).
+  const max = $derived(total !== null && total > 0 ? total - 1 : 0);
+  const value = $derived(dragging ? dragFrame : frame);
 </script>
 
 <input

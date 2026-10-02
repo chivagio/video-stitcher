@@ -169,11 +169,24 @@ impl WorkerEvent {
             // The state-carrying variants are not log lines; project them to a
             // concise INFO summary so a log-only consumer (or a headless gate
             // report) still sees them without inventing text on the JS side.
-            WorkerEvent::Position { frame, total, .. } => LogLine {
+            WorkerEvent::Position {
+                frame,
+                total,
+                fps_rational,
+            } => LogLine {
                 level: Level::Info,
-                message: match total {
-                    Some(total) => format!("position: frame {frame}/{total}"),
-                    None => format!("position: frame {frame}"),
+                // The rational rides along so the frontend can compute an exact
+                // timecode. Without it the UI falls back to a nominal 30 fps and
+                // drifts on non-30 material (29.97 is ~3.6 s per hour).
+                message: match (total, fps_rational) {
+                    (Some(total), Some((num, den))) => {
+                        format!("position: frame {frame}/{total} @ {num}/{den}")
+                    }
+                    (Some(total), None) => format!("position: frame {frame}/{total}"),
+                    (None, Some((num, den))) => {
+                        format!("position: frame {frame} @ {num}/{den}")
+                    }
+                    (None, None) => format!("position: frame {frame}"),
                 },
             },
             WorkerEvent::Transport {
@@ -230,7 +243,11 @@ impl WorkerEvent {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, thiserror::Error)]
 pub enum WorkerError {
     /// A command required an imported session but none exists yet.
-    #[error("no clips are imported yet — press Import first")]
+    ///
+    /// Phase 2 imports at startup and its chrome has no Import button, so the
+    /// message must not tell the user to press one: the actionable cause is a
+    /// failed startup import (see the worker log for the engine error).
+    #[error("no clips are loaded yet — the startup import did not complete (see the log)")]
     NotImported,
 
     /// The command is not implemented in this phase.
@@ -370,7 +387,7 @@ mod tests {
         assert_eq!(line.level, Level::Error);
         assert_eq!(
             line.message,
-            "no clips are imported yet — press Import first"
+            "no clips are loaded yet — the startup import did not complete (see the log)"
         );
     }
 
@@ -519,6 +536,29 @@ mod tests {
         };
         assert_eq!(pos.to_log_line().level, Level::Info);
         assert_eq!(pos.to_log_line().message, "position: frame 5/100");
+
+        // With a rational: the frontend needs it to compute an exact timecode
+        // instead of assuming a nominal 30 fps.
+        let pos_rational = WorkerEvent::Position {
+            frame: 5,
+            total: Some(100),
+            fps_rational: Some((30000, 1001)),
+        };
+        assert_eq!(
+            pos_rational.to_log_line().message,
+            "position: frame 5/100 @ 30000/1001"
+        );
+
+        // Rational without a total must still carry it.
+        let pos_rational_no_total = WorkerEvent::Position {
+            frame: 5,
+            total: None,
+            fps_rational: Some((25, 1)),
+        };
+        assert_eq!(
+            pos_rational_no_total.to_log_line().message,
+            "position: frame 5 @ 25/1"
+        );
 
         let tr = WorkerEvent::Transport {
             state: crate::transport::TransportState::Paused,
