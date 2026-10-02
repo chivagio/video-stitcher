@@ -41,6 +41,7 @@ use reco_core::source::YuvData;
 pub mod x11;
 
 pub mod fallback;
+pub mod pointer_input;
 pub mod readback;
 pub mod separate_window;
 
@@ -660,6 +661,22 @@ pub trait SurfacePresenter {
     /// (readback, fallback) or whose window has been released. Additive default
     /// so no other impl changes.
     fn child_geometry(&self) -> Option<(u32, u32)> {
+        None
+    }
+
+    /// Take the pointer gesture accumulated by this presenter's **own window**
+    /// since the last drain, and reset the accumulator.
+    ///
+    /// `None` for a presenter with no window inside the main window (readback,
+    /// separate window, fallback) — those presenters draw nothing over the
+    /// preview region, so the webview owns their pose input instead (see
+    /// `PreviewSurface.svelte`). `Some` means something moved; the default
+    /// `None` keeps the worker loop's idle path free of work.
+    ///
+    /// The gesture becomes intents through
+    /// [`pointer_input::pointer_gesture_to_intents`], which is pure and
+    /// platform-free so its sign convention is testable without an X server.
+    fn take_pointer_gesture(&mut self) -> Option<pointer_input::PointerGesture> {
         None
     }
 
