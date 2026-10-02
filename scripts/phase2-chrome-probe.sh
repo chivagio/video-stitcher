@@ -131,28 +131,34 @@ echo "PHASE2 PROBE: main window id=${MAIN_WIN}"
 
 # ------------------------------------------------------------- z-order assert
 
-# WebKitGTK reality: the webview is a GTK widget *inside* the toplevel, not a
-# separate X11 child window, so `xwininfo -tree` shows exactly ONE native
-# InputOutput child of the main window — the presenter's X11 child view. The
-# z-order claim therefore reduces to:
-#   (a) the native child is the only InputOutput child, AND
-#   (b) it was LOWERED (RESEARCH Pitfall 1) — it must not own the full window,
-#       and it must not be the topmost eligible window, AND
-#   (c) pointer events over the chrome reach the webview (asserted below by the
-#       Import/Start-preview clicks landing on webview-owned buttons, and by a
-#       companion click over the preview region NOT triggering an engine command).
+# WebKitGTK reality, as `xwininfo -tree` shows it: the webview is a GTK widget
+# *inside* the toplevel, NOT a separate X11 child window, so the tree shows
+# exactly ONE native InputOutput child — the presenter's panorama child view.
+# The claims this block can therefore make are:
+#   (a) the panorama child is the only InputOutput child, AND
+#   (b) its geometry is the L-shaped complement of the chrome, i.e. strictly
+#       smaller than the window in at least one dimension, AND
+#   (c) it IS the topmost child — and that is EXPECTED, not a defect: an X child
+#       window always composites above its parent's own drawing (where the
+#       webview paints), so inside its rectangle the panorama is on top and
+#       receives all pointer input. It needs to be transparent to the webview
+#       only if the webview owned pose input there; under the accepted
+#       arrangement the CHILD owns pose input instead.
+# Pointer routing for the chrome is asserted positively further down, by driving
+# webview-owned controls and requiring their log effects.
 TREE="$(xwininfo -display "$DISPLAY_NUM" -tree -id "$MAIN_WIN" 2>/dev/null || true)"
 [[ -n "$TREE" ]] || fail "xwininfo -tree returned nothing for window ${MAIN_WIN}"
 
 echo "PHASE2 PROBE: window tree:"
 echo "$TREE"
 
-# Count InputOutput children (the 1x1 InputOnly helper wry/GDK creates is not
-# relevant to compositing). Extract child ids and query each one's class.
+# Count InputOutput children (the 1x1 InputOnly helper wry/GDK creates is not a
+# drawable). Extract child ids and query each one's class.
 mapfile -t CHILD_IDS < <(echo "$TREE" | grep -oE '^\s+0x[0-9a-f]+' | tr -d ' ')
 [[ "${#CHILD_IDS[@]}" -ge 1 ]] || fail "no child windows under ${MAIN_WIN}"
 
 NATIVE_CHILD=""
+INPUTOUTPUT_COUNT=0
 for cid in "${CHILD_IDS[@]}"; do
   info="$(xwininfo -display "$DISPLAY_NUM" -id "$cid" 2>/dev/null || true)"
   cls="$(echo "$info" | awk -F': ' '/^  Class:/{print $2}' | head -n1 | tr -d ' ')"
@@ -160,6 +166,7 @@ for cid in "${CHILD_IDS[@]}"; do
   h="$(echo "$info" | awk -F': ' '/^  Height:/{print $2}' | head -n1 | tr -d ' ')"
   echo "PHASE2 PROBE: child ${cid} class=${cls} ${w}x${h}"
   if [[ "$cls" == "InputOutput" ]]; then
+    INPUTOUTPUT_COUNT=$(( INPUTOUTPUT_COUNT + 1 ))
     NATIVE_CHILD="$cid"
     NATIVE_W="$w"
     NATIVE_H="$h"
@@ -167,17 +174,26 @@ for cid in "${CHILD_IDS[@]}"; do
 done
 
 [[ -n "$NATIVE_CHILD" ]] || fail "no InputOutput native child view found under ${MAIN_WIN}"
+# (a) Exactly one InputOutput child: the webview is not a window, so any second
+# InputOutput child would mean the arrangement is not the one this probe reads.
+[[ "$INPUTOUTPUT_COUNT" -eq 1 ]] \
+  || fail "expected exactly 1 InputOutput child (the panorama child view), found ${INPUTOUTPUT_COUNT}"
 
 # (b) The native child must NOT cover the full window: it is the L-shaped
 # complement of the chrome (1240x728 for the 1280x800 default), i.e. strictly
 # smaller than the window in at least one dimension.
 if [[ "$NATIVE_W" -ge "$SCREEN_W" && "$NATIVE_H" -ge "$SCREEN_H" ]]; then
-  fail "native child ${NATIVE_CHILD} (${NATIVE_W}x${NATIVE_H}) covers the whole ${SCREEN_W}x${SCREEN_H} window — it was not lowered below the transparent chrome"
+  fail "native child ${NATIVE_CHILD} (${NATIVE_W}x${NATIVE_H}) covers the whole ${SCREEN_W}x${SCREEN_H} window — the chrome reservation is gone"
 fi
-echo "PHASE2 PROBE: native child ${NATIVE_CHILD} = ${NATIVE_W}x${NATIVE_H} (L-shaped; below the webview)"
+echo "PHASE2 PROBE: panorama child ${NATIVE_CHILD} = ${NATIVE_W}x${NATIVE_H} (L-shaped complement of the chrome; the webview is drawn by the parent window, so the child composites ABOVE it and owns all pointer input in that rectangle)"
 
+# (c) The single InputOutput child IS the topmost child. This is a fact about
+# the tree and it is expected under the accepted arrangement — not a defect to
+# fix by lowering it. `XLowerWindow` can only reorder SIBLING child windows and
+# there is no sibling webview window, so lowering cannot put the webview above
+# the panorama.
 TOP_CHILD_ID="${CHILD_IDS[-1]}"
-echo "PHASE2 PROBE: topmost child = ${TOP_CHILD_ID}"
+echo "PHASE2 PROBE: topmost child = ${TOP_CHILD_ID} (= the panorama child; expected: a child window composites above its parent's own drawing, and the child — not the webview — owns pose input inside its rectangle)"
 
 # --------------------------------------------------- drive play (Phase 2 UI)
 
