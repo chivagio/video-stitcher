@@ -239,6 +239,16 @@ pub trait EngineBackend: Send {
     /// state, loop, and coalesced seek).
     fn transport(&mut self) -> &mut crate::transport::Transport;
 
+    /// The transport built at `Import` time, or `None` before any import.
+    ///
+    /// Read-only counterpart to [`Self::transport`], for a handler that must
+    /// *report* state rather than mutate it. Reporting must not go through
+    /// `transport()`, which materializes a placeholder transport in the
+    /// `session` slot — and `session_active()` keys off that slot, so reporting
+    /// through the mutable accessor would falsely signal an active session and
+    /// start the tick loop with no session (no renderer, no real timing).
+    fn loaded_transport(&self) -> Option<&crate::transport::Transport>;
+
     /// Report the webview chrome's collapsible state; recompute and reconfigure
     /// the native viewport (no transport/pose reset).
     fn set_chrome(&mut self, chrome: crate::presenter::ChromeState, events: &EventSink);
@@ -307,7 +317,33 @@ fn handle_command<B: EngineBackend>(
 ) -> bool {
     match cmd {
         WorkerCommand::Import => match backend.import(events) {
-            Ok(()) => events.info("import finished"),
+            Ok(()) => {
+                events.info("import finished");
+                // Publish the loaded clip's authoritative projection. Phase 2's
+                // chrome has no Import button — the app imports at startup — so
+                // without this the frontend transport store never leaves its
+                // initial "empty" state and gates every transport action
+                // (`play`, `seek`, `step`, `set_loop`) as unavailable. The
+                // worker owns the projection (UI-SPEC Interaction rule 1): the
+                // frontend mirrors it and never derives readiness itself.
+                let (frame, total, fps_rational, state, loop_enabled) = {
+                    // Read-only: see `loaded_transport` for why reporting must
+                    // not materialize a placeholder transport.
+                    match backend.loaded_transport() {
+                        Some(t) => (
+                            t.frame(),
+                            t.total_frames(),
+                            t.fps_rational(),
+                            t.state(),
+                            t.loop_enabled(),
+                        ),
+                        // A backend that loaded nothing cannot project a clip.
+                        None => return true,
+                    }
+                };
+                events.position(frame, total, fps_rational);
+                events.transport(state, loop_enabled);
+            }
             Err(e) => events.failed(e),
         },
         WorkerCommand::Preview => {
@@ -619,6 +655,15 @@ pub struct GpuEngineBackend {
     ///
     /// `Some` while a session is active; [`Self::session_active`] keys off it.
     session: Option<crate::transport::Transport>,
+    /// The transport built at `Import` time from the source's timing metadata,
+    /// or `None` before the first successful import.
+    ///
+    /// Distinct from `session`: this one exists from import (so the frontend can
+    /// learn the clip length and enable transport before a session starts), while
+    /// `session` only exists while a preview is ticking. [`Self::transport`]
+    /// prefers `session` and falls back to this, so a Play that lands before
+    /// `begin_preview` carries the real fps/frame count instead of a placeholder.
+    loaded: Option<crate::transport::Transport>,
     /// Whether the first presented frame of the current session still owes the
     /// A1 marker line (and the one-shot debug device-loss affordance).
     first_frame_marker_pending: bool,
@@ -788,6 +833,7 @@ impl GpuEngineBackend {
             blend_width: 0.05,
             rig_tilt: 0.0,
             session: None,
+            loaded: None,
             first_frame_marker_pending: true,
             last_frame_time: std::time::Instant::now(),
             window_width: 1280,
@@ -1119,6 +1165,14 @@ impl EngineBackend for GpuEngineBackend {
         self.input_size = Some((info.width, info.height));
         self.calibration = Some(cal);
         self.source = Some(source);
+
+        // Build the transport from the loaded source's timing metadata so a
+        // transport command issued before `begin_preview` carries the real
+        // fps/frame count instead of a placeholder (see [`Self::transport`]).
+        let transport = crate::transport::Transport::new(info.fps, info.fps_rational, {
+            self.source.as_ref().and_then(|s| s.total_frames())
+        });
+        self.loaded = Some(transport);
         Ok(())
     }
 
@@ -1413,12 +1467,27 @@ impl EngineBackend for GpuEngineBackend {
     }
 
     fn transport(&mut self) -> &mut crate::transport::Transport {
-        // The caller (`handle_command`) only reaches this for transport
-        // commands, which are only meaningful with a session. Lazily create a
-        // session-less transport so the borrow is total; it is replaced by
-        // `begin_preview` when a real session starts.
-        self.session
-            .get_or_insert_with(|| crate::transport::Transport::new(30.0, None, None))
+        // Prefer the live session; fall back to the transport `Import` built so a
+        // transport command issued before `begin_preview` still carries the real
+        // fps/frame count. Only with neither (a transport command before any
+        // import) is a placeholder materialized, and that path is unreachable
+        // from a handler that reports state - see [`Self::loaded_transport`].
+        if self.session.is_none() && self.loaded.is_none() {
+            self.session = Some(crate::transport::Transport::new(30.0, None, None));
+        }
+        // Destructure once so the two slots are borrowed disjointly; two
+        // sequential `as_mut()` borrows of `self` would overlap here.
+        let Self {
+            session, loaded, ..
+        } = self;
+        session
+            .as_mut()
+            .or(loaded.as_mut())
+            .expect("a session or an import-built transport is present")
+    }
+
+    fn loaded_transport(&self) -> Option<&crate::transport::Transport> {
+        self.loaded.as_ref()
     }
 
     fn set_chrome(&mut self, chrome: crate::presenter::ChromeState, events: &EventSink) {
@@ -1730,6 +1799,9 @@ mod tests {
         active_kind: crate::presenter::PresenterKind,
         /// The mock's current view mode (PREV-03).
         view_mode: crate::presenter::ViewMode,
+        /// The transport built by the mock's `import`, mirroring the real
+        /// backend so `loaded_transport` has something to report.
+        loaded: Option<crate::transport::Transport>,
     }
 
     impl MockBackend {
@@ -1740,6 +1812,7 @@ mod tests {
                     reco_control::pose_control::PoseControl::with_defaults(),
                 )),
                 session: None,
+                loaded: None,
                 total_frames: Some(5),
                 last_pushed_fov: Arc::new(std::sync::Mutex::new(None)),
                 import_fails: false,
@@ -1761,6 +1834,13 @@ mod tests {
             if self.import_fails {
                 return Err(WorkerError::Engine("synthetic import failure".to_string()));
             }
+            // Mirror the real backend: a successful import builds the transport
+            // from the source's timing so the handler can project it.
+            self.loaded = Some(crate::transport::Transport::new(
+                30.0,
+                Some((30, 1)),
+                self.total_frames,
+            ));
             Ok(())
         }
 
@@ -1825,6 +1905,10 @@ mod tests {
         fn transport(&mut self) -> &mut crate::transport::Transport {
             self.session
                 .get_or_insert_with(|| crate::transport::Transport::new(30.0, None, None))
+        }
+
+        fn loaded_transport(&self) -> Option<&crate::transport::Transport> {
+            self.loaded.as_ref()
         }
 
         fn set_chrome(&mut self, _chrome: crate::presenter::ChromeState, _events: &EventSink) {
@@ -1964,6 +2048,64 @@ mod tests {
                 "import finished",
                 "shutdown"
             ]
+        );
+    }
+
+    #[test]
+    fn import_projects_position_and_transport_so_the_frontend_can_play() {
+        // Phase 2 has no Import button — the app imports at startup — so the
+        // worker MUST publish the loaded clip's position + transport. The
+        // frontend transport store gates every action (`play`, `seek`, `step`,
+        // `set_loop`) on leaving its initial "empty" state, which only happens
+        // on these events. Without them Play is silently unreachable.
+        let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (worker, events) = EngineWorker::spawn(MockBackend::new(ops));
+        let handle = worker.handle();
+        handle.send(WorkerCommand::Import).unwrap();
+        handle.send(WorkerCommand::Shutdown).unwrap();
+
+        let seen = drain_until_shutdown(&events);
+
+        let position_idx = seen
+            .iter()
+            .position(|e| matches!(e, WorkerEvent::Position { .. }))
+            .expect("import emits an authoritative Position event");
+        let transport_idx = seen
+            .iter()
+            .position(|e| matches!(e, WorkerEvent::Transport { .. }))
+            .expect("import emits an authoritative Transport event");
+
+        // Both projections must land AFTER the import completes: the frontend
+        // reads them as "a clip is loaded", so publishing them first would
+        // advertise a clip the worker has not opened yet.
+        let finished_idx = seen
+            .iter()
+            .position(
+                |e| matches!(e, WorkerEvent::Log { message, .. } if message == "import finished"),
+            )
+            .expect("'import finished' is emitted");
+        assert!(
+            position_idx > finished_idx,
+            "Position must follow 'import finished' (position={position_idx}, finished={finished_idx})"
+        );
+        assert!(
+            transport_idx > finished_idx,
+            "Transport must follow 'import finished' (transport={transport_idx}, finished={finished_idx})"
+        );
+
+        // The transport starts paused, not playing: an import must never start
+        // playback on its own.
+        let state = seen
+            .iter()
+            .find_map(|e| match e {
+                WorkerEvent::Transport { state, .. } => Some(*state),
+                _ => None,
+            })
+            .expect("a Transport event");
+        assert_eq!(
+            state,
+            crate::transport::TransportState::Paused,
+            "import must not begin playback"
         );
     }
 
@@ -2558,8 +2700,8 @@ mod tests {
         handle.send(WorkerCommand::Import).unwrap();
         handle.send(WorkerCommand::Preview).unwrap();
 
-        // Collect Position events in a background thread so they are not
-        // lost between measurement points.
+        // Collect Position events in a background thread so they are not lost
+        // between measurement points.
         let collected = Arc::new(std::sync::Mutex::new(Vec::new()));
         let collected_clone = Arc::clone(&collected);
         let events_clone = events;
@@ -2605,7 +2747,18 @@ mod tests {
 
         // Verify the frame index advances by exactly 1 between consecutive
         // ticks (no reset, no double-advance).
-        let frames = collected.lock().unwrap().clone();
+        //
+        // The leading frame-0 run is dropped first: Import publishes the loaded
+        // clip's position and Preview publishes the session start, so frame 0 is
+        // legitimately projected two or three times before the first tick
+        // advances it. Those are command-time projections, not ticks. Anything
+        // after the first advance — a reset to 0, a skipped or doubled step — is
+        // still caught by the windows below.
+        let frames: Vec<u64> = {
+            let all = collected.lock().unwrap().clone();
+            let first_advance = all.iter().position(|f| *f != 0).unwrap_or(all.len());
+            all[first_advance..].to_vec()
+        };
         assert!(
             frames.len() >= 4,
             "expected at least 4 Position events, got {}: {frames:?}",
@@ -2727,7 +2880,18 @@ mod tests {
 
         // Verify the frame index advances by exactly 1 between consecutive
         // ticks (no reset, no double-advance).
-        let frames = collected.lock().unwrap().clone();
+        //
+        // The leading frame-0 run is dropped first: Import publishes the loaded
+        // clip's position and Preview publishes the session start, so frame 0 is
+        // legitimately projected two or three times before the first tick
+        // advances it. Those are command-time projections, not ticks. Anything
+        // after the first advance — a reset to 0, a skipped or doubled step — is
+        // still caught by the windows below.
+        let frames: Vec<u64> = {
+            let all = collected.lock().unwrap().clone();
+            let first_advance = all.iter().position(|f| *f != 0).unwrap_or(all.len());
+            all[first_advance..].to_vec()
+        };
         assert!(
             frames.len() >= 4,
             "expected at least 4 Position events, got {}: {frames:?}",
