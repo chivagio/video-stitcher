@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# Interactive test for the Reco desktop app (Phase 1 walking skeleton).
+# Interactive test for the Reco desktop app (Phase 2 preview shell).
+#
+# Phase 2 imports the hardcoded clips AT STARTUP and its chrome has no Import
+# button: the transport bar is Step back / Play / Step forward / Loop. The full
+# manual checklist is .planning/phases/02-.../02-UAT.md.
 #
 # RUN THIS FROM AN SSH SESSION WITH X11 FORWARDING:
 #     ssh -X -Y <user>@<host>
@@ -61,6 +65,20 @@ else
 fi
 
 hdr "3. Build"
+# The Tauri bundle embeds ui/dist, and `cargo build -p reco-app` fails without
+# it, so build the frontend first on a fresh clone.
+if [ ! -f crates/reco-app/ui/dist/index.html ]; then
+  echo "Frontend bundle missing; building it (npm ci + vite build)..."
+  if ! command -v npm >/dev/null 2>&1; then
+    red "npm not found but ui/dist is missing."
+    echo "Install Node 20+, then re-run. Nothing else can build the webview."
+    exit 1
+  fi
+  (cd crates/reco-app && npm ci && npm run build) \
+    || { red "Frontend build failed."; exit 1; }
+fi
+grn "Frontend bundle present: crates/reco-app/ui/dist"
+
 if [ ! -x target/debug/reco-app ]; then
   echo "Binary not found; building (first build is slow)..."
   cargo build -p reco-app || { red "Build failed."; exit 1; }
@@ -69,30 +87,47 @@ grn "Binary present: target/debug/reco-app"
 
 hdr "4. Launching"
 cat <<'NOTES'
-What you should see:
+What you should see (Phase 2):
   * A window titled "Reco", about 1280x800.
-  * Bottom ~208px of UI: an event log pane above a row of three buttons
-    labelled  [Import]  [Start preview]  [Export]
-  * The large top area is TRANSPARENT/empty at first — that region is a
-    native GPU child view, not part of the web page.
+  * A RIGHT-HAND controls panel (Pose / FOV slider / view toggle / presenter
+    override) that collapses to a narrow rail.
+  * A BOTTOM transport bar: timeline, then Step back / Play / Step forward /
+    Loop / Log, then the presenter status badge.
+  * The large top-LEFT area is the preview: a native GPU child view, not a web
+    element. It is NOT painted by the webview, so it looks empty over a plain
+    background until the panorama is presented.
 
 Drive it in this order:
-  1. Click [Import]         -> log shows "import started" / "import finished";
-                               the button greys out while working.
-  2. Click [Start preview]  -> the TOP AREA fills with the stitched panorama
-                               (colour-bar test footage), live at ~30fps;
-                               log shows "...presented 60 frame(s)".
-  3. Click [Export]         -> log shows "export started" / "export finished";
-                               test-media/reco-app-export.mp4 is (re)written.
+  1. DO NOT look for an Import button - there isn't one. The app imports the
+     hardcoded clips at startup. The log drawer should show, in order:
+         import started
+         import finished
+         transport: Paused, loop off
+         position: frame 0/N @ 30000/1001
+  2. Press Play (or Space) -> the top-left area fills with the stitched
+     panorama, live at ~30fps, and the log shows
+         preview session started
+         A1 verdict: engine worker presented a stitched frame ...
+  3. Wheel over the preview     -> FOV readout changes.
+     Drag over the preview      -> yaw/pitch readout changes.
+     Shift + arrow               -> the pose nudges.
+     Drag the timeline           -> seeks; the accent fill follows the playhead.
+  4. Toggle the view (or press V) -> the two raw sources appear tiled left|right.
+  5. Export is not on the transport bar in Phase 2; skip it.
 
 Then close the window and confirm this terminal prints:
       engine worker stopped cleanly
 (That line is the FOUND-06 clean-teardown check.)
 
 What to report back if something is wrong:
-  * Which step failed, and the exact log line shown in the event pane.
-  * Whether the panorama appeared in the TOP region (vs a black box or nothing).
+  * Which step failed, and the exact line shown in the log drawer.
+  * Whether the panorama appeared in the TOP-LEFT region (vs a black box or
+    nothing), and whether the status badge says "Native".
   * The last ~15 lines of this terminal's output.
+
+The definitive checklist - including the checks that only a human with a GPU,
+a real window, and a compositor can make - is:
+      .planning/phases/02-zero-copy-preview-playback-pose/02-UAT.md
 NOTES
 echo
 set -x
