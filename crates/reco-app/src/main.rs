@@ -122,7 +122,13 @@ fn run_skeleton(app: &mut tauri::App) -> Result<(), SkeletonError> {
     // selects among these; here they are prepared and handed to the app.
     let preview_window = build_preview_window(app)?;
     let separate_window_presenter =
-        presenter::separate_window::SeparateWindowPresenter::new(preview_window, &instance, rect)?;
+        match presenter::separate_window::SeparateWindowPresenter::new(preview_window, &instance, rect) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                log::warn!("separate-window presenter unavailable, falling back to readback: {e}");
+                None
+            }
+        };
 
     // Full-window transparent chrome webview: it is an absolutely positioned set
     // of opaque panels that tiles around the transparent preview hole. Pointer
@@ -133,17 +139,16 @@ fn run_skeleton(app: &mut tauri::App) -> Result<(), SkeletonError> {
     // three are pre-created here on the setup thread; the worker installs the
     // active one and can swap at a tick boundary on a manual override (Task 3).
     // Readback is trivially cheap (no surface; it shares the worker's device).
-    let presenter_chain: worker::PresenterChain = vec![
+    let mut presenter_chain: worker::PresenterChain = vec![
         (presenter::PresenterKind::Native, Box::new(presenter)),
-        (
-            presenter::PresenterKind::SeparateWindow,
-            Box::new(separate_window_presenter),
-        ),
-        (
-            presenter::PresenterKind::Readback,
-            Box::new(presenter::readback::ReadbackPresenter::new(rect)),
-        ),
     ];
+    if let Some(separate) = separate_window_presenter {
+        presenter_chain.push((presenter::PresenterKind::SeparateWindow, Box::new(separate)));
+    }
+    presenter_chain.push((
+        presenter::PresenterKind::Readback,
+        Box::new(presenter::readback::ReadbackPresenter::new(rect)),
+    ));
 
     // Ownership handoff (FOUND-03): the device is created *inside* the worker
     // from the presenter's surface, so the worker is the sole device owner.
