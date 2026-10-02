@@ -6,8 +6,8 @@
 #   * the native X11 child view (wgpu::Surface) is composited BELOW a full-window
 #     Tauri webview (z-order asserted from `xwininfo -tree`);
 #   * pointer events over the preview region reach the webview, not the native
-#     child (asserted by driving Import -> Start preview through the webview via
-#     `xdotool`, which requires the click to land on the webview-owned buttons);
+#     child (asserted by driving Play through the webview via `xdotool`, which
+#     requires the click to land on the webview-owned buttons);
 #   * the stitched panorama actually renders and presents (`A1 verdict` /
 #     `preview presented N frame(s)` in the worker log).
 #
@@ -168,7 +168,7 @@ echo "PHASE2 PROBE: native child ${NATIVE_CHILD} = ${NATIVE_W}x${NATIVE_H} (L-sh
 TOP_CHILD_ID="${CHILD_IDS[-1]}"
 echo "PHASE2 PROBE: topmost child = ${TOP_CHILD_ID}"
 
-# --------------------------------------------------- drive import -> preview
+# --------------------------------------------------- drive play (Phase 2 UI)
 
 sleep 1.5  # let the webview finish loading index.html
 
@@ -211,21 +211,18 @@ click_strip_until() {
 
 # (1) A click directly over the *preview region* (top-left, over the native
 # child) must reach the webview and not trigger an engine command. We click the
-# empty preview area and then assert no import/preview/export command started.
+# empty preview area and then assert no play/pause/seek command started.
 click_at 400 300
 sleep 1.0
-if log_grep -qE "import started|preview started|export started"; then
+if log_grep -qE "preview session started|transport: Playing|export started"; then
   fail "a click over the preview region triggered an engine command — pointer routing is wrong"
 fi
 echo "PHASE2 PROBE: preview-region click reached the webview without leaking to the native child"
 
-# (2) Import, then Start preview, via webview-owned buttons in the strip.
-click_strip_until "Import" "import (started|finished)" \
-  || fail "no import command after sweeping the transport strip — pointer events did not reach the webview buttons"
-wait_for_log "import finished" 30 || fail "no 'import finished' in the log"
-
-click_strip_until "Start preview" "preview started" \
-  || fail "no preview command after sweeping the transport strip — pointer events did not reach the webview buttons"
+# (2) Play via a webview-owned button in the strip. Phase 2 auto-imports on
+# startup (hardcoded clips), so the only command needed is Play.
+click_strip_until "Play" "preview session started" \
+  || fail "no play command after sweeping the transport strip — pointer events did not reach the webview buttons"
 
 # ---------------------------------------------------- assert engine progress
 
