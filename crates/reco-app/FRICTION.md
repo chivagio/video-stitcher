@@ -373,3 +373,43 @@ covered by the live observation (Play glyph 137 -> 232, timecode `0:00 / 0:00` -
 `0:00 / 0:02`). A mock-only test of a projection path cannot catch a wrong field
 on the real backend; see A5 for the same shape. Worth an assertion on the real
 backend's field reads once a GPU-free seam exists for it.
+
+## A11 — a mock that reimplements a decision hides the defect at the real site
+
+**Symptom.** Three separate defects reached a manual UAT run with a fully green
+suite: the wheel did nothing, Play did nothing after the clip ended, and Loop
+froze the UI. All three are in the end-of-source / input paths.
+
+**The wheel one is the generalisable lesson.** A wheel notch is a `ButtonPress`
+whose *detail* is 4/5 (X.h `Button4`/`Button5`) — its event type is
+`ButtonPress`, like any click. The press arm matched only `button == 1`, and a
+separate detail-based arm sat further down the `kind` match, unreachable because
+no wheel event can have any type other than `ButtonPress`. Every scroll was
+consumed and discarded, and dragging panned correctly the whole time, so the
+obvious "is input wired up at all" check passed.
+
+It survived review because the mapping lived inside an `unsafe` block next to a
+live `Display*`, where it reads as plumbing. Extracting `PointerState::apply_event`
+as a pure function of `(kind, button, x, y)` made it testable, and three of the
+six new tests fail when the original one-line bug is reintroduced.
+
+**The structural cause of the other two.** `MockBackend::tick_session`
+reimplemented the wrap-vs-end branch instead of sharing it. Mutating the real
+site — deferring the rewind to a pending seek, the actual defect — left every
+test green, because the mock never ran that code.
+
+That reimplementation was itself introduced by an earlier fix: making the mock
+carry the Loop flag across the session boundary meant teaching it the loop path
+too. A mock that gains behaviour tends to grow its own copy of the decision.
+
+**Consumer lesson.** A test double should call the same function the real
+implementation calls. When a mock has to *model* something (a source that
+exhausts, a window that steals input), model the thing — not the branch that
+reacts to it. `resolve_end_of_source` is now a provided trait method with one
+body, run by both backends.
+
+**Corollary.** Where a real cost is invisible to the double (a decode-pipeline
+respawn opening a CUDA context), assert on the observable proxy — the rewind
+count against the tick count — not on the thing you cannot see. `ticks >
+rewinds` is the invariant; a specific ratio would have over-fitted the clip
+length and was wrong on the first run.
