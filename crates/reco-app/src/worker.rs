@@ -396,6 +396,34 @@ pub trait EngineBackend: Send {
     /// placeholder-materialising side effect of [`Self::transport`].
     fn session_transport_mut(&mut self) -> Option<&mut crate::transport::Transport>;
 
+    /// Advance the transport by one frame after a successful present, and end
+    /// the session if the counter reached `total_frames`.
+    ///
+    /// Returns `true` when the session ended and the tick must stop.
+    ///
+    /// This is the **second** of the two endings, and it was previously
+    /// open-coded in the real backend as `self.session = None`: no
+    /// `preview reached end of source` line, and no `end_preview`, so
+    /// `carry_user_state` never mirrored the session back. It is a provided
+    /// method, and used inline, precisely so there is one copy — the user saw
+    /// seven `preview session started` lines with no ends because the
+    /// mock and the real backend each owned their own ending and only the real
+    /// one ran in production.
+    ///
+    /// Note the counter is a `duration × fps` **estimate** while the decoder
+    /// serves what the container holds, so this usually fires before the source
+    /// is provably dry — it is the ending that happens most often.
+    fn advance_session_after_frame(&mut self, events: &EventSink) -> Result<bool, WorkerError> {
+        let ended = self.session_transport_mut().is_some_and(|t| {
+            t.on_frame_advanced();
+            t.state() == crate::transport::TransportState::Ended
+        });
+        if ended {
+            self.resolve_end_of_source(events)?;
+        }
+        Ok(ended)
+    }
+
     /// Resolve a playing session that has run out of source.
     ///
     /// **The single place** the wrap-vs-end decision is made. It is a provided
@@ -1653,19 +1681,13 @@ impl EngineBackend for GpuEngineBackend {
                 }
                 // Advance the transport and emit the new position.
                 if playing {
-                    if let Some(t) = self.session.as_mut() {
-                        t.on_frame_advanced();
-                        let frame = t.frame();
-                        let total = t.total_frames();
-                        let fps_rational = t.fps_rational();
-                        let ended = t.state() == crate::transport::TransportState::Ended;
-                        if ended {
-                            events.transport(t.state(), t.loop_enabled());
-                        }
+                    if self.advance_session_after_frame(events)? {
+                        return Ok(());
+                    }
+                    if let Some(t) = self.session.as_ref() {
+                        let (frame, total, fps_rational) =
+                            (t.frame(), t.total_frames(), t.fps_rational());
                         events.position(frame, total, fps_rational);
-                        if ended {
-                            self.session = None;
-                        }
                     }
                 } else {
                     events.position(frame, self.session_total(), self.session_fps_rational());
@@ -2177,6 +2199,22 @@ mod tests {
         /// condition the real defect needed, and the reason `is_end_of_source`
         /// takes three arguments rather than testing the spent flag alone.
         warmup_ticks: u32,
+        /// Frames the fake source will serve, if overridden independently of
+        /// `total_frames`.
+        ///
+        /// The real source and the transport's total are two different numbers:
+        /// `total_frames` is a `duration × fps` **estimate**, while the decoder
+        /// serves however many frames the container actually holds. When the
+        /// estimate is short, the transport counter reaches `total_frames`
+        /// while the source still has frames — and that, not source exhaustion,
+        /// is the ending that fires in production (observed in the user's log as
+        /// seven `preview session started` lines and zero ends). Using one value
+        /// for both meant the mock could only ever end the source-driven way,
+        /// leaving that path untested.
+        ///
+        /// `None` means "the source serves `total_frames`", which keeps every
+        /// existing test's arithmetic unchanged.
+        source_frames: Option<u64>,
     }
 
     impl MockBackend {
@@ -2199,6 +2237,7 @@ mod tests {
                 frames_served: 0,
                 source_exhausted: false,
                 warmup_ticks: 0,
+                source_frames: None,
             }
         }
 
@@ -2309,7 +2348,12 @@ mod tests {
             } else {
                 if !self.source_exhausted {
                     self.frames_served += 1;
-                    if self.frames_served >= self.total_frames.unwrap_or(u64::MAX) {
+                    // The source's own length, which defaults to the transport
+                    // total but can exceed it -- see `source_frames`.
+                    let source_len = self
+                        .source_frames
+                        .unwrap_or_else(|| self.total_frames.unwrap_or(u64::MAX));
+                    if self.frames_served >= source_len {
                         self.source_exhausted = true;
                     }
                 }
@@ -2326,11 +2370,16 @@ mod tests {
                 if self.session.is_none() {
                     return Ok(());
                 }
-            } else if frame_available && let Some(t) = self.session.as_mut() {
-                // Only a delivered frame advances the playhead. During warm-up
-                // no frame arrives, so the position must hold -- the session
-                // stays alive but does not pretend to play.
-                t.on_frame_advanced();
+            } else if frame_available {
+                // A delivered frame advances the playhead; during warm-up no
+                // frame arrives, so the position holds and the session stays
+                // alive without pretending to play. `advance_session_after_frame`
+                // does the advancing AND the second ending check in one step --
+                // calling `on_frame_advanced` here as well would advance twice
+                // and jump the frame index by two per tick.
+                if self.advance_session_after_frame(events)? {
+                    return Ok(());
+                }
             }
             let (frame, total, fps_rational) = self
                 .session
@@ -3054,6 +3103,61 @@ mod tests {
         assert!(!t.loop_enabled());
         assert_eq!(t.state(), crate::transport::TransportState::Paused);
         assert_eq!(t.frame(), 0);
+    }
+
+    #[test]
+    fn a_clip_that_reaches_its_transport_total_ends_through_the_shared_resolver() {
+        // Regression, observed live: seven `preview session started` lines and
+        // ZERO `preview reached end of source` lines. The ending was open-coded
+        // as `self.session = None`, so it logged nothing and never called
+        // `end_preview` -- meaning `carry_user_state` never mirrored user-set
+        // state back to the loaded transport at the end of a clip.
+        //
+        // `source_frames` exceeds `total_frames` deliberately: in production
+        // `total_frames` is a `duration × fps` ESTIMATE while the decoder serves
+        // whatever the container actually holds, so the transport counter
+        // usually reaches the total first. That is this path, and it is the one
+        // that fired in the user's log -- while the mock, using one number for
+        // both, could only ever end the source-driven way.
+        let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut mock = MockBackend::new(Arc::clone(&ops));
+        mock.total_frames = Some(5);
+        mock.source_frames = Some(1_000_000);
+        let (worker, events) = EngineWorker::spawn(mock);
+        let handle = worker.handle();
+        handle.send(WorkerCommand::Import).unwrap();
+        handle.send(WorkerCommand::Preview).unwrap();
+
+        let start = std::time::Instant::now();
+        while start.elapsed() < Duration::from_millis(500) {
+            if ops.lock().unwrap().contains(&"end_preview") {
+                break;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        handle.send(WorkerCommand::Shutdown).unwrap();
+        let seen = drain_until_shutdown(&events);
+        let _ = worker.join(Duration::from_secs(2));
+
+        let recorded = ops.lock().unwrap().clone();
+        assert!(
+            recorded.contains(&"end_preview"),
+            "reaching the transport total must call end_preview, so user state is \
+             mirrored back: {recorded:?}"
+        );
+        assert!(
+            seen.iter()
+                .any(|e| matches!(e, WorkerEvent::Log { message, .. }
+                    if message == "preview reached end of source")),
+            "the ending must be logged -- sessions starting with no matching end \
+             line is exactly what was reported: {recorded:?}"
+        );
+        assert!(
+            recorded.iter().filter(|o| **o == "rewind").count() == 1,
+            "exactly one rewind, from begin_preview -- the ending itself must not \
+             respawn the decode pipeline, since the source still had frames: \
+             {recorded:?}"
+        );
     }
 
     #[test]
