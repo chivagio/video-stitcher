@@ -103,6 +103,59 @@ struct PointerState {
     wheel_notches: f32,
 }
 
+impl PointerState {
+    /// Fold one raw X event into the accumulated gesture state.
+    ///
+    /// Split out of the `XCheckWindowEvent` drain loop so the mapping is
+    /// testable without a live X server. That matters: the wheel was previously
+    /// matched in an arm that no wheel event can ever reach (the event's *type*
+    /// is `ButtonPress`, like any click), so every scroll was consumed and
+    /// dropped while dragging panned correctly. The defect was invisible to
+    /// review because the mapping was buried in an unsafe block next to a real
+    /// `Display*`.
+    ///
+    /// `kind`/`button` are the raw `XEvent.type_` and `XButtonEvent.button`;
+    /// `x`/`y` are child-window coordinates.
+    fn apply_event(&mut self, kind: i32, button: c_uint, x: f32, y: f32) {
+        match kind {
+            xlib::ButtonPress => match button {
+                1 => {
+                    self.pressed = true;
+                    self.last_x = x;
+                    self.last_y = y;
+                }
+                // The wheel arrives as a ButtonPress whose *detail* is 4/5, so it
+                // has to be matched here by detail. See the note above.
+                WHEEL_UP_BUTTON => self.wheel_notches += 1.0,
+                WHEEL_DOWN_BUTTON => self.wheel_notches -= 1.0,
+                // Buttons 2/3 and up: not bound to anything.
+                _ => {}
+            },
+            xlib::MotionNotify => {
+                if self.pressed {
+                    self.drag_dx += x - self.last_x;
+                    self.drag_dy += y - self.last_y;
+                    self.last_x = x;
+                    self.last_y = y;
+                }
+            }
+            xlib::ButtonRelease => {
+                // A release must NOT discard the last few pixels of a drag, so
+                // the accumulators are left alone. The wheel's release (detail
+                // 4/5) also lands here and is ignored, which is correct: only
+                // the press carries direction, and counting both would double
+                // every notch.
+                if button == 1 {
+                    self.pressed = false;
+                }
+            }
+            // Everything else the mask admits (EnterNotify, LeaveNotify,
+            // FocusIn/Out, ...): no pose meaning.
+            _ => {}
+        }
+    }
+}
+
 /// Install an X error handler that logs and swallows the benign teardown errors
 /// our foreign child window can provoke, instead of letting GDK abort.
 ///
@@ -850,50 +903,15 @@ impl SurfacePresenter for X11Presenter {
             // written by `XCheckWindowEvent` for a matching event, and each
             // payload read is gated on that event's own type, so the correct
             // variant is active.
-            let (kind, detail, button, x, y) = unsafe {
+            let (kind, button, x, y) = unsafe {
                 (
                     event.type_,
-                    event.any.send_event,
                     event.button.button,
                     event.button.x,
                     event.button.y,
                 )
             };
-            let _ = detail;
-            match kind {
-                xlib::ButtonPress => {
-                    // Only the primary button pans; 4/5 are the wheel, handled
-                    // below, and anything else (buttons 2/3 and up) is ignored.
-                    if button == 1 {
-                        state.pressed = true;
-                        state.last_x = x as f32;
-                        state.last_y = y as f32;
-                    }
-                }
-                xlib::MotionNotify => {
-                    if state.pressed {
-                        state.drag_dx += x as f32 - state.last_x;
-                        state.drag_dy += y as f32 - state.last_y;
-                        state.last_x = x as f32;
-                        state.last_y = y as f32;
-                    }
-                }
-                xlib::ButtonRelease => {
-                    // A release must NOT discard the last few pixels of a drag,
-                    // so the accumulators are left alone for this drain. The
-                    // release of the wheel arrives here too and is ignored.
-                    if button == 1 {
-                        state.pressed = false;
-                    }
-                }
-                _ => match button {
-                    // Wheel arrives as a press (4 = up, 5 = down) followed by a
-                    // release; only the press carries the direction.
-                    WHEEL_UP_BUTTON => state.wheel_notches += 1.0,
-                    WHEEL_DOWN_BUTTON => state.wheel_notches -= 1.0,
-                    _ => {}
-                },
-            }
+            state.apply_event(kind, button, x as f32, y as f32);
         }
 
         let gesture = PointerGesture {
@@ -974,5 +992,123 @@ impl X11Presenter {
             (self.xlib.XDestroyWindow)(self.display, child.get());
             (self.xlib.XFlush)(self.display);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A wheel notch is a `ButtonPress` whose *detail* is 4 or 5 (X.h:
+    /// `Button4`/`Button5`) — its type is `ButtonPress`, not a distinct event
+    /// type. This is the regression that made scrolling do nothing: the press
+    /// arm matched only detail 1 and discarded the rest, and a separate
+    /// detail-based arm further down was unreachable because no wheel event can
+    /// have a type other than `ButtonPress`.
+    #[test]
+    fn wheel_press_accumulates_notches_with_the_right_sign() {
+        let mut state = PointerState::default();
+
+        state.apply_event(xlib::ButtonPress, WHEEL_UP_BUTTON, 100.0, 100.0);
+        state.apply_event(xlib::ButtonPress, WHEEL_UP_BUTTON, 100.0, 100.0);
+
+        assert_eq!(
+            state.wheel_notches, 2.0,
+            "two scroll-up presses must be two notches (positive = scroll up)"
+        );
+        assert!(
+            !state.pressed,
+            "a wheel notch must not start a drag: scrolling over the preview \
+             must not also pan it"
+        );
+        assert_eq!(state.drag_dx, 0.0, "scrolling must not pan");
+
+        state.apply_event(xlib::ButtonPress, WHEEL_DOWN_BUTTON, 100.0, 100.0);
+        assert_eq!(state.wheel_notches, 1.0, "scroll down must subtract");
+    }
+
+    /// The wheel's release carries the same detail as its press. Counting it
+    /// would double every notch, so a press+release pair is exactly one.
+    #[test]
+    fn wheel_release_is_ignored_so_each_notch_counts_once() {
+        let mut state = PointerState::default();
+
+        state.apply_event(xlib::ButtonPress, WHEEL_UP_BUTTON, 10.0, 10.0);
+        state.apply_event(xlib::ButtonRelease, WHEEL_UP_BUTTON, 10.0, 10.0);
+
+        assert_eq!(
+            state.wheel_notches, 1.0,
+            "a press+release pair is one notch, not two"
+        );
+    }
+
+    /// Scroll and drag are independent: notching the wheel while a drag is in
+    /// flight must not disturb the drag's accumulated travel.
+    #[test]
+    fn wheel_and_drag_do_not_interfere() {
+        let mut state = PointerState::default();
+
+        state.apply_event(xlib::ButtonPress, 1, 50.0, 50.0);
+        state.apply_event(xlib::MotionNotify, 0, 70.0, 50.0);
+        state.apply_event(xlib::ButtonPress, WHEEL_UP_BUTTON, 70.0, 50.0);
+        state.apply_event(xlib::MotionNotify, 0, 90.0, 50.0);
+
+        assert_eq!(state.drag_dx, 40.0, "drag travel must survive a notch");
+        assert_eq!(state.wheel_notches, 1.0);
+        assert!(state.pressed, "the drag is still held");
+    }
+
+    /// Motion with no button held must not pan — this is the guard that keeps a
+    /// stray pointer pass across the preview from moving the camera.
+    #[test]
+    fn motion_without_the_primary_button_does_not_pan() {
+        let mut state = PointerState::default();
+
+        state.apply_event(xlib::MotionNotify, 0, 200.0, 200.0);
+
+        assert_eq!(state.drag_dx, 0.0);
+        assert_eq!(state.drag_dy, 0.0);
+    }
+
+    /// Buttons 2/3 (middle/right) are not bound to anything, and must not be
+    /// mistaken for the wheel (which is 4/5).
+    #[test]
+    fn middle_and_right_buttons_do_nothing() {
+        let mut state = PointerState::default();
+
+        state.apply_event(xlib::ButtonPress, 2, 10.0, 10.0);
+        state.apply_event(xlib::ButtonPress, 3, 10.0, 10.0);
+        state.apply_event(xlib::MotionNotify, 0, 90.0, 90.0);
+
+        assert!(!state.pressed, "only button 1 may start a drag");
+        assert_eq!(state.wheel_notches, 0.0, "2/3 are not wheel notches");
+        assert_eq!(state.drag_dx, 0.0);
+    }
+
+    /// A drag spanning two drains is one continuous drag: `pressed` and the
+    /// last position persist, while the per-drain accumulators are reset by
+    /// `take_pointer_gesture`.
+    #[test]
+    fn a_drag_across_two_drains_is_continuous() {
+        let mut state = PointerState::default();
+
+        state.apply_event(xlib::ButtonPress, 1, 0.0, 0.0);
+        state.apply_event(xlib::MotionNotify, 0, 10.0, 0.0);
+
+        // First drain: take the gesture and reset the accumulators, exactly as
+        // `take_pointer_gesture` does.
+        let first = state.drag_dx;
+        state.drag_dx = 0.0;
+        state.drag_dy = 0.0;
+        state.wheel_notches = 0.0;
+
+        state.apply_event(xlib::MotionNotify, 0, 25.0, 0.0);
+
+        assert_eq!(first, 10.0);
+        assert_eq!(
+            state.drag_dx, 15.0,
+            "the second drain must measure from the position the first ended at"
+        );
+        assert!(state.pressed, "the button is still held across drains");
     }
 }

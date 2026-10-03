@@ -382,6 +382,61 @@ pub trait EngineBackend: Send {
     /// falls through the chain and reports the reason.
     fn set_presenter(&mut self, kind: crate::presenter::PresenterKind, events: &EventSink);
 
+    /// Position the source back at frame 0 so playback (or a loop wrap) can pull
+    /// frames again.
+    ///
+    /// A source that has run out stays exhausted: `try_next_frame` returns `None`
+    /// forever after. So both a loop wrap and a fresh session over a spent
+    /// source must rewind, or the very next tick reads as end-of-source and the
+    /// clip appears not to play at all. Must be a no-op-safe error rather than a
+    /// silent skip — a failed rewind is a real failure to report.
+    fn rewind_for_loop(&mut self) -> Result<(), WorkerError>;
+
+    /// The live session's transport, or `None` when idle — without the
+    /// placeholder-materialising side effect of [`Self::transport`].
+    fn session_transport_mut(&mut self) -> Option<&mut crate::transport::Transport>;
+
+    /// Resolve a playing session that has run out of source.
+    ///
+    /// **The single place** the wrap-vs-end decision is made. It is a provided
+    /// method on purpose: the mock used to reimplement this branch, and a
+    /// mutation at the real site (deferring the rewind to a pending transport
+    /// seek) then left every test green.
+    ///
+    /// With Loop on, the SOURCE is rewound and the session keeps playing. With
+    /// Loop off, the transport is marked ended and the session is dropped.
+    ///
+    /// The rewind happens HERE, inline, and that is load-bearing. Leaving it as a
+    /// pending transport seek for the next tick looks equivalent but is not: an
+    /// exhausted source keeps returning no frame, so the very next tick read as
+    /// end-of-source again and queued another wrap, and every executed seek
+    /// respawned the whole decode pipeline — two fresh decoders, each opening a
+    /// CUDA context. On a short clip that respawned many times per second until
+    /// the GPU was starved (CUDA_ERROR_OUT_OF_MEMORY, NVDEC falling back to
+    /// software) and the app stopped accepting input.
+    fn resolve_end_of_source(&mut self, events: &EventSink) -> Result<(), WorkerError> {
+        let looping = self
+            .session_transport_mut()
+            .is_some_and(|t| t.loop_enabled());
+        if looping {
+            self.rewind_for_loop()?;
+            if let Some(t) = self.session_transport_mut() {
+                t.request_seek(0);
+                t.mark_seeking_done(0);
+            }
+            return Ok(());
+        }
+        events.info("preview reached end of source");
+        if let Some(t) = self.session_transport_mut() {
+            t.mark_ended();
+            events.transport(t.state(), t.loop_enabled());
+            let (frame, total, fps_rational) = (t.frame(), t.total_frames(), t.fps_rational());
+            events.position(frame, total, fps_rational);
+        }
+        self.end_preview(events);
+        Ok(())
+    }
+
     /// Which presenter in the chain is currently active (PREV-05).
     fn active_presenter(&self) -> crate::presenter::PresenterKind;
 
@@ -1360,6 +1415,17 @@ impl EngineBackend for GpuEngineBackend {
         events.transport(transport.state(), transport.loop_enabled());
         self.session = Some(transport);
         self.first_frame_marker_pending = true;
+
+        // Rewind a source left exhausted by a previous session, or the new
+        // session gets nothing from it.
+        //
+        // `end_preview` drops the session transport but the SOURCE keeps its
+        // decode state, so after a clip runs to its end `try_next_frame` returns
+        // `None` forever. Pressing Play again built a fresh session transport
+        // against that dead source: the first tick saw no frame, `at_end` fired
+        // immediately, and the clip "played" for zero frames -- Play looked dead
+        // after the first run.
+        self.rewind_for_loop()?;
         self.last_frame_time = std::time::Instant::now();
 
         // UI-SPEC E3: paint the idle/clear frame in the reserved region before
@@ -1466,19 +1532,7 @@ impl EngineBackend for GpuEngineBackend {
             Some(p) => p,
             None => {
                 if at_end {
-                    if self.session.as_ref().is_some_and(|t| t.loop_enabled()) {
-                        // Wrap: request a seek to 0 and keep playing.
-                        if let Some(t) = self.session.as_mut() {
-                            t.request_seek(0);
-                        }
-                        return Ok(());
-                    }
-                    events.info("preview reached end of source");
-                    if let Some(t) = self.session.as_mut() {
-                        t.mark_ended();
-                        events.transport(t.state(), t.loop_enabled());
-                    }
-                    self.end_preview(events);
+                    self.resolve_end_of_source(events)?;
                 }
                 return Ok(());
             }
@@ -1621,6 +1675,21 @@ impl EngineBackend for GpuEngineBackend {
         self.session = None;
     }
 
+    /// Position the source back at frame 0 so playback (or a loop wrap) can
+    /// actually pull frames again.
+    ///
+    /// A no-op when no source is loaded. Split out because two callers need it
+    /// for the same reason and getting it wrong is expensive: both a loop wrap
+    /// and a fresh `begin_preview` over an exhausted source must rewind, and a
+    /// source left exhausted makes every subsequent tick see end-of-source
+    /// immediately.
+    fn rewind_for_loop(&mut self) -> Result<(), WorkerError> {
+        let source = self.source.as_mut().ok_or(WorkerError::NotImported)?;
+        source
+            .seek(0)
+            .map_err(|e| WorkerError::Engine(e.to_string()))
+    }
+
     fn session_active(&self) -> bool {
         self.session.is_some()
     }
@@ -1647,6 +1716,10 @@ impl EngineBackend for GpuEngineBackend {
 
     fn loaded_transport(&self) -> Option<&crate::transport::Transport> {
         self.loaded.as_ref()
+    }
+
+    fn session_transport_mut(&mut self) -> Option<&mut crate::transport::Transport> {
+        self.session.as_mut()
     }
 
     fn publish_position(&mut self, events: &EventSink) {
@@ -2053,6 +2126,19 @@ mod tests {
         /// child's own window would have produced. `None` means "the user did
         /// not touch the panorama", so the ordinary idle case stays free.
         pending_gesture: Option<crate::presenter::pointer_input::PointerGesture>,
+        /// Frames the mock's fake source has served since its last rewind.
+        ///
+        /// The real backend's end-of-source is a property of the SOURCE (a spent
+        /// decode pipeline returning `None`), not of the transport's frame
+        /// counter — so looping has to rewind the source, and a session started
+        /// over a spent source gets nothing. This models that. When the mock
+        /// instead let `Transport::on_frame_advanced` wrap the frame on its own,
+        /// the mock never reached `rewind_for_loop`, and the loop path had no
+        /// test at all — which is how a respawn-the-decoders-on-every-wrap bug
+        /// shipped.
+        frames_served: u64,
+        /// Whether the fake source is spent (returns `None` until rewound).
+        source_exhausted: bool,
     }
 
     impl MockBackend {
@@ -2072,6 +2158,8 @@ mod tests {
                 active_kind: crate::presenter::PresenterKind::Native,
                 view_mode: crate::presenter::ViewMode::Panorama,
                 pending_gesture: None,
+                frames_served: 0,
+                source_exhausted: false,
             }
         }
 
@@ -2124,6 +2212,10 @@ mod tests {
             events.position(t.frame(), t.total_frames(), t.fps_rational());
             events.transport(t.state(), t.loop_enabled());
             self.session = Some(t);
+            // Mirror the real backend: a session over a spent source must rewind
+            // it, or the first tick sees no frame and ends the session again --
+            // which is why Play did nothing after the clip had run out.
+            self.rewind_for_loop()?;
             Ok(())
         }
 
@@ -2160,22 +2252,37 @@ mod tests {
                 let current = pose.current_pose();
                 events.pose(current.yaw, current.pitch, pose.current_fov_deg());
             }
-            // Advance the transport; if it reaches Ended (loop off), the session
-            // ends so the worker loop returns to a blocking recv.
-            if t.state() == crate::transport::TransportState::Playing {
-                t.on_frame_advanced();
-                let frame = t.frame();
-                let total = t.total_frames();
-                let fps_rational = t.fps_rational();
-                let ended = t.state() == crate::transport::TransportState::Ended;
-                if ended {
-                    events.transport(t.state(), t.loop_enabled());
-                }
-                events.position(frame, total, fps_rational);
-                if ended {
-                    self.session = None;
+            // Advance the transport, modelling the real tick's source-driven
+            // end-of-source: the fake source is spent once it has served
+            // `total_frames`, and only `rewind_for_loop` makes it serve again.
+            if t.state() != crate::transport::TransportState::Playing {
+                return Ok(());
+            }
+            if !self.source_exhausted {
+                self.frames_served += 1;
+                if self.frames_served >= self.total_frames.unwrap_or(u64::MAX) {
+                    self.source_exhausted = true;
                 }
             }
+            if self.source_exhausted {
+                // The shared resolver -- NOT a mock reimplementation. The mock
+                // used to own this branch, which is exactly why a mutation at
+                // the real site (defer the rewind) left the tests green.
+                self.resolve_end_of_source(events)?;
+                // With Loop off the resolver drops the session, so there is no
+                // position left to publish -- and the tick ends here.
+                if self.session.is_none() {
+                    return Ok(());
+                }
+            } else if let Some(t) = self.session.as_mut() {
+                t.on_frame_advanced();
+            }
+            let (frame, total, fps_rational) = self
+                .session
+                .as_ref()
+                .map(|t| (t.frame(), t.total_frames(), t.fps_rational()))
+                .expect("a session is present");
+            events.position(frame, total, fps_rational);
             Ok(())
         }
 
@@ -2210,6 +2317,10 @@ mod tests {
 
         fn loaded_transport(&self) -> Option<&crate::transport::Transport> {
             self.loaded.as_ref()
+        }
+
+        fn session_transport_mut(&mut self) -> Option<&mut crate::transport::Transport> {
+            self.session.as_mut()
         }
 
         fn publish_position(&mut self, events: &EventSink) {
@@ -2285,6 +2396,16 @@ mod tests {
             self.record("set_presenter");
             self.active_kind = kind;
             events.presenter(kind, None);
+        }
+
+        fn rewind_for_loop(&mut self) -> Result<(), WorkerError> {
+            // Records the rewind so a test can count wraps; the real cost (a
+            // decode-pipeline respawn) is invisible here, which is exactly why
+            // the wrap count is the thing worth asserting on.
+            self.record("rewind");
+            self.frames_served = 0;
+            self.source_exhausted = false;
+            Ok(())
         }
 
         fn active_presenter(&self) -> crate::presenter::PresenterKind {
@@ -2960,6 +3081,119 @@ mod tests {
         assert!(
             mock.session.as_ref().expect("session").loop_enabled(),
             "loop set during a session must survive the session ending"
+        );
+    }
+
+    #[test]
+    fn looping_rewinds_the_source_once_per_wrap_not_once_per_tick() {
+        // Regression, observed live: with Loop on the app played continuously but
+        // became unresponsive, and the log filled with
+        // `cuCtxCreate ... CUDA_ERROR_OUT_OF_MEMORY` plus repeated
+        // `left/right decoder: software` lines. The wrap was left as a *pending
+        // transport seek* for the next tick, but the source was already spent,
+        // so every subsequent tick read as end-of-source and queued another wrap
+        // -- and each executed seek respawned both decoders, opening a fresh CUDA
+        // context apiece, until the GPU was starved.
+        let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut mock = MockBackend::new(Arc::clone(&ops));
+        mock.total_frames = Some(2);
+        let (worker, _events) = EngineWorker::spawn(mock);
+        let handle = worker.handle();
+        handle.send(WorkerCommand::Import).unwrap();
+        handle.send(WorkerCommand::SetLoop(true)).unwrap();
+        handle.send(WorkerCommand::Preview).unwrap();
+
+        let start = std::time::Instant::now();
+        while start.elapsed() < Duration::from_millis(500) {
+            if ops
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|o| **o == "rewind")
+                .count()
+                >= 8
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        handle.send(WorkerCommand::Shutdown).unwrap();
+        let _ = worker.join(Duration::from_secs(2));
+
+        let recorded = ops.lock().unwrap().clone();
+        let ticks = recorded.iter().filter(|o| **o == "tick").count();
+        let rewinds = recorded.iter().filter(|o| **o == "rewind").count();
+        assert!(
+            ticks >= 8 && rewinds >= 4,
+            "expected repeated wraps, saw {ticks} ticks / {rewinds} rewinds"
+        );
+        // The defect signature: the source was spent, so EVERY tick read as
+        // end-of-source and queued a wrap -- rewinds ≈ ticks. Correct behaviour
+        // is one rewind per wrap, and a wrap takes at least as many ticks as the
+        // clip has frames, so ticks must exceed rewinds strictly. The clip here
+        // is 2 frames, so the healthy ratio is 2 ticks per rewind; requiring
+        // exactly that would over-fit, `ticks > rewinds` is the real invariant.
+        assert!(
+            ticks > rewinds,
+            "the source is being rewound at least once per tick ({ticks} ticks / \
+             {rewinds} rewinds) -- that is the respawn storm, not one rewind per wrap"
+        );
+    }
+
+    #[test]
+    fn pressing_play_after_the_clip_ends_replays_it() {
+        // Regression, observed live: the clip played once and then Play did nothing
+        // however many times it was pressed. `end_preview` drops the session
+        // transport but leaves the SOURCE spent, so the next `begin_preview` built a
+        // fresh session against a dead source -- the first tick saw no frame, read as
+        // end-of-source, and ended again, every time.
+        let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut mock = MockBackend::new(Arc::clone(&ops));
+        mock.total_frames = Some(2);
+        let (worker, _events) = EngineWorker::spawn(mock);
+        let handle = worker.handle();
+        handle.send(WorkerCommand::Import).unwrap();
+
+        handle.send(WorkerCommand::Preview).unwrap();
+        let start = std::time::Instant::now();
+        while start.elapsed() < Duration::from_millis(500) {
+            if ops.lock().unwrap().contains(&"end_preview") {
+                break;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert!(
+            ops.lock().unwrap().contains(&"end_preview"),
+            "the first run must reach the end of the source"
+        );
+
+        let before = ops.lock().unwrap().len();
+        handle.send(WorkerCommand::Play).unwrap();
+        let start = std::time::Instant::now();
+        while start.elapsed() < Duration::from_millis(500) {
+            if ops.lock().unwrap()[before..]
+                .iter()
+                .filter(|o| **o == "tick")
+                .count()
+                >= 2
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        handle.send(WorkerCommand::Shutdown).unwrap();
+        let _ = worker.join(Duration::from_secs(2));
+
+        let recorded = ops.lock().unwrap().clone();
+        let second_run_ticks = recorded[before..].iter().filter(|o| **o == "tick").count();
+        assert!(
+            second_run_ticks >= 2,
+            "Play after the end must replay the clip, saw {second_run_ticks} ticks in \
+         the second run: {recorded:?}"
+        );
+        assert!(
+            recorded[before..].contains(&"rewind"),
+            "the replay must rewind the spent source: {recorded:?}"
         );
     }
 

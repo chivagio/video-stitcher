@@ -326,3 +326,50 @@ the live drag assertion in `scripts/phase2-chrome-probe.sh`. Unrelatedly, the
 unified drag/wheel path in `PoseControl` (`drag_deg_per_pixel`, `wheel_fov_per_tick`,
 `invert_drag_x`/`y`) is now unused by this consumer — it is a second place the same
 conversion is configured, and the two will drift.
+
+## A10 — a fire-and-forget event bridge silently drops the opening projection
+
+**Symptom.** After a host reboot, the app rendered correctly but Play was
+greyed out with no error anywhere, the clip length read `0:00 / 0:00`, and the
+panel showed default pose values. The import had plainly succeeded (the log
+shows `import finished` and both NVDEC decoders opening).
+
+**Cause.** `install_event_bridge` does `Emitter::emit(&app, "worker-event", …)`
+per event, and Tauri's `emit` is a fan-out to the listeners registered *at that
+moment*. The worker is spawned in `setup()` and imports immediately, so its
+first position/transport/pose/view events fire roughly a second into startup —
+before the webview has loaded its bundle and run `listen`. They are dropped with
+no error, because there is no listener to receive them and no error to report.
+
+The frontend then sits in its initial `status: "empty"`, which gates every
+transport action. Nothing in the UI says "waiting for the worker"; it just looks
+disabled.
+
+**Why it hid for so long.** Every other Phase 2 symptom was verified through
+*later* commands (panel toggle, view switch, Play once reachable), and those all
+emit after the listener is registered. So the only thing being dropped was the
+one projection that happens before boot completes. The same race also silently
+breaks a webview reload: every projection since boot is missed, so the UI comes
+back empty with no reload-time recovery.
+
+**Fix.** `republish_projection` — the frontend subscribes, *then* asks the
+worker to re-assert the whole projection. Two consequences worth keeping:
+
+- Ordering is load-bearing. The reconcile must land after `listen` resolves, or
+  it is dropped the same way. This is why `App.svelte` now awaits the four
+  `init()` calls sequentially in one async task: the previous four independent
+  `void` calls had no defined order relative to the invoke.
+- It doubles as reload recovery, which is why it is a worker command and not a
+  frontend-side default. The frontend still never derives readiness itself.
+
+**Consumer lesson.** A projection the worker emits only once at startup is
+effectively a handshake with a listener that may not exist yet. Anything emitted
+before the frontend subscribes needs a pull-based counterpart. Where a store
+`init()` is fire-and-forget, the ordering it implies should be explicit.
+
+**Test-coverage gap (open).** The three tests drive `MockBackend`. The real
+`GpuEngineBackend::republish_projection` — the one that actually runs — is only
+covered by the live observation (Play glyph 137 -> 232, timecode `0:00 / 0:00` ->
+`0:00 / 0:02`). A mock-only test of a projection path cannot catch a wrong field
+on the real backend; see A5 for the same shape. Worth an assertion on the real
+backend's field reads once a GPU-free seam exists for it.
