@@ -473,6 +473,36 @@ pub trait EngineBackend: Send {
     fn shutdown(&mut self);
 }
 
+/// Whether a playing session that just failed to produce a frame has actually
+/// reached the end of the source.
+///
+/// **The three-way distinction is the whole point.** `try_next_frame` returns
+/// `Ok(None)` for two unrelated reasons:
+///
+/// - the decode channel is momentarily empty (`TryRecvError::Empty`) — the
+///   decoder threads are still working, or were just spawned;
+/// - the source has genuinely run out (`TryRecvError::Disconnected`, EOF).
+///
+/// Treating both as end-of-source killed the session on its *first* tick: after
+/// `begin_preview` respawns the decode pipeline, the new threads have not
+/// produced a frame yet, so `Ok(None)` arrived about 8ms in and the log read
+/// `preview session started` / `preview reached end of source` back to back for
+/// a 2-second clip. Play therefore appeared to do nothing, repeatedly.
+///
+/// With Loop on the same conflation drove the visible symptom: each bogus
+/// end-of-source triggered `resolve_end_of_source` → a rewind → a pipeline
+/// respawn → which is again not ready for the next tick → another rewind. Two
+/// fresh decoders every few milliseconds, each opening a CUDA context, until
+/// `cuCtxCreate` returned CUDA_ERROR_OUT_OF_MEMORY and the decoders fell back
+/// to software. The log flood the user reported.
+///
+/// `Source::is_exhausted` exists precisely to make this distinction ("distinguish
+/// finished from frame not ready yet"); `reco-core` documents it for interactive
+/// consumers such as this one.
+pub fn is_end_of_source(playing: bool, frame_available: bool, exhausted: bool) -> bool {
+    playing && !frame_available && exhausted
+}
+
 /// Handle a single command. Returns `false` when the loop should stop.
 fn handle_command<B: EngineBackend>(
     cmd: WorkerCommand,
@@ -1501,8 +1531,13 @@ impl EngineBackend for GpuEngineBackend {
         //    try_next_frame so a not-ready decode channel is a no-op; when
         //    paused-at-a-seek, do a blocking next_frame so the seek shows a
         //    frame immediately.
+        //
+        //    `exhausted` is read in the SAME borrow so it describes this exact
+        //    attempt: `try_next_frame` returns `Ok(None)` both when the channel
+        //    is merely not ready yet and when the source has genuinely run out,
+        //    and only `is_exhausted()` separates the two.
         let seeking = pending.is_some();
-        let pair = {
+        let (pair, exhausted) = {
             let source = self.source.as_mut().ok_or(WorkerError::NotImported)?;
             let frame_result = if playing || seeking {
                 if playing {
@@ -1517,25 +1552,23 @@ impl EngineBackend for GpuEngineBackend {
             } else {
                 None
             };
-            match frame_result {
+            let pair = match frame_result {
                 Some(reco_core::source::StereoFrame::Yuv420p(pair)) => Some(pair),
                 Some(_) => None,
                 None => None,
-            }
+            };
+            (pair, source.is_exhausted())
         };
 
-        // End-of-source handling: a `None` from a playing source that has
-        // exhausted (or a decode that produced no Yuv pair) ends the session
-        // unless looping.
-        let at_end = playing && pair.is_none();
+        // End-of-source handling. Ending requires an ACTUALLY spent source, not
+        // just an absent frame — see `is_end_of_source`.
+        if is_end_of_source(playing, pair.is_some(), exhausted) {
+            self.resolve_end_of_source(events)?;
+            return Ok(());
+        }
         let pair = match pair {
             Some(p) => p,
-            None => {
-                if at_end {
-                    self.resolve_end_of_source(events)?;
-                }
-                return Ok(());
-            }
+            None => return Ok(()),
         };
 
         // 4. Pose tick + FOV plumbing (PREV-04). Mirror the CLI's smooth_camera:
@@ -2139,6 +2172,11 @@ mod tests {
         frames_served: u64,
         /// Whether the fake source is spent (returns `None` until rewound).
         source_exhausted: bool,
+        /// Ticks during which the fake source yields nothing *without* being
+        /// spent — a freshly (re)spawned decode pipeline. This is the exact
+        /// condition the real defect needed, and the reason `is_end_of_source`
+        /// takes three arguments rather than testing the spent flag alone.
+        warmup_ticks: u32,
     }
 
     impl MockBackend {
@@ -2160,6 +2198,7 @@ mod tests {
                 pending_gesture: None,
                 frames_served: 0,
                 source_exhausted: false,
+                warmup_ticks: 0,
             }
         }
 
@@ -2253,28 +2292,44 @@ mod tests {
                 events.pose(current.yaw, current.pitch, pose.current_fov_deg());
             }
             // Advance the transport, modelling the real tick's source-driven
-            // end-of-source: the fake source is spent once it has served
-            // `total_frames`, and only `rewind_for_loop` makes it serve again.
+            // end-of-source: the fake source serves frames until it is spent,
+            // only `rewind_for_loop` makes it serve again, and right after a
+            // rewind it is not ready yet.
             if t.state() != crate::transport::TransportState::Playing {
                 return Ok(());
             }
-            if !self.source_exhausted {
-                self.frames_served += 1;
-                if self.frames_served >= self.total_frames.unwrap_or(u64::MAX) {
-                    self.source_exhausted = true;
+            // The warm-up window: freshly (re)spawned decode threads produce
+            // nothing for a beat. This is the condition that killed the real
+            // session on its first tick — `Ok(None)` with a source that is NOT
+            // spent. Modelled so a test can reproduce the exact input the bug
+            // needed, rather than only exercising the spent branch.
+            let (frame_available, exhausted) = if self.warmup_ticks > 0 {
+                self.warmup_ticks -= 1;
+                (false, false)
+            } else {
+                if !self.source_exhausted {
+                    self.frames_served += 1;
+                    if self.frames_served >= self.total_frames.unwrap_or(u64::MAX) {
+                        self.source_exhausted = true;
+                    }
                 }
-            }
-            if self.source_exhausted {
-                // The shared resolver -- NOT a mock reimplementation. The mock
-                // used to own this branch, which is exactly why a mutation at
-                // the real site (defer the rewind) left the tests green.
+                (!self.source_exhausted, self.source_exhausted)
+            };
+            // The shared predicate -- NOT `if self.source_exhausted`. Checking
+            // only the spent flag would let this test suite pass against a real
+            // tick that ends the session on any absent frame, which is exactly
+            // the defect (FRICTION A12).
+            if is_end_of_source(true, frame_available, exhausted) {
                 self.resolve_end_of_source(events)?;
                 // With Loop off the resolver drops the session, so there is no
                 // position left to publish -- and the tick ends here.
                 if self.session.is_none() {
                     return Ok(());
                 }
-            } else if let Some(t) = self.session.as_mut() {
+            } else if frame_available && let Some(t) = self.session.as_mut() {
+                // Only a delivered frame advances the playhead. During warm-up
+                // no frame arrives, so the position must hold -- the session
+                // stays alive but does not pretend to play.
                 t.on_frame_advanced();
             }
             let (frame, total, fps_rational) = self
@@ -2405,6 +2460,9 @@ mod tests {
             self.record("rewind");
             self.frames_served = 0;
             self.source_exhausted = false;
+            // The freshly spawned pipeline produces nothing for a beat. Two
+            // ticks: enough for a test to observe the window reliably.
+            self.warmup_ticks = 2;
             Ok(())
         }
 
@@ -3081,6 +3139,79 @@ mod tests {
         assert!(
             mock.session.as_ref().expect("session").loop_enabled(),
             "loop set during a session must survive the session ending"
+        );
+    }
+
+    #[test]
+    fn is_end_of_source_requires_the_source_to_be_spent_not_just_a_missing_frame() {
+        // The distinction that killed Play. `try_next_frame` returns `Ok(None)`
+        // both when the decode channel is momentarily empty and when the source
+        // has genuinely run out; only `is_exhausted()` separates them.
+        assert!(
+            !is_end_of_source(true, false, false),
+            "a frame not ready yet with a source that still has frames must NOT \
+             end the session -- this is the first tick after begin_preview, and \
+             treating it as end-of-source is what made Play appear dead"
+        );
+        assert!(
+            is_end_of_source(true, false, true),
+            "a missing frame from a spent source IS end-of-source"
+        );
+        assert!(
+            !is_end_of_source(true, true, false),
+            "a delivered frame is never end-of-source, even on a spent source"
+        );
+        assert!(
+            !is_end_of_source(false, false, true),
+            "a paused session must not end on a missing frame -- pausing at the \
+             tail of a clip must not tear the session down"
+        );
+    }
+
+    #[test]
+    fn a_freshly_started_session_survives_the_warmup_ticks_before_its_first_frame() {
+        // Regression, observed live: `preview session started` immediately
+        // followed by `preview reached end of source`, ~8ms apart, for a
+        // 2-second clip. The decode pipeline had just been (re)spawned and had
+        // not produced a frame yet, so `pair` was `None` on the very first tick
+        // and the session ended on it.
+        //
+        // The symptom the user saw was Play doing nothing, over and over: every
+        // press rebuilt the session, which died before its first frame arrived.
+        let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut mock = MockBackend::new(Arc::clone(&ops));
+        // Far longer than the observation window: the mock has no pacing sleep,
+        // so it runs unbounded. Any `end_preview` seen here can only come from
+        // the warm-up conflation, never from reaching the tail.
+        mock.total_frames = Some(1_000_000);
+        let (worker, _events) = EngineWorker::spawn(mock);
+        let handle = worker.handle();
+        handle.send(WorkerCommand::Import).unwrap();
+        handle.send(WorkerCommand::Preview).unwrap();
+
+        // The first ticks fall inside the warm-up window. The session must be
+        // alive and running by the time frames start arriving.
+        let start = std::time::Instant::now();
+        let mut seen = Vec::new();
+        while start.elapsed() < Duration::from_millis(200) {
+            seen = ops.lock().unwrap().clone();
+            if seen.iter().filter(|o| **o == "tick").count() >= 10 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        handle.send(WorkerCommand::Shutdown).unwrap();
+        let _ = worker.join(Duration::from_secs(2));
+
+        assert!(
+            seen.iter().filter(|o| **o == "tick").count() >= 10,
+            "expected the session to keep running, saw {:?}",
+            seen.iter().filter(|o| **o == "tick").count()
+        );
+        assert!(
+            !seen.contains(&"end_preview"),
+            "the session ended during pipeline warm-up instead of playing: \
+             {seen:?}"
         );
     }
 
