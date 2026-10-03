@@ -455,6 +455,18 @@ impl reco_core::source::FrameSource for FfmpegFileSource {
         // the final target. This method is blocking for strategy 1 and
         // semi-blocking for strategy 2 (spawns threads, returns before
         // first frame is decoded).
+        // Already at the target with a live pipeline: nothing to seek. This is
+        // the common case for `rewind_for_loop` from `begin_preview`, where the
+        // pipeline sits at frame 0 and was spawned at import. Without it every
+        // Play press fell through to the respawn below and reopened both
+        // decoders — two fresh NVDEC contexts and ~250ms of startup before the
+        // first frame could arrive, which is both wasted work and extra pressure
+        // on the CUDA context budget.
+        if frame == self.current_frame && !self.exhausted {
+            log::debug!("Seek to frame {frame}: already positioned, no-op");
+            return Ok(());
+        }
+
         if frame > self.current_frame {
             let skip = frame - self.current_frame;
             let max_forward = (self.info.fps * 10.0) as u64;
@@ -635,5 +647,213 @@ impl Encoder for FfmpegFileEncoder {
         self.inner.finish().map_err(|e| EncodeError::Finalize {
             reason: e.to_string(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reco_core::source::FrameSource;
+    use std::path::PathBuf;
+
+    /// A logger that records this module's messages during a test, so the branch
+    /// a `seek` actually took can be asserted rather than inferred from timing.
+    struct RecordingLogger(std::sync::Mutex<Vec<String>>);
+
+    impl log::Log for RecordingLogger {
+        fn enabled(&self, metadata: &log::Metadata) -> bool {
+            metadata.target().starts_with("reco_io::adapters")
+        }
+        fn log(&self, record: &log::Record) {
+            if self.enabled(record.metadata()) {
+                self.0.lock().unwrap().push(record.args().to_string());
+            }
+        }
+        fn flush(&self) {}
+    }
+
+    static LOGGER: RecordingLogger = RecordingLogger(std::sync::Mutex::new(Vec::new()));
+
+    /// Clear the recorded lines, installing the logger on first use.
+    fn recorded() -> Vec<String> {
+        let _ = log::set_logger(&LOGGER);
+        log::set_max_level(log::LevelFilter::Debug);
+        LOGGER.0.lock().unwrap().drain(..).collect()
+    }
+
+    /// The checked-in stereo test clip, or `None` when this checkout has no
+    /// `test-media/` (in which case the seek tests decline to run).
+    fn media_paths() -> Option<(PathBuf, PathBuf)> {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test-media");
+        let left = dir.join("left.mp4");
+        let right = dir.join("right.mp4");
+        (left.is_file() && right.is_file()).then_some((left, right))
+    }
+
+    fn open_test_source() -> Option<FfmpegFileSource> {
+        let (left, right) = media_paths()?;
+        let mut source = FfmpegFileSource::open(&left, &right).expect("open the test clip");
+        // Establish a position and a live decode channel before the assertion.
+        for _ in 0..600 {
+            match source.try_next_frame().expect("decode") {
+                Some(_) => break,
+                None => {
+                    if source.is_exhausted() {
+                        return None;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            }
+        }
+        Some(source)
+    }
+
+    /// Seeking to the position the source is already at must be a no-op, not a
+    /// pipeline respawn.
+    ///
+    /// A respawn reopens both decoders: NVDEC re-init, a fresh CUDA context
+    /// each, and ~250ms before the next frame can arrive. `begin_preview` calls
+    /// `seek(0)` through `rewind_for_loop` on every Play, so without this the
+    /// first Play threw away a pipeline that `import` had already warmed up —
+    /// and that delay is the window in which a Play press looked like it did
+    /// nothing.
+    #[test]
+    fn seek_to_the_current_frame_is_a_no_op_not_a_respawn() {
+        let Some(mut source) = open_test_source() else {
+            return;
+        };
+        let at = source.current_frame;
+
+        let _ = recorded();
+        source.seek(at).expect("seek to the current position");
+        let lines = recorded();
+
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("already positioned, no-op")),
+            "seek to the current frame must be a no-op, not a respawn; \
+             recorded: {lines:?}"
+        );
+        assert_eq!(
+            source.current_frame, at,
+            "a no-op seek must not move the playhead"
+        );
+    }
+
+    /// The guard must not swallow a seek that really has to move — this is what
+    /// keeps the fast path from breaking ordinary playback.
+    #[test]
+    fn seek_past_the_current_frame_still_advances() {
+        let Some(mut source) = open_test_source() else {
+            return;
+        };
+        let at = source.current_frame;
+        let target = at + 5;
+
+        let _ = recorded();
+        source.seek(target).expect("seek forward");
+        let lines = recorded();
+
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.contains("already positioned, no-op")),
+            "a forward seek must take the real path; recorded: {lines:?}"
+        );
+        assert_eq!(
+            source.current_frame, target,
+            "the forward seek must land on its target"
+        );
+    }
+
+    /// The `!exhausted` half of the guard, on its own.
+    ///
+    /// After a full drain, `current_frame` sits at the total and the pipeline is
+    /// dead. A seek to *that same* position is therefore `frame ==
+    /// current_frame` — which the fast path would answer with "already
+    /// positioned" and do nothing, leaving a dead pipeline reported as ready.
+    /// This is not hypothetical: `Seek` clamps to the total, so scrubbing the
+    /// timeline to the very end of a played-out clip lands here. The player
+    /// would show a frame it could never actually produce.
+    #[test]
+    fn seek_to_the_end_of_a_spent_source_respawns_even_though_frame_matches() {
+        let Some(mut source) = open_test_source() else {
+            return;
+        };
+
+        for _ in 0..100_000 {
+            match source.try_next_frame().expect("decode") {
+                Some(_) => {}
+                None => {
+                    if source.is_exhausted() {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
+        }
+        if !source.is_exhausted() {
+            return;
+        }
+
+        // `frame == current_frame` and the pipeline is spent.
+        let at = source.current_frame;
+        let _ = recorded();
+        source.seek(at).expect("seek to the current position");
+        let lines = recorded();
+
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.contains("already positioned, no-op")),
+            "a spent source must respawn even when frame == current_frame;              recorded: {lines:?}"
+        );
+        assert!(
+            !source.is_exhausted(),
+            "the respawn must leave the source able to serve frames again"
+        );
+    }
+
+    /// A spent source must still rewind — `is_exhausted` explicitly defeats the
+    /// fast path, because being at frame 0 is meaningless when the pipeline is
+    /// dead.
+    #[test]
+    fn seek_to_zero_on_a_spent_source_respawns() {
+        let Some(mut source) = open_test_source() else {
+            return;
+        };
+
+        // Drain to the end.
+        for _ in 0..100_000 {
+            match source.try_next_frame().expect("decode") {
+                Some(_) => {}
+                None => {
+                    if source.is_exhausted() {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
+        }
+        if !source.is_exhausted() {
+            return; // clip drained without hitting EOF; nothing to assert
+        }
+
+        let _ = recorded();
+        source.seek(0).expect("rewind a spent source");
+        let lines = recorded();
+
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.contains("already positioned, no-op")),
+            "a spent source must respawn even at frame 0; recorded: {lines:?}"
+        );
+        assert_eq!(source.current_frame, 0, "the rewind must land at frame 0");
+        assert!(
+            !source.is_exhausted(),
+            "a rewound source must be able to serve frames again"
+        );
     }
 }
