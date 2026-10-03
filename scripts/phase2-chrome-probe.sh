@@ -240,6 +240,113 @@ wait_for_log_delta() {
   return 1
 }
 
+# ---------------------------------------------------------------- pose helpers
+
+# The worker's pose report, in the same shape the webview's typed `Pose` event
+# projects to:
+#     "pose: yaw {:.3}, pitch {:.3}, fov {:.1}"
+# It is written to stdout at exactly two points, neither per-tick:
+#   * once when a session starts (the BASELINE, before any gesture), and
+#   * after a gesture is drained (the TARGET that `dispatch_intent` set).
+# Reading the target keeps the assertion immune to the easing rate of the
+# current pose, and the session-start line is what makes a "before" value
+# exist at all.
+#
+# Values are located by KEYWORD rather than by fixed field offset, so adding a
+# prefix to the message cannot silently shift every index and make the
+# assertions compare the wrong number.
+#
+# Prints EMPTY when no such line exists yet. Callers must treat empty as "no
+# baseline" and fail — never as 0, which would silently pass a comparison.
+#
+# Always exits 0: the script runs with `set -euo pipefail`, and a `grep` that
+# finds nothing would otherwise fail the *assignment* this is called from,
+# killing the script before any caller's emptiness check can run. That is a
+# silent death with no FAIL line — far worse than an empty value.
+last_pose_field() {
+  local idx="$1" key
+  case "$idx" in
+    1) key="yaw" ;;
+    2) key="pitch" ;;
+    3) key="fov" ;;
+    *) return 0 ;;
+  esac
+  local line
+  line="$(sed 's/\x1b\[[0-9;]*m//g' "$LOG_FILE" 2>/dev/null \
+    | grep -E 'pose: yaw -?[0-9]' | tail -n 1 || true)"
+  [[ -n "$line" ]] || return 0
+  # Locate the value by its KEY: scan tokens for the key, take the next one with
+  # any trailing comma stripped. Keying on the name means reformatting the
+  # message cannot silently shift an index onto the wrong number.
+  printf '%s\n' "$line" \
+    | awk -v key="$key" '
+        {
+          for (i = 1; i < NF; i++) {
+            if ($i == key) {
+              v = $(i + 1)
+              gsub(/,/, "", v)
+              if (v ~ /^-?[0-9]+\.[0-9]+$/) print v
+              exit
+            }
+          }
+        }' || true
+  return 0
+}
+
+# Poll until pose field `idx` differs from `baseline` by more than `threshold`.
+# Echoes the new value; non-zero on timeout.
+pose_field_changed() {
+  local idx="$1" baseline="$2" threshold="$3" timeout_s="$4"
+  local deadline=$(( $(date +%s) + timeout_s ))
+  local now delta
+  while [[ $(date +%s) -lt $deadline ]]; do
+    now="$(last_pose_field "$idx")"
+    if [[ -n "$now" ]]; then
+      delta="$(awk -v a="$now" -v b="$baseline" \
+        'BEGIN { d = a - b; if (d < 0) d = -d; printf "%.6f", d }')"
+      if awk -v d="$delta" -v t="$threshold" 'BEGIN { exit !(d > t) }'; then
+        echo "$now"
+        return 0
+      fi
+    fi
+    sleep 0.3
+  done
+  return 1
+}
+
+# ---------------------------------------------------------------- geometry helpers
+
+# Server-side width of the native child, from the X server itself — not from
+# the app's own log. Queried against the SAME $NATIVE_CHILD id captured at
+# startup; nothing is re-derived.
+#
+# Always exits 0 (same `set -e` hazard as `last_pose_field`): callers test the
+# returned string, and a failing query must yield an empty value they can
+# report, not terminate the probe silently.
+child_width() {
+  xwininfo -display "$DISPLAY_NUM" -id "$NATIVE_CHILD" 2>/dev/null \
+    | awk -F': ' '/^  Width:/{print $2}' | head -n 1 | tr -d ' ' || true
+  return 0
+}
+
+# Poll until the X server reports the child at <expected>. Echoes the observed
+# width and returns non-zero on timeout.
+wait_for_child_width() {
+  local expected="$1" timeout_s="$2"
+  local deadline=$(( $(date +%s) + timeout_s ))
+  local w=""
+  while [[ $(date +%s) -lt $deadline ]]; do
+    w="$(child_width)"
+    if [[ "$w" == "$expected" ]]; then
+      echo "PHASE2 PROBE: native child width = ${w} (expected ${expected})"
+      return 0
+    fi
+    sleep 0.3
+  done
+  echo "PHASE2 PROBE: child width never reached ${expected} (observed '${w:-unreadable}')" >&2
+  return 1
+}
+
 # The transport strip is the bottom 72px (y ~ 728..800); button centres are on
 # the control row (y ~ 776). Buttons are laid out left-to-right from the 16px
 # padding; their exact rendered widths depend on the font, so sweep candidate x
@@ -326,6 +433,49 @@ click_rail_until "controls-panel collapse toggle" "$COLLAPSED" \
   || fail "the controls-panel collapse toggle was never driven: '${COLLAPSED}' did not appear in the log after sweeping the rail — the panel stayed expanded"
 echo "PHASE2 PROBE: chrome restored (${COLLAPSED})"
 
+# --------------------------------------------------- geometry (server-side)
+#
+# 02-08 already asserts the WORKER RECEIVED the chrome change. That assertion
+# passed while the child window stayed 1240 wide: the surface and the log were
+# right and the window was wrong. This step asks the X SERVER.
+#
+# The two numbers are hard-coded on purpose, not derived from the screen size.
+# They come from `ViewportRect::for_chrome(1280, 800, …)` — 1000 = 1280 - 280
+# (expanded controls panel), 1240 = 1280 - 40 (collapsed rail), 728 = 800 - 72
+# (transport bar). Hard-coding them means a change to the geometry authority
+# itself is a visible failure rather than something the probe silently agrees
+# with by recomputing the same wrong number.
+w0="$(child_width)"
+if [[ "$w0" != "1240" ]]; then
+  fail "native child baseline width is '${w0:-unreadable}', expected 1240 (collapsed default)"
+fi
+echo "PHASE2 PROBE: geometry baseline, child width = ${w0} (collapsed)"
+
+click_rail_until "controls-panel expand toggle (geometry)" "$EXPANDED" \
+  || fail "could not expand the panel to assert geometry: '${EXPANDED}' missing from the log"
+wait_for_child_width 1000 10 \
+  || fail "the X server still reports the native child at '$(child_width)' after expansion — expected 1000; the window did not follow the chrome (surface/log may still agree, which is exactly the defect this step catches)"
+
+# The app's OWN report must agree with the server's, in the agreeing form only:
+# `mismatch` means the window refused the request and must fail even if the
+# numbers happened to line up afterwards.
+if log_grep -qE 'native viewport: requested 1000x728, child window .*mismatch'; then
+  fail "the worker reports a geometry MISMATCH for the expanded state"
+fi
+if ! log_grep -qE 'native viewport: requested 1000x728, child window 1000x728'; then
+  fail "the worker never reported the expanded geometry agreeing with the request"
+fi
+echo "PHASE2 PROBE: expanded geometry — server and worker both report 1000x728"
+
+click_rail_until "controls-panel collapse toggle (geometry)" "$COLLAPSED" \
+  || fail "could not collapse the panel to restore geometry: '${COLLAPSED}' missing from the log"
+wait_for_child_width 1240 10 \
+  || fail "the X server reports '$(child_width)' after collapse — expected 1240"
+if log_grep -qE 'native viewport: requested 1240x728, child window .*mismatch'; then
+  fail "the worker reports a geometry MISMATCH for the collapsed state"
+fi
+echo "PHASE2 PROBE: geometry restored to 1240; child is back at its default size"
+
 # (3) Play via a webview-owned button in the strip. Phase 2 auto-imports on
 # startup (hardcoded clips), so the only command needed is Play.
 click_strip_until "Play" "preview session started" \
@@ -338,6 +488,104 @@ wait_for_log "A1 verdict|preview presented" 60 || fail "no stitched frame presen
 # The app must NOT have logged a preview failure.
 if log_grep -qE "preview failed"; then
   fail "app logged 'preview failed'"
+fi
+
+# ------------------------------------------------ native pose input assertions
+#
+# 02-08 removed an unfalsifiable claim but added no assertion requiring
+# behaviour the tree did not have yet. 02-10 owns pose input on the native
+# child; these are the assertions that would have caught its absence.
+#
+# They come AFTER the A1 wait because `pose:` lines are only emitted while a
+# session is ticking — and after the panel expand/collapse above (which restores
+# the 1240-wide child) so the gestures land inside the child's rectangle.
+#
+# DIRECTION IS DELIBERATELY NOT CHECKED. Dragging right takes a negative yaw
+# delta (+yaw looks LEFT), per `crates/reco-cli/src/preview.rs:582-598` and
+# FRICTION A6. Turning this into a sign check would make the probe a direction
+# oracle, and direction is a product judgement for the human verification list.
+# The probe's job is to prove the gesture REACHED THE ENGINE AT ALL. Do not
+# "improve" this into a sign comparison.
+
+# --- drag pan -------------------------------------------------------------
+yaw_before="$(last_pose_field 1)"
+if [[ -z "$yaw_before" ]]; then
+  fail "no 'gesture applied: yaw …' line in the log before dragging — the session is not ticking or no gesture has ever been drained (probe sequencing bug), not a product failure"
+fi
+
+# Step the pointer across the child in explicit moves. A single jump can be
+# coalesced by the X server into one motion event, and the drain runs once per
+# tick, so intermediate steps are what make the drag actually register.
+#
+# Written out rather than as a loop: this is a probe, and being able to count
+# the steps with `grep -c mousemove` is itself part of the check that they
+# exist. Ten steps across 300 -> 900 at constant y, so the assertion is about
+# yaw alone (pitch is clamped per tick by coverage and proves less here).
+if ! command -v xdotool >/dev/null 2>&1; then
+  fail "xdotool is required to synthesise the drag — not skipping this assertion"
+fi
+xdotool mousemove --sync 300 300 >/dev/null 2>&1 || true
+sleep 0.2
+xdotool mousedown 1 >/dev/null 2>&1 || fail "xdotool mousedown failed — cannot synthesise a drag"
+xdotool mousemove --sync 360 300 >/dev/null 2>&1 || true
+sleep 0.06
+xdotool mousemove --sync 420 300 >/dev/null 2>&1 || true
+sleep 0.06
+xdotool mousemove --sync 480 300 >/dev/null 2>&1 || true
+sleep 0.06
+xdotool mousemove --sync 540 300 >/dev/null 2>&1 || true
+sleep 0.06
+xdotool mousemove --sync 600 300 >/dev/null 2>&1 || true
+sleep 0.06
+xdotool mousemove --sync 660 300 >/dev/null 2>&1 || true
+sleep 0.06
+xdotool mousemove --sync 720 300 >/dev/null 2>&1 || true
+sleep 0.06
+xdotool mousemove --sync 780 300 >/dev/null 2>&1 || true
+sleep 0.06
+xdotool mousemove --sync 840 300 >/dev/null 2>&1 || true
+sleep 0.06
+xdotool mousemove --sync 900 300 >/dev/null 2>&1 || true
+sleep 0.1
+xdotool mouseup 1 >/dev/null 2>&1 || true
+
+yaw_after="$(pose_field_changed 1 "$yaw_before" 0.01 10)" \
+  || fail "yaw did not change after a 600px drag over the native child (before=${yaw_before}) — native pointer input is not reaching ControlIntent"
+echo "PHASE2 PROBE: drag changed yaw ${yaw_before} -> ${yaw_after} (direction intentionally not asserted)"
+
+# --- wheel zoom -----------------------------------------------------------
+fov_before="$(last_pose_field 3)"
+if [[ -z "$fov_before" ]]; then
+  fail "no 'pose: … fov …' line in the log before wheeling — probe sequencing bug, not a product failure"
+fi
+
+xdotool mousemove --sync 600 400 >/dev/null 2>&1 || true
+sleep 0.2
+xdotool click 5 >/dev/null 2>&1 || fail "xdotool click 5 failed — cannot synthesise a wheel"
+sleep 0.2
+xdotool click 5 >/dev/null 2>&1 || true
+sleep 0.2
+xdotool click 5 >/dev/null 2>&1 || true
+
+fov_after="$(pose_field_changed 3 "$fov_before" 1.0 10)" \
+  || fail "FOV did not change after three wheel-down notches (before=${fov_before}) — wheel input is not reaching the pose"
+echo "PHASE2 PROBE: wheel changed FOV ${fov_before} -> ${fov_after}"
+
+# ------------------------------------------------- best-effort presenter swap
+#
+# The geometry step above is what makes the PresenterSelect reachable at all
+# (before it, the native child covered x=1000..1240). This reports the outcome
+# and does NOT fail: selecting a presenter re-binds a wgpu surface, and the
+# readback arm cannot be exercised reliably on a software renderer with no
+# compositor. A gate that fails for an environment reason is worse than no gate.
+#
+# Reported only. Do not promote this to an assertion without a compositor.
+presenter_base="$(log_count 'presenter:')"
+click_at 1258 330
+if wait_for_log_delta 'presenter:' "$presenter_base" 5; then
+  echo "PHASE2 PROBE: best-effort — presenter select drove a swap ($(log_grep -E 'presenter:' | tail -n 1 | sed 's/^.*INFO[^:]*: //' | cut -c1-80))"
+else
+  echo "PHASE2 PROBE: best-effort — presenter select did not report a swap (expected on a software renderer with no compositor; NOT a failure)"
 fi
 
 # --------------------------------------------------- transparency disposition

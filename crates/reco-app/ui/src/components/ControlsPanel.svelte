@@ -31,6 +31,8 @@
   const yaw = $derived(pose.pose?.yaw ?? 0);
   const pitch = $derived(pose.pose?.pitch ?? 0);
   const fov = $derived(pose.pose?.fov ?? 75);
+  // The coverage ceiling, so the slider stops advertising range it cannot reach.
+  const fovMax = $derived(pose.fovMax);
 </script>
 
 <div class="controls-panel" class:expanded>
@@ -57,6 +59,7 @@
         <h3 class="section-heading">Field of view</h3>
         <FovSlider
           value={fovValue}
+          max={fovMax}
           disabled={!poseEnabled}
           onChange={onFovChange}
         />

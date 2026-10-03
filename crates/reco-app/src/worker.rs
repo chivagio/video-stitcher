@@ -154,11 +154,16 @@ impl EventSink {
     }
 
     /// Emit the authoritative pose after a tick (PREV-04).
-    fn pose(&self, yaw: f32, pitch: f32, fov_degrees: f32) {
+    ///
+    /// `fov_max` is the coverage ceiling the pose is clamped to, reported so a
+    /// control advertising a fixed range can be bounded to what this clip
+    /// actually allows instead of silently doing nothing above it.
+    fn pose(&self, yaw: f32, pitch: f32, fov_degrees: f32, fov_max: f32) {
         let _ = self.tx.send(WorkerEvent::Pose {
             yaw,
             pitch,
             fov_degrees,
+            fov_max,
         });
     }
 
@@ -529,6 +534,27 @@ pub trait EngineBackend: Send {
 /// consumers such as this one.
 pub fn is_end_of_source(playing: bool, frame_available: bool, exhausted: bool) -> bool {
     playing && !frame_available && exhausted
+}
+
+/// The widest FOV that is actually renderable: the coverage boundary's own
+/// ceiling bounded by the configured maximum.
+///
+/// This is the same `min(...)` the CLI logs as `max FOV = … (coverage-limited)`
+/// (`crates/reco-cli/src/preview.rs:131-141`). It is factored out so the
+/// arithmetic can be tested without a renderer: on the shipped test clip the
+/// coverage ceiling is 50.87° against a configured max of 150°, and every degree
+/// above it was inert under `clamp_via_coverage` while the UI kept advertising it.
+///
+/// `None` for the coverage (before the first renderer exists) falls back to the
+/// configured maximum — there is no calibration to be bounded by yet, and that
+/// is what the pose clamps to anyway.
+pub fn fov_ceiling_from(
+    coverage: Option<&reco_core::projection::CoverageBoundary>,
+    configured: f32,
+) -> f32 {
+    coverage.map_or(configured, |coverage| {
+        coverage.max_fov_degrees().min(configured)
+    })
 }
 
 /// Handle a single command. Returns `false` when the loop should stop.
@@ -1167,6 +1193,28 @@ impl GpuEngineBackend {
     }
 
     /// Build a `StitchRenderer` from the current device and the given inputs.
+    /// The FOV ceiling `clamp_via_coverage` will actually allow, in degrees.
+    ///
+    /// The stitchable area (coverage boundary from the loaded calibration)
+    /// bounded by the configured `fov_max_degrees` — the same `min(...)` the CLI
+    /// logs as `max FOV = … (coverage-limited)` at
+    /// `crates/reco-cli/src/preview.rs:131-141`.
+    ///
+    /// Computed rather than stored: it is a property of the calibration, so
+    /// there is no state to keep in sync, and reading it fresh means a device
+    /// recovery that rebuilds the renderer cannot leave a stale ceiling.
+    ///
+    /// Falls back to the configured max while no renderer exists (before the
+    /// first session), which is the honest answer: without a calibration there
+    /// is no coverage to be bounded by, and the configured max is what the pose
+    /// clamps to.
+    fn fov_ceiling(&self) -> f32 {
+        fov_ceiling_from(
+            self.renderer.as_ref().map(|r| r.coverage()),
+            self.pose.config().fov_max_degrees,
+        )
+    }
+
     fn build_renderer(
         &self,
         cal: reco_core::calibration::MatchCalibration,
@@ -1501,6 +1549,22 @@ impl EngineBackend for GpuEngineBackend {
         }
 
         events.info("preview session started");
+        // Baseline pose, in the same `pose: yaw …` shape `drain_pointer_input`
+        // writes after a gesture. Without it the FIRST gesture had nothing to be
+        // compared against — there was no earlier pose line at all, because
+        // `events.pose` sends only on the typed channel to the webview and never
+        // reaches stdout. A reader can now take "before" from here and "after"
+        // from the post-gesture line.
+        //
+        // Emitted once per session, never per tick.
+        let baseline = self.pose.current_pose();
+        events.info(format!(
+            "pose: yaw {:.3}, pitch {:.3}, fov {:.1}, max {:.1}",
+            baseline.yaw,
+            baseline.pitch,
+            self.pose.current_fov_deg(),
+            self.fov_ceiling()
+        ));
         Ok(())
     }
 
@@ -1624,6 +1688,7 @@ impl EngineBackend for GpuEngineBackend {
             self.pose.current_pose().yaw,
             self.pose.current_pose().pitch,
             fov_degrees,
+            self.fov_ceiling(),
         );
 
         // 5. Render + present.
@@ -1799,7 +1864,12 @@ impl EngineBackend for GpuEngineBackend {
         // session there is no tick, so a drag while paused must still be
         // reflected in what the frontend reconciles.
         let pose = self.pose.current_pose();
-        events.pose(pose.yaw, pose.pitch, self.pose.current_fov_deg());
+        events.pose(
+            pose.yaw,
+            pose.pitch,
+            self.pose.current_fov_deg(),
+            self.fov_ceiling(),
+        );
         events.view(self.view_mode);
         // `reason` is deliberately omitted: the fallback that selected this
         // presenter already reported its reason, and re-announcing it would
@@ -1839,7 +1909,7 @@ impl EngineBackend for GpuEngineBackend {
         dispatch_intent(&mut self.pose, intent);
     }
 
-    fn drain_pointer_input(&mut self, _events: &EventSink) {
+    fn drain_pointer_input(&mut self, events: &EventSink) {
         let Some(gesture) = self.presenter.take_pointer_gesture() else {
             return;
         };
@@ -1863,6 +1933,30 @@ impl EngineBackend for GpuEngineBackend {
             // an arrow key cannot diverge.
             dispatch_intent(&mut self.pose, intent);
         }
+        // Report the pose, in the SAME `pose: yaw …` shape the webview's typed
+        // `Pose` event projects to. Two emissions use it — this one and the
+        // baseline printed at session start — so a reader can take "before"
+        // from the session-start line and "after" from this one.
+        //
+        // Event-driven on purpose: this fires only when the native child
+        // actually delivered pointer input, never per tick, so it cannot flood
+        // the log. Before it existed the worker consumed drags in complete
+        // silence — `Pose` events reach only the webview (sent on the typed
+        // channel, never through `EventSink::log`), so neither the terminal nor
+        // a headless probe could tell input had arrived, and a dead gesture path
+        // was indistinguishable from a working one.
+        //
+        // The TARGET, not the current pose: `dispatch_intent` moves the target
+        // and the current pose eases toward it over later ticks. Reporting the
+        // target makes the assertion immediate and immune to easing rate.
+        let target = self.pose.target_pose();
+        events.info(format!(
+            "pose: yaw {:.3}, pitch {:.3}, fov {:.1}, max {:.1}",
+            target.yaw,
+            target.pitch,
+            target.fov_degrees.unwrap_or(fov_degrees),
+            self.fov_ceiling()
+        ));
     }
 
     fn set_presenter(&mut self, kind: crate::presenter::PresenterKind, events: &EventSink) {
@@ -2252,6 +2346,18 @@ mod tests {
             self
         }
 
+        /// The mock's coverage ceiling. It has no renderer or coverage
+        /// boundary, so the configured max is the honest answer for it — and a
+        /// test that wants to pin the emitted ceiling can lower this.
+        ///
+        /// Inherent, not a trait method: the ceiling is a property of each
+        /// backend's own state, so putting it on the trait would force every
+        /// backend through one accessor for a value only the real one can
+        /// actually compute from coverage.
+        fn fov_ceiling(&self) -> f32 {
+            self.pose.lock().unwrap().config().fov_max_degrees
+        }
+
         fn record(&self, op: &'static str) {
             self.ops.lock().unwrap().push(op);
         }
@@ -2319,6 +2425,10 @@ mod tests {
                 crate::presenter::ViewMode::Panorama => self.record("render_panorama"),
                 crate::presenter::ViewMode::Source => self.record("render_source"),
             }
+            // Read the ceiling BEFORE taking the session borrow below: this
+            // reads pose config, which needs `&self`, and holding it across the
+            // `&mut` session borrow would overlap.
+            let fov_ceiling = self.fov_ceiling();
             let Some(t) = self.session.as_mut() else {
                 return Ok(());
             };
@@ -2328,7 +2438,12 @@ mod tests {
                 pose.tick();
                 *self.last_pushed_fov.lock().unwrap() = Some(pose.current_fov_deg());
                 let current = pose.current_pose();
-                events.pose(current.yaw, current.pitch, pose.current_fov_deg());
+                events.pose(
+                    current.yaw,
+                    current.pitch,
+                    pose.current_fov_deg(),
+                    fov_ceiling,
+                );
             }
             // Advance the transport, modelling the real tick's source-driven
             // end-of-source: the fake source serves frames until it is spent,
@@ -2443,7 +2558,7 @@ mod tests {
             }
             let pose = self.pose.lock().unwrap().current_pose();
             let fov = self.pose.lock().unwrap().current_fov_deg();
-            events.pose(pose.yaw, pose.pitch, fov);
+            events.pose(pose.yaw, pose.pitch, fov, self.fov_ceiling());
             events.view(self.view_mode);
             events.presenter(self.active_kind, None);
         }
@@ -3244,6 +3359,70 @@ mod tests {
             mock.session.as_ref().expect("session").loop_enabled(),
             "loop set during a session must survive the session ending"
         );
+    }
+
+    /// The ceiling arithmetic, without a renderer.
+    ///
+    /// `fov_ceiling` itself is GPU-bound — it reads the live renderer's coverage
+    /// — so the pure part is factored into `fov_ceiling_from` and tested here.
+    /// What matters is the ORDER of the `min`: coverage may be narrower than the
+    /// configured max (the usual case — 50.87 vs 150 on the shipped clip, which
+    /// is why most of the slider did nothing), or a future config may be
+    /// narrower than the coverage. Both must clamp to the LOWER of the two,
+    /// never to the wider one.
+    #[test]
+    fn fov_ceiling_clamps_to_the_narrower_of_coverage_and_config() {
+        // No renderer yet: nothing to be bounded by, so the configured max wins.
+        assert_eq!(
+            fov_ceiling_from(None, 150.0),
+            150.0,
+            "before the first renderer the configured maximum is the honest answer"
+        );
+
+        let Some(coverage) = test_coverage() else {
+            return; // test-media absent in this checkout
+        };
+        let from_coverage = coverage.max_fov_degrees();
+
+        // The real ordering: coverage is the binding constraint.
+        assert_eq!(
+            fov_ceiling_from(Some(&coverage), from_coverage + 50.0),
+            from_coverage,
+            "when coverage is narrower than the config, coverage must win"
+        );
+        // ...and the config still caps it when it is the narrower one.
+        assert_eq!(
+            fov_ceiling_from(Some(&coverage), from_coverage - 10.0),
+            from_coverage - 10.0,
+            "when the config is narrower than the coverage, the config must win"
+        );
+        // Never wider than either input.
+        let ceiling = fov_ceiling_from(Some(&coverage), 150.0);
+        assert!(
+            ceiling <= from_coverage + f32::EPSILON && ceiling <= 150.0,
+            "the ceiling must never exceed its inputs, got {ceiling}              (coverage {from_coverage}, config 150)"
+        );
+    }
+
+    /// Coverage boundary built from the shipped test calibration, or `None` when
+    /// this checkout has no `test-media/`.
+    fn test_coverage() -> Option<reco_core::projection::CoverageBoundary> {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test-media/match.json");
+        if !path.is_file() {
+            return None;
+        }
+        let cal = reco_core::calibration::MatchCalibration::from_file(&path).ok()?;
+        // The same 16:9 aspect the test clip decodes at; the ceiling depends on
+        // it only through the scene geometry, and any fixed value exercises the
+        // ordering under test.
+        let scene = reco_core::render::scene::SceneGeometry::from_layout_with_aspect(
+            &cal.layout,
+            16.0 / 9.0,
+        );
+        Some(reco_core::projection::CoverageBoundary::from_calibration(
+            &cal, &scene,
+        ))
     }
 
     #[test]

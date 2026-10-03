@@ -413,3 +413,42 @@ respawn opening a CUDA context), assert on the observable proxy — the rewind
 count against the tick count — not on the thing you cannot see. `ticks >
 rewinds` is the invariant; a specific ratio would have over-fitted the clip
 length and was wrong on the first run.
+
+## A12 — typed worker events never reach stdout, so nothing headless can observe them
+
+**Symptom.** Plan 02-11 specified its assertion chain as ending in
+`INFO 'pose: yaw …'`. The first run of that assertion exited 1 with **no FAIL
+line at all** — the worst outcome a gate can produce.
+
+**Two causes, one of which is a project-wide trap.**
+
+`EventSink` has two kinds of method. `info`/`failed` go through `log()`, which
+mirrors to `log::info!` and therefore to the terminal, CI logs, and any headless
+probe. `pose`, `position`, and `transport` send a typed `WorkerEvent` straight
+onto the channel — only the webview ever sees them.
+
+So there is a class of state that is **invisible to every automated check**,
+silently, while looking perfectly well-connected: `events.pose(...)` compiles,
+tests asserting the event can be written against the mock, and the UI shows the
+right numbers. A probe reading stdout just never sees it. The FRICTION notes had
+recorded this fact earlier (Pose/Position/Transport reach only the webview) but
+no plan accounted for it when choosing an assertion target.
+
+**Consumer lesson.** Before writing an assertion against the worker's log,
+check *which* kind of method emits it. `EventSink::log` reaches stdout;
+everything else needs a different observation channel (screenshot, in-app drawer)
+or an explicit new line.
+
+**Second cause — `set -euo pipefail` plus a pipeline that can find nothing.**
+The reading helper ended in `grep`, which returns 1 on no match. That failed the
+*command substitution in the assignment itself*, so the script terminated before
+the caller's `-z` emptiness check could run. Every helper that returns a value a
+caller inspects must exit 0 and signal "nothing" by returning empty. An empty
+string a caller can report beats a process that dies without explanation — a
+silent death hides the very failure the gate exists to catch.
+
+**Related:** the FOV slider advertised 40-150° while `clamp_via_coverage` pinned
+the pose to 50.87° for the shipped clip. The CLI logged `max FOV =
+… (coverage-limited)`; the app surfaced nothing. Bound the control to the value
+the engine reports rather than to a constant chosen by the UI — a range the
+engine will never accept is indistinguishable from a broken control.

@@ -106,6 +106,14 @@ pub enum WorkerEvent {
         pitch: f32,
         /// Current vertical FOV in degrees.
         fov_degrees: f32,
+        /// The widest FOV the stitchable coverage actually allows, in degrees.
+        ///
+        /// The pose gets clamped to this every tick, so a UI that offers a
+        /// wider range silently does nothing above it. On the shipped test clip
+        /// this is 50.87 against a configured max of 150 — most of that slider
+        /// was inert with no indication why. Reported so the control can be
+        /// bounded to what is achievable rather than advertising dead range.
+        fov_max: f32,
     },
 
     /// The active presenter changed (PREV-05).
@@ -203,11 +211,16 @@ impl WorkerEvent {
                 yaw,
                 pitch,
                 fov_degrees,
+                fov_max,
             } => LogLine {
                 level: Level::Info,
+                // `max` is APPENDED, not interleaved: `parsePose` in the webview
+                // matches this string, so keeping the original prefix intact and
+                // making the new group optional means an older consumer still
+                // parses the three values it knows rather than failing outright.
                 message: format!(
-                    "pose: yaw {:.3}, pitch {:.3}, fov {:.1}",
-                    yaw, pitch, fov_degrees
+                    "pose: yaw {:.3}, pitch {:.3}, fov {:.1}, max {:.1}",
+                    yaw, pitch, fov_degrees, fov_max
                 ),
             },
             WorkerEvent::Presenter { kind, reason } => LogLine {
@@ -517,6 +530,7 @@ mod tests {
             yaw: 0.25,
             pitch: -0.1,
             fov_degrees: 75.0,
+            fov_max: 50.9,
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(
@@ -571,8 +585,21 @@ mod tests {
             yaw: 0.0,
             pitch: 0.0,
             fov_degrees: 75.0,
+            fov_max: 50.9,
         };
         assert_eq!(pose.to_log_line().level, Level::Info);
-        assert!(pose.to_log_line().message.contains("fov 75.0"));
+        let line = pose.to_log_line().message;
+        assert!(
+            line.contains("fov 75.0"),
+            "the current FOV must still be reported: {line}"
+        );
+        // The ceiling is APPENDED so an older parser that anchors after `fov`
+        // keeps working; this asserts the suffix is present and parseable, since
+        // the whole point of the field is that the UI can bound the control to
+        // what the clip allows.
+        assert!(
+            line.contains("max 50.9"),
+            "the coverage ceiling must be appended to the pose line: {line}"
+        );
     }
 }

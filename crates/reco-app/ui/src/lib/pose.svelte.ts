@@ -27,6 +27,14 @@ export interface PoseState {
   pitch: number;
   /** Current vertical FOV in degrees. */
   fov: number;
+  /**
+   * The widest FOV the stitchable coverage allows, in degrees.
+   *
+   * The pose is clamped to this every tick, so a control offering a wider range
+   * does nothing above it. Optional so an older or partial payload still parses
+   * — consumers fall back to the configured maximum.
+   */
+  fovMax?: number;
 }
 
 /**
@@ -34,12 +42,18 @@ export interface PoseState {
  * Returns the pose state or null when the message is not a pose line.
  */
 function parsePose(message: string): PoseState | null {
-  const m = message.match(/^pose: yaw ([-\d.]+), pitch ([-\d.]+), fov ([-\d.]+)$/);
+  // The trailing `max` is OPTIONAL: it was appended after the original three
+  // fields so that a payload without it still parses rather than failing the
+  // whole match. Anchoring only the known prefix is what keeps that true.
+  const m = message.match(
+    /^pose: yaw ([-\d.]+), pitch ([-\d.]+), fov ([-\d.]+)(?:, max ([-\d.]+))?$/,
+  );
   if (!m) return null;
   return {
     yaw: Number(m[1]),
     pitch: Number(m[2]),
     fov: Number(m[3]),
+    ...(m[4] !== undefined ? { fovMax: Number(m[4]) } : {}),
   };
 }
 
@@ -157,6 +171,16 @@ class PoseStore {
   /** The current FOV value for the slider, or 75 (default) when unknown. */
   get fovValue(): number {
     return this.pose?.fov ?? 75;
+  }
+
+  /**
+   * The widest FOV this clip's coverage allows, for bounding the slider.
+   *
+   * Falls back to 150 — the configured maximum — until the worker reports the
+   * coverage ceiling, so the control is never *below* the real range.
+   */
+  get fovMax(): number {
+    return this.pose?.fovMax ?? 150;
   }
 }
 
