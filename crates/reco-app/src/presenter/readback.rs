@@ -21,6 +21,20 @@
 //! The presenter builds no `GpuContext` and no `RgbaReadback` of its own — it
 //! drives the worker's shared [`StitchRenderer`] (D-03). The readback staging
 //! buffers live inside the renderer.
+//!
+//! # Frame wire format
+//!
+//! Every frame pushed over the [`Channel`](tauri::ipc::Channel) is prefixed with
+//! its own pixel geometry so the webview binds its canvas backing store to each
+//! frame instead of assuming a fixed size:
+//!
+//! ```text
+//! [width: u32 little-endian][height: u32 little-endian][RGBA bytes]
+//! ```
+//!
+//! [`READBACK_HEADER_LEN`] is the header size (8) and the byte offset at which
+//! the RGBA payload begins. The frontend mirrors both the length and the layout
+//! in `PreviewSurface.svelte`.
 
 use std::time::{Duration, Instant};
 
@@ -32,6 +46,29 @@ use super::{FrameOutcome, PresenterError, SurfacePresenter, ViewportRect};
 /// Readback frame-rate cap (frames per second). Surfaced in the WARN line so
 /// the degradation is honest about its cadence.
 pub const READBACK_FPS: u32 = 10;
+
+/// Length in bytes of the per-frame IPC header: two little-endian `u32`s
+/// (`width`, then `height`). The RGBA payload starts at this offset.
+///
+/// The frontend (`PreviewSurface.svelte`) mirrors this constant as
+/// `READBACK_HEADER_LEN`; the two must agree on the wire format. The frontend's
+/// runtime length guard (`byteLength == READBACK_HEADER_LEN + width * height *
+/// 4`) fails closed — no paint — if they ever drift.
+pub const READBACK_HEADER_LEN: usize = 8;
+
+/// Prefix `bytes` with the frame geometry:
+/// `[width: u32 LE][height: u32 LE][RGBA bytes]`.
+///
+/// The readback IPC frame carries its own dimensions so the webview can size
+/// its canvas backing store from the frame rather than from a fixed constant.
+/// Consumed by the readback `paintFrame` in `PreviewSurface.svelte`.
+pub fn frame_with_header(bytes: &[u8], width: u32, height: u32) -> Vec<u8> {
+    let mut framed = Vec::with_capacity(READBACK_HEADER_LEN + bytes.len());
+    framed.extend_from_slice(&width.to_le_bytes());
+    framed.extend_from_slice(&height.to_le_bytes());
+    framed.extend_from_slice(bytes);
+    framed
+}
 
 /// Headless presenter that renders to CPU pixels and pushes them over IPC.
 pub struct ReadbackPresenter {
@@ -138,13 +175,21 @@ impl SurfacePresenter for ReadbackPresenter {
         pitch: f32,
         fov_degrees: f32,
     ) -> Result<FrameOutcome, PresenterError> {
+        // Capture the frame geometry BEFORE the readback call. The returned
+        // slice borrows `renderer` mutably for as long as `bytes` is live, so an
+        // `&self` accessor cannot be called alongside it (E0502).
+        // `readback_dimensions` returns an owned `Option<(u32, u32)>`, ending
+        // the immutable borrow at this statement.
+        let dims = renderer.readback_dimensions();
         // FOV is plumbed uniformly across impls (PREV-04); the pipeline clamps
         // 1..179 internally.
         renderer.pipeline_mut().set_fov(fov_degrees);
         let left_planes = left.as_planes();
         let right_planes = right.as_planes();
         // The renderer owns the triple-buffered `RgbaReadback`; `None` on the
-        // first two calls during warmup, `Some` from the third onward.
+        // first two calls during warmup, `Some` from the third onward. The
+        // staging buffer is created on the first call and never reset, so `dims`
+        // is `Some` on every tick that yields `Some(bytes)`.
         let rgba = renderer
             .render_and_readback_rgba(&left_planes, &right_planes, yaw, pitch)
             .map_err(|e| PresenterError::Surface {
@@ -155,8 +200,13 @@ impl SurfacePresenter for ReadbackPresenter {
             && let Some(channel) = self.channel.as_ref()
         {
             // Never block the worker on the send: a closed webview just drops the
-            // frame (T-02-10).
-            let _ = channel.send(tauri::ipc::Response::new(bytes.to_vec()));
+            // frame (T-02-10). The frame self-describes its geometry so the
+            // webview sizes its canvas from the frame. If `dims` were somehow
+            // `None` while bytes exist, skip rather than send a headerless frame.
+            if let Some((width, height)) = dims {
+                let payload = frame_with_header(bytes, width, height);
+                let _ = channel.send(tauri::ipc::Response::new(payload));
+            }
         }
         // The readback path has no swapchain; "presented" here means a frame was
         // produced (and, subject to the throttle, delivered) this tick.
@@ -169,6 +219,8 @@ impl SurfacePresenter for ReadbackPresenter {
         left: &YuvData,
         right: &YuvData,
     ) -> Result<FrameOutcome, PresenterError> {
+        // Capture geometry before the readback borrow (see `render_frame`).
+        let dims = renderer.readback_dimensions();
         let left_planes = left.as_planes();
         let right_planes = right.as_planes();
         // Render the source tiles into the internal target and read back,
@@ -182,7 +234,11 @@ impl SurfacePresenter for ReadbackPresenter {
             && self.should_send()
             && let Some(channel) = self.channel.as_ref()
         {
-            let _ = channel.send(tauri::ipc::Response::new(bytes.to_vec()));
+            // Same self-describing header as the panorama path.
+            if let Some((width, height)) = dims {
+                let payload = frame_with_header(bytes, width, height);
+                let _ = channel.send(tauri::ipc::Response::new(payload));
+            }
         }
         Ok(FrameOutcome::Presented)
     }

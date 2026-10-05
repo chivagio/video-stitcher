@@ -439,6 +439,25 @@ impl StitchRenderer {
         self.pipeline.render_target()
     }
 
+    /// The pixel geometry of the tightly-packed RGBA bytes that
+    /// [`render_and_readback_rgba`](Self::render_and_readback_rgba) and
+    /// [`render_source_and_readback_rgba`](Self::render_source_and_readback_rgba)
+    /// return.
+    ///
+    /// This is the [`RgbaReadback`] staging size, not the pipeline viewport:
+    /// the staging buffers are allocated once on the first readback call and
+    /// keep that size even if `pipeline_mut().resize` later moves the pipeline
+    /// viewport. They are never resized or reset afterward, so this is the
+    /// authoritative geometry of the returned frame bytes.
+    ///
+    /// Returns `None` until the first readback call creates the staging
+    /// buffer; callers that need the geometry alongside a readback should read
+    /// it *before* the `&mut self` readback call (the returned slice keeps the
+    /// renderer mutably borrowed for its lifetime).
+    pub fn readback_dimensions(&self) -> Option<(u32, u32)> {
+        self.rgba.as_ref().map(|r| (r.width(), r.height()))
+    }
+
     pub fn coverage(&self) -> &CoverageBoundary {
         &self.coverage
     }
