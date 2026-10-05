@@ -1048,4 +1048,46 @@ mod tests {
         // Exactly one trailing period after the reason (punct trimmed once).
         assert!(!line.contains(".."));
     }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn startup_fallback_reason_reports_a_chain_head_other_than_native() {
+        // G-02-9: when the native arm did not construct, the chain head is a
+        // weaker presenter and the recorded native error is the reason. The
+        // locked line must name that weaker kind.
+        let err = PresenterError::Unsupported {
+            reason: "parent window handle is Wayland(...), not Xlib — Wayland has no \
+                     X11-style child embedding (D-05)"
+                .to_string(),
+        };
+        let chain = [PresenterKind::SeparateWindow, PresenterKind::Readback];
+        let reason =
+            startup_fallback_reason(&chain, Some(&err)).expect("a fallback reason is reported");
+        assert_eq!(reason, err.to_string());
+        assert!(
+            fallback_warn_line(chain[0], &reason)
+                .starts_with("Presenter fallback to Separate window: "),
+            "the locked WARN must name the resolved chain head"
+        );
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn startup_fallback_reason_is_none_when_native_is_active() {
+        // A native/X11 chain head is the strongest presenter: no fallback, so
+        // no reason even if a stale native error were somehow present.
+        let err = PresenterError::Unsupported {
+            reason: "x".to_string(),
+        };
+        let chain = [PresenterKind::Native, PresenterKind::Readback];
+        assert!(startup_fallback_reason(&chain, Some(&err)).is_none());
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn startup_fallback_reason_is_none_for_an_empty_chain() {
+        // An empty chain is a programmer error the worker rejects separately;
+        // the helper must never invent a reason for it.
+        assert!(startup_fallback_reason(&[], None).is_none());
+    }
 }

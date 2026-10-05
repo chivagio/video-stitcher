@@ -180,10 +180,8 @@ fn run_skeleton(app: &mut tauri::App) -> Result<(), SkeletonError> {
     // fallback from native compositing. Carried to the worker, which re-asserts
     // it (with the resolved kind) through `republish_projection` after the
     // webview subscribes — the single locked-WARN delivery point.
-    let chain_kinds: Vec<presenter::PresenterKind> = presenter_chain
-        .iter()
-        .map(|(kind, _)| *kind)
-        .collect();
+    let chain_kinds: Vec<presenter::PresenterKind> =
+        presenter_chain.iter().map(|(kind, _)| *kind).collect();
     let startup_fallback = presenter::startup_fallback_reason(&chain_kinds, native_error.as_ref());
 
     // Ownership handoff (FOUND-03): the device is created *inside* the worker

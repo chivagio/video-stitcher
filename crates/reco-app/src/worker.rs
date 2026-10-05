@@ -4005,6 +4005,97 @@ mod tests {
     }
 
     #[test]
+    fn startup_fallback_republish_reasserts_the_resolved_kind_and_one_locked_warn() {
+        // G-02-9 regression: a chain lacking Native (the native arm failed to
+        // construct on a Wayland handle) activates the first available arm with
+        // the recorded native error as its reason. `republish_projection` — the
+        // single post-subscribe delivery point (F1) — must re-assert BOTH the
+        // resolved kind and the locked fallback WARN, exactly once. No existing
+        // test covers this: `MockBackend` hardcodes `active_kind = Native`.
+        let reason = crate::presenter::PresenterError::Unsupported {
+            reason: "parent window handle is Wayland(...), not Xlib — Wayland has no \
+                     X11-style child embedding (D-05)"
+                .to_string(),
+        }
+        .to_string();
+
+        let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut mock = MockBackend::new(Arc::clone(&ops));
+        mock.active_kind = crate::presenter::PresenterKind::SeparateWindow;
+        mock.active_reason = Some(reason.clone());
+        let (worker, events) = EngineWorker::spawn(mock);
+        let handle = worker.handle();
+        handle.send(WorkerCommand::RepublishProjection).unwrap();
+        handle.send(WorkerCommand::Shutdown).unwrap();
+
+        let seen = drain_until_shutdown(&events);
+        let fallback_events: Vec<_> = seen
+            .iter()
+            .filter_map(|e| match e {
+                WorkerEvent::Presenter {
+                    kind,
+                    reason: Some(r),
+                } => Some((*kind, r.clone())),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            fallback_events.len(),
+            1,
+            "exactly one fallback Presenter event per reconcile, got {fallback_events:?}"
+        );
+        let (kind, reported) = &fallback_events[0];
+        assert_eq!(*kind, crate::presenter::PresenterKind::SeparateWindow);
+
+        // The resolved event projects to the locked WARN shape.
+        let line = WorkerEvent::Presenter {
+            kind: *kind,
+            reason: Some(reported.clone()),
+        }
+        .to_log_line();
+        assert_eq!(line.level, Level::Warn);
+        assert_eq!(
+            line.message,
+            crate::presenter::fallback_warn_line(
+                crate::presenter::PresenterKind::SeparateWindow,
+                &reason
+            )
+        );
+        assert!(
+            line.message
+                .starts_with("Presenter fallback to Separate window: ")
+        );
+
+        // The native path emits no fallback: with `active_reason == None`,
+        // `republish_projection` projects to the INFO `presenter: <Kind>` line.
+        // This half also fails if a duplicate boot emission is introduced.
+        let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (worker, events) = EngineWorker::spawn(MockBackend::new(Arc::clone(&ops)));
+        let handle = worker.handle();
+        handle.send(WorkerCommand::RepublishProjection).unwrap();
+        handle.send(WorkerCommand::Shutdown).unwrap();
+
+        let seen = drain_until_shutdown(&events);
+        let fallback_count = seen
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    WorkerEvent::Presenter {
+                        reason: Some(_),
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(
+            fallback_count, 0,
+            "the native path must emit no fallback Presenter event"
+        );
+    }
+
+    #[test]
     fn show_preview_window_command_reaches_the_backend() {
         // Task 3: ShowPreviewWindow reaches the backend.
         let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
