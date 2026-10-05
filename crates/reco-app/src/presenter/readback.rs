@@ -277,4 +277,47 @@ mod tests {
         p.attach_readback_channel(channel);
         assert!(p.has_channel());
     }
+
+    #[test]
+    fn readback_header_len_is_the_payload_offset() {
+        // The wire layout is `[width: u32 LE][height: u32 LE][RGBA bytes]`, so
+        // the two 4-byte fields put the payload at offset 8. PreviewSurface
+        // .svelte mirrors this constant and its runtime length guard fails
+        // closed if the two ever drift.
+        assert_eq!(READBACK_HEADER_LEN, 8);
+        let framed = frame_with_header(&[1, 2, 3, 4], 2, 1);
+        assert_eq!(framed.len(), READBACK_HEADER_LEN + 4);
+        assert_eq!(&framed[READBACK_HEADER_LEN..], &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn frame_header_is_eight_little_endian_bytes() {
+        let framed = frame_with_header(&[], 1000, 728);
+        assert_eq!(framed.len(), READBACK_HEADER_LEN);
+        assert_eq!(&framed[0..4], &1000u32.to_le_bytes());
+        assert_eq!(&framed[4..8], &728u32.to_le_bytes());
+        // A concrete byte assertion pins endianness and field order, not just
+        // a round-trip through the same encoder.
+        assert_eq!(framed, vec![0xE8, 0x03, 0x00, 0x00, 0xD8, 0x02, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn frame_with_header_appends_the_payload_unchanged() {
+        let payload: Vec<u8> = (0..32).collect();
+        let framed = frame_with_header(&payload, 4, 2);
+        assert_eq!(framed.len(), READBACK_HEADER_LEN + payload.len());
+        assert_eq!(&framed[READBACK_HEADER_LEN..], payload.as_slice());
+    }
+
+    #[test]
+    fn frame_header_encodes_the_dimensions_it_is_given() {
+        // A hard-coded 1240x728 header would fail this: encoding a different
+        // pair must change the bytes.
+        let a = frame_with_header(&[], 1000, 728);
+        let b = frame_with_header(&[], 1240, 728);
+        assert_ne!(a, b);
+        assert_eq!(&a[0..4], &1000u32.to_le_bytes());
+        assert_eq!(&b[0..4], &1240u32.to_le_bytes());
+        assert_eq!(&a[4..8], &b[4..8]);
+    }
 }
