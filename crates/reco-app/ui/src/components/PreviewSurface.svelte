@@ -114,13 +114,36 @@
     if (el.hasPointerCapture(e.pointerId)) el.releasePointerCapture(e.pointerId);
   }
 
+  // The Rust producer's `readback::READBACK_HEADER_LEN` and this constant MUST
+  // agree: the readback frame is `[width: u32 LE][height: u32 LE][RGBA bytes]`.
+  // The length guard below fails closed (no paint) if the two ever drift.
+  const READBACK_HEADER_LEN = 8;
+
   function paintFrame(buffer: ArrayBuffer): void {
     if (!canvasEl) return;
     const ctx = canvasEl.getContext("2d");
     if (!ctx) return;
-    const w = canvasEl.width;
-    const h = canvasEl.height;
-    const imageData = new ImageData(new Uint8ClampedArray(buffer), w, h);
+    if (buffer.byteLength < READBACK_HEADER_LEN) return;
+    const header = new DataView(buffer);
+    const width = header.getUint32(0, true);
+    const height = header.getUint32(4, true);
+    // Fail closed on a malformed frame: reject before allocating or building
+    // ImageData, so a bad header cannot throw inside this uncaught Channel
+    // handler (the prior hard-coded-size ImageData threw IndexSizeError).
+    if (width === 0 || height === 0) return;
+    if (buffer.byteLength !== READBACK_HEADER_LEN + width * height * 4) return;
+    // The canvas backing store follows each frame's own geometry, never the
+    // panel/window geometry -- so collapsing the controls panel or resizing the
+    // window while Readback is active keeps painting. Assign only when the size
+    // changes: a same-size assignment would reset (clear) the 2D context.
+    if (canvasEl.width !== width) canvasEl.width = width;
+    if (canvasEl.height !== height) canvasEl.height = height;
+    const pixels = new Uint8ClampedArray(
+      buffer,
+      READBACK_HEADER_LEN,
+      width * height * 4,
+    );
+    const imageData = new ImageData(pixels, width, height);
     ctx.putImageData(imageData, 0, 0);
   }
 
@@ -200,12 +223,10 @@
         For smooth playback use a separate preview window.
       </p>
     </div>
-    <canvas
-      bind:this={canvasEl}
-      class="readback-canvas"
-      width={1240}
-      height={728}
-    ></canvas>
+    <!-- No fixed width/height: paintFrame sets the backing store from each
+         frame's header, so the canvas always matches the frame geometry the
+         worker produced (1000x728 panel-expanded, 1240x728 collapsed). -->
+    <canvas bind:this={canvasEl} class="readback-canvas"></canvas>
   {/if}
 </div>
 
