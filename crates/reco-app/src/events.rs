@@ -46,6 +46,102 @@ pub enum Level {
     Error,
 }
 
+/// Which camera input a selection or its metadata belongs to (IMPT-01 / D3-03).
+///
+/// Left/right is semantically load-bearing for stitching, so the role is
+/// explicit and never auto-guessed. Serializes snake_case (`"left"` / `"right"`)
+/// and mirrors into `ui/src/lib/types.ts`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InputRole {
+    /// Camera A — the left feed.
+    Left,
+    /// Camera B — the right feed.
+    Right,
+}
+
+impl InputRole {
+    /// The user-facing slot title (UI-SPEC Copywriting Contract).
+    pub fn label(self) -> &'static str {
+        match self {
+            InputRole::Left => "Camera A (left)",
+            InputRole::Right => "Camera B (right)",
+        }
+    }
+
+    /// The snake_case name used in log lines and typed payloads.
+    pub fn name(self) -> &'static str {
+        match self {
+            InputRole::Left => "left",
+            InputRole::Right => "right",
+        }
+    }
+}
+
+/// Whether a metadata value was read directly from the source or derived
+/// (IMPT-02 / D-05 provenance-over-guessing).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Provenance {
+    /// Read directly from the container/stream.
+    Probed,
+    /// Derived (e.g. duration from frame count ÷ fps); never authoritative.
+    Estimated,
+}
+
+/// One metadata field with its provenance (IMPT-02).
+///
+/// `value` is `None` when the field is genuinely unknown; the UI renders that
+/// as an em-dash, never `0` or blank.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct MetadataField {
+    /// The display value, or `None` when unknown.
+    pub value: Option<String>,
+    /// How the value was obtained.
+    pub provenance: Provenance,
+}
+
+impl MetadataField {
+    /// A value read directly from the source.
+    pub fn probed(value: impl Into<String>) -> Self {
+        Self {
+            value: Some(value.into()),
+            provenance: Provenance::Probed,
+        }
+    }
+
+    /// A derived value; the UI tags it visibly (IMPT-02).
+    pub fn estimated(value: impl Into<String>) -> Self {
+        Self {
+            value: Some(value.into()),
+            provenance: Provenance::Estimated,
+        }
+    }
+
+    /// An unknown field: no value. Provenance records how it *would* have been
+    /// obtained had it been present, so the UI can still render the tag.
+    pub fn missing(provenance: Provenance) -> Self {
+        Self {
+            value: None,
+            provenance,
+        }
+    }
+}
+
+/// The probed metadata for one input, each field tagged with provenance
+/// (IMPT-02). Mirrors into `ui/src/lib/types.ts`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct InputMetadata {
+    /// Frame resolution, e.g. `1920×1080`.
+    pub resolution: MetadataField,
+    /// Frame rate, e.g. `30 fps`.
+    pub fps: MetadataField,
+    /// Duration, derived from frame count ÷ fps when the container omits it.
+    pub duration: MetadataField,
+    /// Codec name (populated in plan 03-02).
+    pub codec: MetadataField,
+}
+
 /// An event emitted by the engine worker and rendered in the webview log pane.
 ///
 /// `Clone + Send + 'static` so it can cross the worker→UI channel; the
@@ -137,6 +233,18 @@ pub enum WorkerEvent {
     View {
         /// The new view mode.
         mode: crate::presenter::ViewMode,
+    },
+
+    /// The probed metadata for one imported input (IMPT-01 / IMPT-02).
+    ///
+    /// Structured — the frontend reads this typed payload and never regex-parses
+    /// log strings (FRICTION A3/A12). The matching INFO line is a human-readable
+    /// summary only; it is not the data channel.
+    ImportMetadata {
+        /// Which input this metadata describes.
+        role: InputRole,
+        /// The per-field metadata with provenance.
+        metadata: InputMetadata,
     },
 }
 
@@ -244,6 +352,16 @@ impl WorkerEvent {
                     }
                 ),
             },
+            WorkerEvent::ImportMetadata { role, metadata } => LogLine {
+                level: Level::Info,
+                // Human-readable summary only; the structured payload travels
+                // under `worker-event-typed` (see main.rs).
+                message: format!(
+                    "metadata: {} {}",
+                    role.name(),
+                    metadata.resolution.value.as_deref().unwrap_or("—"),
+                ),
+            },
         }
     }
 }
@@ -271,6 +389,18 @@ pub enum WorkerError {
     Unsupported {
         /// Which operation was rejected.
         operation: String,
+    },
+
+    /// A command argument failed boundary validation (e.g. an empty input path).
+    ///
+    /// Rejected before any engine work (T-03-01); the UI renders the typed
+    /// `field` / `reason` as text, never a bare code.
+    #[error("invalid {field}: {reason}")]
+    InvalidInput {
+        /// Which argument was rejected.
+        field: String,
+        /// Why it was rejected.
+        reason: String,
     },
 
     /// The worker was already shutting down and refuses new work.
@@ -601,5 +731,68 @@ mod tests {
             line.contains("max 50.9"),
             "the coverage ceiling must be appended to the pose line: {line}"
         );
+    }
+
+    #[test]
+    fn import_metadata_roundtrips_with_snake_case_provenance() {
+        let event = WorkerEvent::ImportMetadata {
+            role: InputRole::Left,
+            metadata: InputMetadata {
+                resolution: MetadataField::probed("1920×1080"),
+                fps: MetadataField::probed("30 fps"),
+                duration: MetadataField::estimated("0:02"),
+                codec: MetadataField::missing(Provenance::Probed),
+            },
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(
+            json.contains("\"kind\":\"import_metadata\""),
+            "unexpected json: {json}"
+        );
+        assert!(json.contains("\"role\":\"left\""), "unexpected json: {json}");
+        assert!(
+            json.contains("\"provenance\":\"estimated\""),
+            "unexpected json: {json}"
+        );
+        assert!(
+            json.contains("\"codec\":{\"value\":null"),
+            "a missing field must serialize as value:null, not a fabricated zero: {json}"
+        );
+        let back: WorkerEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(event, back);
+    }
+
+    #[test]
+    fn import_metadata_projects_to_an_info_metadata_line() {
+        let event = WorkerEvent::ImportMetadata {
+            role: InputRole::Right,
+            metadata: InputMetadata {
+                resolution: MetadataField::probed("1920×1080"),
+                fps: MetadataField::probed("30 fps"),
+                duration: MetadataField::estimated("0:02"),
+                codec: MetadataField::missing(Provenance::Probed),
+            },
+        };
+        let line = event.to_log_line();
+        assert_eq!(line.level, Level::Info);
+        assert_eq!(line.message, "metadata: right 1920×1080");
+    }
+
+    #[test]
+    fn missing_metadata_field_renders_an_em_dash_never_zero() {
+        let event = WorkerEvent::ImportMetadata {
+            role: InputRole::Left,
+            metadata: InputMetadata {
+                resolution: MetadataField::missing(Provenance::Probed),
+                fps: MetadataField::missing(Provenance::Probed),
+                duration: MetadataField::missing(Provenance::Estimated),
+                codec: MetadataField::missing(Provenance::Probed),
+            },
+        };
+        assert!(
+            event.to_log_line().message.contains('—'),
+            "an unknown value must render as an em-dash, never 0"
+        );
+        assert!(!event.to_log_line().message.contains('0'));
     }
 }

@@ -48,3 +48,48 @@ export interface ControlIntent {
 
 /** The event name the Rust bridge emits under. */
 export const WORKER_EVENT = "worker-event";
+
+/**
+ * The typed event name the Rust bridge forwards the full `WorkerEvent` under
+ * (E5). Structured consumers read this and never regex-parse `WORKER_EVENT`
+ * log lines (FRICTION A3/A12).
+ */
+export const WORKER_EVENT_TYPED = "worker-event-typed";
+
+/** Which camera input a selection or its metadata belongs to (IMPT-01). */
+export type InputRole = "left" | "right";
+
+/** Whether a metadata value was probed directly or derived (IMPT-02). */
+export type Provenance = "probed" | "estimated";
+
+/**
+ * One metadata field with its provenance (mirror `events::MetadataField`).
+ * `value: null` means unknown — the UI renders an em-dash, never `0`.
+ */
+export interface MetadataField {
+  value: string | null;
+  provenance: Provenance;
+}
+
+/** The probed metadata for one input (mirror `events::InputMetadata`). */
+export interface InputMetadata {
+  resolution: MetadataField;
+  fps: MetadataField;
+  duration: MetadataField;
+  codec: MetadataField;
+}
+
+/**
+ * The subset of the typed `WorkerEvent` union this phase consumes.
+ *
+ * Serde shape is internally tagged: `{ kind, data }`. The import store reads
+ * `import_metadata`; the union stays open so later calibration variants can be
+ * added without a parallel vocabulary.
+ */
+export type WorkerEventTyped =
+  | { kind: "import_metadata"; data: { role: InputRole; metadata: InputMetadata } }
+  | { kind: "log"; data: LogLine }
+  | { kind: "failed"; data: unknown };
+
+/** The workflow-rail screens (D3-01). Import is the landing screen. */
+export type Screen = "import" | "calibrate" | "preview";

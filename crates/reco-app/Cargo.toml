@@ -43,6 +43,11 @@ reco-autocam = { path = "../reco-autocam", optional = true, default-features = f
 # live behind `unstable` and must not drift underneath the presenter
 # (STATE.md blocker). Do NOT let this float to a caret range.
 tauri = { version = "=2.12.1", features = ["unstable"] }
+# Official Tauri 2 native file-dialog plugin (IMPT-01). Pinned to the Tauri 2
+# line and matched by the JS binding `@tauri-apps/plugin-dialog` 2.8.1. The
+# capability file grants only `dialog:allow-open` / `dialog:allow-save`
+# (least privilege, T-03-02), never `dialog:default`.
+tauri-plugin-dialog = "2.8.1"
 # Raw window-handle ABI (0.6) is used ONLY inside the presenter modules;
 # it never crosses IPC to the frontend (D-02). wgpu 28 also uses
 # raw-window-handle ^0.6, so the handle types are compatible.

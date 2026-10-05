@@ -56,6 +56,10 @@ fn main() -> anyhow::Result<()> {
     init_tracing();
 
     tauri::Builder::default()
+        // Official Tauri 2 dialog plugin (IMPT-01/05/06). Registration alone is
+        // not enough — `capabilities/default.json` grants only
+        // `dialog:allow-open` / `dialog:allow-save` (least privilege, T-03-02).
+        .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             commands::import,
             commands::preview,
@@ -71,7 +75,8 @@ fn main() -> anyhow::Result<()> {
             commands::show_preview_window,
             commands::set_view,
             commands::intent,
-            commands::republish_projection
+            commands::republish_projection,
+            commands::set_input
         ])
         .setup(|app| {
             if let Err(e) = run_skeleton(app) {
@@ -339,6 +344,14 @@ fn install_event_bridge(
             let line = event.to_log_line();
             if let Err(e) = tauri::Emitter::emit(&app, "worker-event", &line) {
                 log::warn!("failed to emit worker event: {e}");
+            }
+            // The typed path (E5): forward the full serialized `WorkerEvent`
+            // under its own event name so structured consumers (the import
+            // store) read typed payloads and never regex-parse the log line
+            // above (FRICTION A3/A12). The `worker-event` LogLine path stays for
+            // the event-log drawer.
+            if let Err(e) = tauri::Emitter::emit(&app, "worker-event-typed", &event) {
+                log::warn!("failed to emit typed worker event: {e}");
             }
         }
     });

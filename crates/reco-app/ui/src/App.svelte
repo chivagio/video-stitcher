@@ -24,6 +24,7 @@
   import { pose } from "./lib/pose.svelte";
   import { presenter } from "./lib/presenter.svelte";
   import { log } from "./lib/log.svelte";
+  import { importStore } from "./lib/import.svelte";
   import PreviewSurface from "./components/PreviewSurface.svelte";
   import Timeline from "./components/Timeline.svelte";
   import TimecodeReadout from "./components/TimecodeReadout.svelte";
@@ -32,7 +33,9 @@
   import PresenterBadge from "./components/PresenterBadge.svelte";
   import ControlsPanel from "./components/ControlsPanel.svelte";
   import LogDrawer from "./components/LogDrawer.svelte";
-  import type { PresenterKind, ViewMode } from "./lib/types";
+  import WorkflowRail from "./components/WorkflowRail.svelte";
+  import ImportScreen from "./components/ImportScreen.svelte";
+  import type { PresenterKind, Screen, ViewMode } from "./lib/types";
 
   // Chrome state (reported to the worker via set_chrome).
   let panelExpanded = $state(false);
@@ -41,6 +44,9 @@
   // View mode (mirrors the worker's ViewMode).
   let viewMode = $state<ViewMode>("panorama");
 
+  // Active screen (D3-01). Import is the landing screen when no result exists.
+  let screen = $state<Screen>("import");
+
   // Initialize stores on mount, then reconcile with the worker.
   onMount(() => {
     void (async () => {
@@ -48,6 +54,10 @@
       await pose.init();
       await presenter.init();
       await log.init();
+      // Subscribe the import store to the typed bridge before the reconcile, so
+      // its listener is registered when `republish_projection` fires (A10
+      // ordering).
+      await importStore.init();
       // Subscribe first, *then* ask the worker to re-assert its state. The
       // worker boots and imports before the webview has loaded, and the event
       // bridge only reaches listeners registered at emit time — so its opening
@@ -65,6 +75,7 @@
       pose.destroy();
       presenter.destroy();
       log.destroy();
+      importStore.destroy();
     };
   });
 
@@ -116,6 +127,20 @@
   // Drawer toggle.
   function handleDrawerToggle(): void {
     drawerExpanded = !drawerExpanded;
+  }
+
+  // Workflow-rail navigation (D3-01). The Calibrate step is disabled in this
+  // tracer plan — its screen ships in plan 03-06 — so only Import/Preview are
+  // reachable here.
+  function handleNavigate(next: Screen): void {
+    if (next === "calibrate") return;
+    screen = next;
+  }
+
+  // Calibrate CTA on the Import screen. The wizard is plan 03-06; this tracer
+  // wires the import seam only, so the button stays a documented stub.
+  function handleCalibrate(): void {
+    screen = "import";
   }
 
   // Pose controls.
@@ -190,87 +215,100 @@
 <svelte:window onkeydown={handleGlobalKeyDown} />
 
 <div class="app-shell">
-  <!-- Preview surface (transparent in native mode) -->
-  <PreviewSurface
-    presenterKind={presenter.kind}
-    {viewMode}
-    onAttachReadback={handleAttachReadback}
-    onShowPreviewWindow={handleShowPreviewWindow}
+  <!-- Workflow rail (D3-01): persistent router on every screen. -->
+  <WorkflowRail
+    active={screen}
+    onNavigate={handleNavigate}
+    logExpanded={drawerExpanded}
+    onToggleLog={handleDrawerToggle}
   />
 
-  <!-- Event-log drawer (above transport bar) -->
+  {#if screen === "import"}
+    <!-- Import screen: opaque dominant, covers the native preview region. -->
+    <ImportScreen onCalibrate={handleCalibrate} />
+  {:else}
+    <!-- Preview surface (transparent in native mode) -->
+    <PreviewSurface
+      presenterKind={presenter.kind}
+      {viewMode}
+      onAttachReadback={handleAttachReadback}
+      onShowPreviewWindow={handleShowPreviewWindow}
+    />
+
+    <!-- Transport bar (bottom) -->
+    <div class="transport-bar" role="toolbar" aria-label="Transport and engine controls">
+      <div class="transport-row">
+        <!-- Timeline row -->
+        <Timeline
+          frame={transport.frame}
+          total={transport.total}
+          disabled={!controlsEnabled}
+          onSeek={handleSeek}
+        />
+        <TimecodeReadout
+          current={transport.currentTimecode}
+          duration={transport.durationTimecode}
+        />
+      </div>
+
+      <div class="transport-row">
+        <!-- Control row -->
+        <TransportButton
+          icon="step-back"
+          label="Step back"
+          disabled={!controlsEnabled}
+          onClick={handleStepBack}
+        />
+        <TransportButton
+          icon={isPlaying ? "pause" : "play"}
+          label={isPlaying ? "Pause" : "Play"}
+          disabled={!controlsEnabled}
+          active={isPlaying}
+          onClick={handlePlayPause}
+        />
+        <TransportButton
+          icon="step-forward"
+          label="Step forward"
+          disabled={!controlsEnabled}
+          onClick={handleStepForward}
+        />
+        <TransportButton
+          icon="loop"
+          label="Loop"
+          disabled={!controlsEnabled}
+          active={transport.loop}
+          onClick={handleLoopToggle}
+        />
+        <ViewToggle
+          mode={viewMode}
+          disabled={!controlsEnabled}
+          onToggle={handleViewToggle}
+        />
+        <TransportButton
+          icon="log"
+          label="Log"
+          active={drawerExpanded}
+          onClick={handleDrawerToggle}
+        />
+        <PresenterBadge
+          label={presenter.badgeLabel}
+          isWarning={isWarning}
+        />
+      </div>
+    </div>
+
+    <!-- Controls panel (right edge) -->
+    <ControlsPanel
+      expanded={panelExpanded}
+      onToggle={handlePanelToggle}
+      onFovChange={handleFovChange}
+      onResetView={handleResetView}
+      onPresenterChange={handlePresenterChange}
+    />
+  {/if}
+
+  <!-- Event-log drawer (global; toggled from the workflow rail). -->
   <LogDrawer expanded={drawerExpanded} onToggle={handleDrawerToggle} />
-
-  <!-- Transport bar (bottom) -->
-  <div class="transport-bar" role="toolbar" aria-label="Transport and engine controls">
-    <div class="transport-row">
-      <!-- Timeline row -->
-      <Timeline
-        frame={transport.frame}
-        total={transport.total}
-        disabled={!controlsEnabled}
-        onSeek={handleSeek}
-      />
-      <TimecodeReadout
-        current={transport.currentTimecode}
-        duration={transport.durationTimecode}
-      />
-    </div>
-
-    <div class="transport-row">
-      <!-- Control row -->
-      <TransportButton
-        icon="step-back"
-        label="Step back"
-        disabled={!controlsEnabled}
-        onClick={handleStepBack}
-      />
-      <TransportButton
-        icon={isPlaying ? "pause" : "play"}
-        label={isPlaying ? "Pause" : "Play"}
-        disabled={!controlsEnabled}
-        active={isPlaying}
-        onClick={handlePlayPause}
-      />
-      <TransportButton
-        icon="step-forward"
-        label="Step forward"
-        disabled={!controlsEnabled}
-        onClick={handleStepForward}
-      />
-      <TransportButton
-        icon="loop"
-        label="Loop"
-        disabled={!controlsEnabled}
-        active={transport.loop}
-        onClick={handleLoopToggle}
-      />
-      <ViewToggle
-        mode={viewMode}
-        disabled={!controlsEnabled}
-        onToggle={handleViewToggle}
-      />
-      <TransportButton
-        icon="log"
-        label="Log"
-        active={drawerExpanded}
-        onClick={handleDrawerToggle}
-      />
-      <PresenterBadge
-        label={presenter.badgeLabel}
-        isWarning={isWarning}
-      />
-    </div>
-  </div>
-
-  <!-- Controls panel (right edge) -->
-  <ControlsPanel
-    expanded={panelExpanded}
-    onToggle={handlePanelToggle}
-    onFovChange={handleFovChange}
-    onResetView={handleResetView}
-    onPresenterChange={handlePresenterChange}
-  />
 </div>
 
 <style>

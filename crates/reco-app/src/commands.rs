@@ -271,6 +271,49 @@ pub async fn set_view(
     state.send(WorkerCommand::SetView(mode))
 }
 
+/// Validate an operator-supplied input path at the command boundary.
+///
+/// The path is a local file string chosen by the native dialog or an HTML5
+/// drop; this is a cheap sanity gate, not a path constructor. It rejects
+/// empty/whitespace paths before they reach the worker so a blank selection
+/// cannot trigger an FFmpeg open (T-03-01). Extracted as a pure function so the
+/// boundary check is unit-testable without a Tauri `State`.
+fn validate_input_path(path: &str) -> Result<(), WorkerError> {
+    if path.trim().is_empty() {
+        return Err(WorkerError::InvalidInput {
+            field: "path".to_string(),
+            reason: "path must not be empty".to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Set the operator-chosen video path for one camera input (IMPT-01).
+///
+/// Thin, same contract as [`import`]: validate the path, post a typed
+/// `WorkerCommand::SetInput`, and return. The worker probes the file with
+/// FFmpeg and emits a typed `ImportMetadata` event. Names no engine type.
+///
+/// # Why `rename_all = "snake_case"`
+///
+/// `role` and `path` are single words today, but the command is pinned to the
+/// crate's snake_case IPC protocol so a future argument rename cannot reintroduce
+/// the silent-never-fires bug recorded in `crates/reco-app/FRICTION.md` A7.
+///
+/// # Errors
+///
+/// Returns [`WorkerError::InvalidInput`] for an empty path, or
+/// [`WorkerError::ChannelClosed`] if the worker has already exited.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn set_input(
+    state: tauri::State<'_, WorkerHandle>,
+    role: crate::events::InputRole,
+    path: String,
+) -> Result<(), WorkerError> {
+    validate_input_path(&path)?;
+    state.send(WorkerCommand::SetInput { role, path })
+}
+
 /// Forward a transport-agnostic input intent to the worker (PREV-04).
 ///
 /// Thin, same contract as [`play`]: post `Intent` and return. The typed
@@ -416,6 +459,19 @@ pub enum WorkerCommand {
     /// worker applies the switch at a tick boundary; the playhead and pose are
     /// preserved.
     SetView(crate::presenter::ViewMode),
+
+    /// Set the operator-chosen video path for one camera input (IMPT-01).
+    ///
+    /// Carries only a typed [`InputRole`](crate::events::InputRole) and a local
+    /// file path string chosen by the native dialog or an HTML5 drop. The worker
+    /// probes the file with FFmpeg and emits a typed `ImportMetadata` event. A
+    /// job: it blocks on the probe, so the loop re-drains after it.
+    SetInput {
+        /// Which camera input the path belongs to.
+        role: crate::events::InputRole,
+        /// The local file path to probe.
+        path: String,
+    },
 
     /// Stop the worker loop and return.
     Shutdown,
@@ -591,5 +647,38 @@ mod tests {
                 other => panic!("expected Unsupported for {bad}, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn validate_input_path_rejects_empty_and_whitespace() {
+        assert!(validate_input_path("/media/clip.mp4").is_ok());
+        for bad in ["", "   ", "\t\n"] {
+            match validate_input_path(bad) {
+                Err(WorkerError::InvalidInput { field, reason }) => {
+                    assert_eq!(field, "path");
+                    assert!(reason.contains("must not be empty"), "reason: {reason}");
+                }
+                other => panic!("expected InvalidInput for {bad:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn set_input_command_round_trips_through_the_channel() {
+        let (tx, rx) = mpsc::channel();
+        let handle = WorkerHandle::new(tx);
+        handle
+            .send(WorkerCommand::SetInput {
+                role: crate::events::InputRole::Left,
+                path: "/media/a.mp4".to_string(),
+            })
+            .unwrap();
+        assert_eq!(
+            rx.recv().unwrap(),
+            WorkerCommand::SetInput {
+                role: crate::events::InputRole::Left,
+                path: "/media/a.mp4".to_string()
+            }
+        );
     }
 }

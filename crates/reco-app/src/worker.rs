@@ -176,6 +176,14 @@ impl EventSink {
     fn view(&self, mode: crate::presenter::ViewMode) {
         let _ = self.tx.send(WorkerEvent::View { mode });
     }
+
+    /// Emit the probed metadata for one imported input (IMPT-01/IMPT-02).
+    ///
+    /// Structured: the frontend reads the typed payload under
+    /// `worker-event-typed` and never regex-parses a log line (FRICTION A3/A12).
+    fn metadata(&self, role: crate::events::InputRole, metadata: crate::events::InputMetadata) {
+        let _ = self.tx.send(WorkerEvent::ImportMetadata { role, metadata });
+    }
 }
 
 /// The recovery action a classified surface error demands (FOUND-05).
@@ -290,6 +298,79 @@ pub fn new_session_transport(
     transport
 }
 
+/// Project a probed [`VideoProbe`](reco_io::ffmpeg::calibration_io::VideoProbe)
+/// into the UI-facing [`InputMetadata`](crate::events::InputMetadata) with
+/// per-field provenance (IMPT-02 / D3-04).
+///
+/// Pure and GPU-free so the provenance mapping is unit-testable in CI. The
+/// mapping is the whole point of IMPT-02:
+///
+/// * `resolution` — read directly from the decoder → `Probed`.
+/// * `fps` — read directly from the decoder → `Probed`.
+/// * `duration` — derived from `total_frames / fps` (and `total_frames` is
+///   itself a `duration × fps` estimate) → `Estimated`; never authoritative.
+/// * `codec` — not available on `VideoProbe` yet (plan 03-02 adds it) → absent
+///   (`value: None`), rendered as an em-dash, never `0`.
+pub fn project_metadata(
+    probe: &reco_io::ffmpeg::calibration_io::VideoProbe,
+) -> crate::events::InputMetadata {
+    use crate::events::{InputMetadata, MetadataField, Provenance};
+
+    let resolution = if probe.width > 0 && probe.height > 0 {
+        MetadataField::probed(format!("{}×{}", probe.width, probe.height))
+    } else {
+        MetadataField::missing(Provenance::Probed)
+    };
+
+    let fps = if probe.fps > 0.0 {
+        MetadataField::probed(format_fps(probe.fps))
+    } else {
+        MetadataField::missing(Provenance::Probed)
+    };
+
+    let duration = if probe.fps > 0.0 && probe.total_frames > 0 {
+        MetadataField::estimated(format_duration(probe.total_frames as f64 / probe.fps))
+    } else {
+        MetadataField::missing(Provenance::Estimated)
+    };
+
+    // Codec is not on `VideoProbe` yet (plan 03-02 extends it). Absent, not zero.
+    let codec = MetadataField::missing(Provenance::Probed);
+
+    InputMetadata {
+        resolution,
+        fps,
+        duration,
+        codec,
+    }
+}
+
+/// Format a frame rate for display, trimming trailing zeros (`30 fps`,
+/// `29.97 fps`).
+fn format_fps(fps: f64) -> String {
+    let mut s = format!("{fps:.3}");
+    while s.contains('.') && s.ends_with('0') {
+        s.pop();
+    }
+    if s.ends_with('.') {
+        s.pop();
+    }
+    format!("{s} fps")
+}
+
+/// Format a duration in seconds as `M:SS` (or `H:MM:SS` past an hour).
+fn format_duration(secs: f64) -> String {
+    let total = secs.max(0.0).round() as u64;
+    let hours = total / 3600;
+    let minutes = (total % 3600) / 60;
+    let seconds = total % 60;
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes}:{seconds:02}")
+    }
+}
+
 /// The engine side of the worker, behind a trait so the protocol is testable
 /// without a GPU.
 ///
@@ -299,6 +380,19 @@ pub fn new_session_transport(
 pub trait EngineBackend: Send {
     /// Load the hardcoded clips and calibration into the session.
     fn import(&mut self, events: &EventSink) -> Result<(), WorkerError>;
+
+    /// Set the operator-chosen path for one camera input and probe it
+    /// (IMPT-01 / IMPT-02).
+    ///
+    /// The real backend probes via FFmpeg and emits a typed
+    /// `ImportMetadata`; the GPU-free mock records the call and emits a
+    /// fabricated metadata event so the protocol is testable without a GPU.
+    fn set_input(
+        &mut self,
+        role: crate::events::InputRole,
+        path: String,
+        events: &EventSink,
+    ) -> Result<(), WorkerError>;
 
     /// Begin a preview **session**: build/ensure the renderer, paint the idle
     /// frame, and start the transport, but do NOT run a frame loop.
@@ -657,6 +751,11 @@ fn handle_command<B: EngineBackend>(
         WorkerCommand::SetView(mode) => {
             backend.set_view(mode, events);
         }
+        WorkerCommand::SetInput { role, path } => {
+            if let Err(e) = backend.set_input(role, path, events) {
+                events.failed(e);
+            }
+        }
         WorkerCommand::Export => {
             interrupted.store(false, Ordering::SeqCst);
             match backend.export(events, interrupted) {
@@ -731,7 +830,10 @@ fn worker_loop<B: EngineBackend>(
                 Ok(cmd) => {
                     let is_job = matches!(
                         cmd,
-                        WorkerCommand::Import | WorkerCommand::Preview | WorkerCommand::Export
+                        WorkerCommand::Import
+                            | WorkerCommand::Preview
+                            | WorkerCommand::Export
+                            | WorkerCommand::SetInput { .. }
                     );
                     let keep_going = handle_command(cmd, &mut backend, &events, &interrupted);
                     ran_job |= is_job;
@@ -947,6 +1049,11 @@ pub struct GpuEngineBackend {
     /// render path from it. A switch is applied at a tick boundary and never
     /// touches the transport frame or pose.
     view_mode: crate::presenter::ViewMode,
+    /// The operator-chosen input paths, keyed by role (IMPT-01).
+    ///
+    /// Populated by `SetInput`; the worker owns them so the webview never holds
+    /// an engine-reachable path. Plan 03-03 reads this to run calibration.
+    input_paths: std::collections::HashMap<crate::events::InputRole, String>,
     /// The loaded calibration, if `Import` has run.
     calibration: Option<reco_core::calibration::MatchCalibration>,
     /// The open decode source, if `Import` has run.
@@ -1118,6 +1225,7 @@ impl GpuEngineBackend {
             window_height: 800,
             chrome: crate::presenter::ChromeState::default(),
             view_mode: crate::presenter::ViewMode::Panorama,
+            input_paths: std::collections::HashMap::new(),
             calibration: None,
             source: None,
             input_size: None,
@@ -1486,6 +1594,28 @@ impl EngineBackend for GpuEngineBackend {
             self.source.as_ref().and_then(|s| s.total_frames())
         });
         self.loaded = Some(transport);
+        Ok(())
+    }
+
+    fn set_input(
+        &mut self,
+        role: crate::events::InputRole,
+        path: String,
+        events: &EventSink,
+    ) -> Result<(), WorkerError> {
+        // Probe via the worker's own FFmpeg path (reco-io); no engine entry point
+        // is named by the command handler — this is the worker's job.
+        let probe = reco_io::ffmpeg::calibration_io::probe_video(std::path::Path::new(&path))
+            .map_err(|e| WorkerError::Engine(e.to_string()))?;
+        let metadata = project_metadata(&probe);
+        let filename = std::path::Path::new(&path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(path.as_str())
+            .to_string();
+        self.input_paths.insert(role, path);
+        events.info(format!("{} selected: {filename}", role.label()));
+        events.metadata(role, metadata);
         Ok(())
     }
 
@@ -2413,6 +2543,33 @@ mod tests {
             Ok(())
         }
 
+        fn set_input(
+            &mut self,
+            role: crate::events::InputRole,
+            path: String,
+            events: &EventSink,
+        ) -> Result<(), WorkerError> {
+            self.record("set_input");
+            let filename = std::path::Path::new(&path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(path.as_str())
+                .to_string();
+            events.info(format!("{} selected: {filename}", role.label()));
+            // Mirror the real backend's typed event shape so a worker-loop test
+            // can assert the protocol without a GPU.
+            events.metadata(
+                role,
+                crate::events::InputMetadata {
+                    resolution: crate::events::MetadataField::probed("1920×1080"),
+                    fps: crate::events::MetadataField::probed("30 fps"),
+                    duration: crate::events::MetadataField::estimated("0:02"),
+                    codec: crate::events::MetadataField::missing(crate::events::Provenance::Probed),
+                },
+            );
+            Ok(())
+        }
+
         fn begin_preview(&mut self, events: &EventSink) -> Result<(), WorkerError> {
             self.record("begin_preview");
             // Mirror the real backend exactly: the session transport is built
@@ -2720,6 +2877,68 @@ mod tests {
         fn shutdown(&mut self) {
             self.record("shutdown");
         }
+    }
+
+    #[test]
+    fn project_metadata_marks_derived_duration_estimated_and_absent_codec_missing() {
+        use crate::events::Provenance;
+        let probe = reco_io::ffmpeg::calibration_io::VideoProbe {
+            width: 1920,
+            height: 1080,
+            fps: 30.0,
+            total_frames: 60,
+        };
+        let md = project_metadata(&probe);
+        assert_eq!(md.resolution.value.as_deref(), Some("1920×1080"));
+        assert_eq!(md.resolution.provenance, Provenance::Probed);
+        assert_eq!(md.fps.value.as_deref(), Some("30 fps"));
+        assert_eq!(md.fps.provenance, Provenance::Probed);
+        // 60 frames / 30 fps = 2 s -> "0:02", and it is DERIVED (estimated).
+        assert_eq!(md.duration.value.as_deref(), Some("0:02"));
+        assert_eq!(md.duration.provenance, Provenance::Estimated);
+        // Codec is not on VideoProbe yet (plan 03-02) -> absent, never 0.
+        assert_eq!(md.codec.value, None);
+    }
+
+    #[test]
+    fn project_metadata_handles_a_degenerate_probe_without_fabricating_values() {
+        use crate::events::Provenance;
+        let probe = reco_io::ffmpeg::calibration_io::VideoProbe {
+            width: 0,
+            height: 0,
+            fps: 0.0,
+            total_frames: 0,
+        };
+        let md = project_metadata(&probe);
+        assert_eq!(md.resolution.value, None);
+        assert_eq!(md.fps.value, None);
+        assert_eq!(md.duration.value, None);
+        assert_eq!(md.duration.provenance, Provenance::Estimated);
+    }
+
+    #[test]
+    fn set_input_emits_a_typed_import_metadata_event() {
+        let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (worker, events) = EngineWorker::spawn(MockBackend::new(Arc::clone(&ops)));
+        let handle = worker.handle();
+        handle
+            .send(WorkerCommand::SetInput {
+                role: crate::events::InputRole::Left,
+                path: "/media/a.mp4".to_string(),
+            })
+            .unwrap();
+        handle.send(WorkerCommand::Shutdown).unwrap();
+
+        let seen = drain_until_shutdown(&events);
+        assert!(
+            seen.iter().any(|e| matches!(
+                e,
+                WorkerEvent::ImportMetadata { role, .. }
+                    if *role == crate::events::InputRole::Left
+            )),
+            "SetInput must emit a typed ImportMetadata event: {seen:?}"
+        );
+        assert!(ops_without_pointer_drain(&ops).contains(&"set_input"));
     }
 
     /// Drain events until `Shutdown`'s info line arrives, or time out.
