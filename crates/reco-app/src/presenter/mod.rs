@@ -251,6 +251,29 @@ pub fn fallback_warn_line(kind: PresenterKind, reason: &str) -> String {
     )
 }
 
+/// The startup fallback reason for a presenter chain, or `None` when the chain
+/// activated its strongest available arm.
+///
+/// This encodes the startup analogue of the attempt-first posture (RESEARCH
+/// Pattern 2 / 02-PRESENTER-POSTURE): the worker activates the FIRST chain entry
+/// it receives, so if that entry is not [`PresenterKind::Native`] the activation
+/// is a fallback from native compositing and `native_error` — recorded in
+/// `run_skeleton` when the native arm failed to construct — is its reason. When
+/// the first entry *is* Native, no fallback occurred and the reason is `None`.
+///
+/// Returns `None` for an empty chain (a programmer error the worker rejects
+/// separately) so the helper never invents a reason for a chain that has none.
+#[cfg(all(unix, not(target_os = "macos")))]
+pub fn startup_fallback_reason(
+    chain: &[PresenterKind],
+    native_error: Option<&PresenterError>,
+) -> Option<String> {
+    match chain.first() {
+        Some(PresenterKind::Native) | None => None,
+        Some(_) => native_error.map(|e| e.to_string()),
+    }
+}
+
 /// The webview chrome's collapsible state (UI-SPEC Surface Layout Contract).
 ///
 /// This is the Rust-side source of truth for the *native* viewport geometry;

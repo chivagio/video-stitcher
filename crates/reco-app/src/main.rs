@@ -111,8 +111,24 @@ fn run_skeleton(app: &mut tauri::App) -> Result<(), SkeletonError> {
     // the device. It is explicitly lowered below the webview before the webview
     // is added, so pointer events reach the chrome.
     let instance = reco_core::wgpu::Instance::default();
-    let mut presenter = X11Presenter::new(&window, &instance, rect)?;
-    presenter.lower();
+    // The native arm is the strongest (zero-copy) presenter but is available
+    // only on an X11/Xlib parent handle. Attempt it first and, on a capability
+    // fall-through (e.g. a native Wayland handle, D-05), record the reason and
+    // omit the arm — mirroring 02-06's catch-and-omit shape for the
+    // separate-window arm. A non-fall-through construction failure stays fatal.
+    let mut native_error: Option<PresenterError> = None;
+    let native_presenter: Option<X11Presenter> = match X11Presenter::new(&window, &instance, rect) {
+        Ok(mut presenter) => {
+            presenter.lower();
+            Some(presenter)
+        }
+        Err(e) if presenter::is_fallthrough(&e) => {
+            log::warn!("native presenter unavailable, falling back: {e}");
+            native_error = Some(e);
+            None
+        }
+        Err(e) => return Err(SkeletonError::Presenter(e)),
+    };
 
     // Pre-create the Rust-owned, webview-less preview window on the SETUP thread
     // (PREV-05 / RESEARCH Pattern 5): it starts hidden, and the separate-window
@@ -143,8 +159,14 @@ fn run_skeleton(app: &mut tauri::App) -> Result<(), SkeletonError> {
     // three are pre-created here on the setup thread; the worker installs the
     // active one and can swap at a tick boundary on a manual override (Task 3).
     // Readback is trivially cheap (no surface; it shares the worker's device).
-    let mut presenter_chain: worker::PresenterChain =
-        vec![(presenter::PresenterKind::Native, Box::new(presenter))];
+    //
+    // The chain is built conditionally from the arms that constructed, in fixed
+    // strongest-first order — Native → SeparateWindow → Readback — because the
+    // worker activates the FIRST entry it receives.
+    let mut presenter_chain: worker::PresenterChain = Vec::new();
+    if let Some(native) = native_presenter {
+        presenter_chain.push((presenter::PresenterKind::Native, Box::new(native)));
+    }
     if let Some(separate) = separate_window_presenter {
         presenter_chain.push((presenter::PresenterKind::SeparateWindow, Box::new(separate)));
     }
@@ -153,12 +175,24 @@ fn run_skeleton(app: &mut tauri::App) -> Result<(), SkeletonError> {
         Box::new(presenter::readback::ReadbackPresenter::new(rect)),
     ));
 
+    // The startup fall-through reason: non-`None` only when the native arm did
+    // not construct, so the worker's activated presenter (the chain head) is a
+    // fallback from native compositing. Carried to the worker, which re-asserts
+    // it (with the resolved kind) through `republish_projection` after the
+    // webview subscribes — the single locked-WARN delivery point.
+    let chain_kinds: Vec<presenter::PresenterKind> = presenter_chain
+        .iter()
+        .map(|(kind, _)| *kind)
+        .collect();
+    let startup_fallback = presenter::startup_fallback_reason(&chain_kinds, native_error.as_ref());
+
     // Ownership handoff (FOUND-03): the device is created *inside* the worker
     // from the presenter's surface, so the worker is the sole device owner.
     // Nothing on this (the setup) thread holds a device handle or renders
     // directly. The readback sender is the worker's channel path for
     // `preview_attach_readback` (PREV-05).
-    let (worker, events, readback_tx) = worker::spawn_gpu_worker(instance, presenter_chain, rect)?;
+    let (worker, events, readback_tx) =
+        worker::spawn_gpu_worker(instance, presenter_chain, rect, startup_fallback)?;
 
     // The webview bridge: drain typed worker events on an async Tauri task and
     // forward each one to the frontend. The JS `listen("worker-event")` side

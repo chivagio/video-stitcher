@@ -978,6 +978,17 @@ pub struct GpuEngineBackend {
     presenters: [Option<Box<dyn crate::presenter::SurfacePresenter + Send>>; 3],
     /// Which chain entry [`Self::presenter`] currently is.
     active_kind: crate::presenter::PresenterKind,
+    /// The reason the active presenter was chosen, when it was a fallback;
+    /// `None` when the active presenter is the strongest available.
+    ///
+    /// Set from the startup fall-through reason at construction (when the native
+    /// arm did not build, `run_skeleton` records its `Unsupported` reason) and
+    /// re-asserted by [`Self::republish_projection`] so the subscribed webview
+    /// receives the resolved presenter together with its single locked fallback
+    /// WARN (F1 subscribe-after-emit ordering). `set_presenter` keeps it in sync
+    /// on every arm so a manual override cannot diverge from what
+    /// `republish_projection` re-asserts.
+    active_reason: Option<String>,
     /// Receives webview readback channels attached by `preview_attach_readback`
     /// (PREV-05). The channel is a Tauri IPC type, not an engine type, so it
     /// travels on its own path rather than the typed `WorkerCommand` enum.
@@ -1022,6 +1033,7 @@ impl GpuEngineBackend {
         instance: reco_core::wgpu::Instance,
         presenters: PresenterChain,
         viewport: crate::presenter::ViewportRect,
+        startup_fallback: Option<String>,
     ) -> Result<Self, WorkerError> {
         // The presenter chain (PREV-05), strongest-first, pre-built on the setup
         // thread. Index each presenter into its fixed chain slot; the first entry
@@ -1112,6 +1124,7 @@ impl GpuEngineBackend {
             presenter,
             presenters: slots,
             active_kind,
+            active_reason: startup_fallback,
             readback_rx,
             readback_tx,
             instance,
@@ -1871,10 +1884,14 @@ impl EngineBackend for GpuEngineBackend {
             self.fov_ceiling(),
         );
         events.view(self.view_mode);
-        // `reason` is deliberately omitted: the fallback that selected this
-        // presenter already reported its reason, and re-announcing it would
-        // duplicate the warning on every reconcile.
-        events.presenter(self.active_kind, None);
+        // Re-assert the resolved presenter with its fallback reason. The
+        // frontend subscribes and only then invokes `republish_projection`
+        // (App.svelte), so this is the single delivery point for a startup
+        // fallback WARN: the reason is delivered exactly once per reconcile
+        // instead of at worker boot, where the F1 subscribe-after-emit ordering
+        // would drop it. When `active_reason` is `None` (the native path) this
+        // still projects to the `presenter: <Kind>` INFO line.
+        events.presenter(self.active_kind, self.active_reason.clone());
     }
 
     fn set_chrome(&mut self, chrome: crate::presenter::ChromeState, events: &EventSink) {
@@ -2195,8 +2212,9 @@ pub fn spawn_gpu_worker(
     instance: reco_core::wgpu::Instance,
     presenters: PresenterChain,
     viewport: crate::presenter::ViewportRect,
+    startup_fallback: Option<String>,
 ) -> Result<SpawnedWorker, WorkerError> {
-    let backend = GpuEngineBackend::new(instance, presenters, viewport)?;
+    let backend = GpuEngineBackend::new(instance, presenters, viewport, startup_fallback)?;
     let readback_tx = backend.readback_sender();
     let (worker, events) = EngineWorker::spawn(backend);
     Ok((worker, events, readback_tx))
