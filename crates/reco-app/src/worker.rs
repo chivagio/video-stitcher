@@ -1987,6 +1987,8 @@ impl EngineBackend for GpuEngineBackend {
         // untouched either way; a swap happens only at this command boundary).
         if kind == self.active_presenter() {
             events.info(format!("presenter: {} (already active)", kind.name()));
+            // The active presenter is the requested one and is not a fallback.
+            self.active_reason = None;
             events.presenter(kind, None);
             return;
         }
@@ -2022,20 +2024,27 @@ impl EngineBackend for GpuEngineBackend {
             // Fallback to a weaker presenter: exactly one WARN line carrying the
             // reason and the remediation (Phase 1 D-05; never silent).
             Some(err) => {
-                events.presenter(chosen, Some(err.to_string()));
+                let reason = err.to_string();
+                // Keep `active_reason` in sync so `republish_projection` (which
+                // re-asserts the presenter after subscribe) reports the same
+                // resolved fallback the set_presenter path just announced.
+                self.active_reason = Some(reason.clone());
+                events.presenter(chosen, Some(reason.clone()));
                 events.log(
                     Level::Warn,
-                    crate::presenter::fallback_warn_line(chosen, &err.to_string()),
+                    crate::presenter::fallback_warn_line(chosen, &reason),
                 );
             }
             // Successful manual selection: an INFO line, no WARN.
             None if chosen == kind => {
+                self.active_reason = None;
                 events.info(format!("presenter switched to {}", chosen.name()));
                 events.presenter(chosen, None);
             }
             // The requested kind failed with fall-through but a weaker kind
             // succeeded: report the fallback without a WARN.
             None => {
+                self.active_reason = None;
                 events.info(format!(
                     "presenter override to {} resolved to {}",
                     kind.name(),
@@ -2284,6 +2293,11 @@ mod tests {
         lost: Arc<AtomicBool>,
         /// The mock's active presenter (PREV-05).
         active_kind: crate::presenter::PresenterKind,
+        /// The mock's active-presenter reason when it is a fallback; mirrors the
+        /// real backend's `active_reason` so a test can assert that
+        /// `republish_projection` re-asserts the resolved kind and the locked
+        /// `Presenter fallback to <kind>: <reason>. <remediation>.` WARN.
+        active_reason: Option<String>,
         /// The mock's current view mode (PREV-03).
         view_mode: crate::presenter::ViewMode,
         /// The transport built by the mock's `import`, mirroring the real
@@ -2344,6 +2358,7 @@ mod tests {
                 tick_fails: false,
                 lost: Arc::new(AtomicBool::new(false)),
                 active_kind: crate::presenter::PresenterKind::Native,
+                active_reason: None,
                 view_mode: crate::presenter::ViewMode::Panorama,
                 pending_gesture: None,
                 frames_served: 0,
@@ -2578,7 +2593,7 @@ mod tests {
             let fov = self.pose.lock().unwrap().current_fov_deg();
             events.pose(pose.yaw, pose.pitch, fov, self.fov_ceiling());
             events.view(self.view_mode);
-            events.presenter(self.active_kind, None);
+            events.presenter(self.active_kind, self.active_reason.clone());
         }
 
         fn set_chrome(&mut self, _chrome: crate::presenter::ChromeState, _events: &EventSink) {
@@ -2632,6 +2647,9 @@ mod tests {
         fn set_presenter(&mut self, kind: crate::presenter::PresenterKind, events: &EventSink) {
             self.record("set_presenter");
             self.active_kind = kind;
+            // Mirror the real backend: a manual selection is not a fallback, so
+            // the reason is cleared alongside the kind.
+            self.active_reason = None;
             events.presenter(kind, None);
         }
 
