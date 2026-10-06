@@ -443,6 +443,36 @@ pub struct LensProfileSummary {
 
 // ── Calibration Result ───────────────────────────────────────────
 
+/// Which sync path produced a calibration's temporal offset (CALB-03 / D3-14).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncMethod {
+    /// Sync came from IMU/gyroscope telemetry.
+    Imu,
+    /// Sync came from audio cross-correlation.
+    Audio,
+    /// Sync was set manually by the operator.
+    Manual,
+    /// No sync was applied (the offset defaults to zero).
+    None,
+}
+
+/// Temporal sync provenance carried on [`CalibrationResult`] (CALB-03 / D3-14).
+///
+/// The scorecard reports method + confidence; IMU/manual paths have no
+/// confidence and report `None` ("Not reported"), never a fabricated number.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct SyncInfo {
+    /// Which path produced the offset.
+    pub method: SyncMethod,
+    /// Confidence of the sync estimate, when the path reports one.
+    ///
+    /// `None` for IMU (no confidence is computed) and for manual/None.
+    pub confidence: Option<f64>,
+    /// Applied sync offset in frames.
+    pub offset_frames: i64,
+}
+
 /// Output of a successful calibration run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CalibrationResult {
@@ -465,6 +495,8 @@ pub struct CalibrationResult {
     pub right_lens_profile: Option<LensProfileInfo>,
     /// Detailed quality metrics for diagnostics.
     pub quality: Option<CalibrationQuality>,
+    /// Sync method, confidence, and applied offset (CALB-03).
+    pub sync: SyncInfo,
 }
 
 /// Detailed calibration quality metrics.

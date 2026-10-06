@@ -41,7 +41,9 @@ use reco_core::gpu::GpuContext;
 
 use crate::error::CalibrateError;
 use crate::telemetry::TelemetryData;
-use crate::types::{CalibrationConfig, CalibrationResult, LensProfileInfo, YuvFrame};
+use crate::types::{
+    CalibrationConfig, CalibrationResult, LensProfileInfo, SyncInfo, SyncMethod, YuvFrame,
+};
 use crate::{audio_sync, lens_database, sampling, telemetry};
 
 /// Video metadata that the app provides from its decoder.
@@ -88,6 +90,11 @@ pub struct CalibrationPipeline {
     /// Cached parsed telemetry for the right video. See [`Self::left_telemetry`].
     right_telemetry: Option<Result<TelemetryData, ()>>,
     sync_offset_frames: i64,
+    /// Which path produced [`Self::sync_offset_frames`] (CALB-03).
+    sync_method: SyncMethod,
+    /// Confidence reported by the sync path, when it reports one. `None`
+    /// for IMU and manual paths — never a fabricated number.
+    sync_confidence: Option<f64>,
     /// IMU seeds extracted during imu_sync
     imu_xrz_seed: Option<f64>,
     imu_xrx_seed: Option<f64>,
@@ -117,6 +124,8 @@ impl CalibrationPipeline {
             left_telemetry: None,
             right_telemetry: None,
             sync_offset_frames: 0,
+            sync_method: SyncMethod::None,
+            sync_confidence: None,
             imu_xrz_seed: None,
             imu_xrx_seed: None,
             imu_zrx_seed: None,
@@ -277,8 +286,13 @@ impl CalibrationPipeline {
     // ---------------------------------------------------------------
 
     /// Set sync offset manually (in frames).
+    ///
+    /// Marks the sync method as [`SyncMethod::Manual`] and clears any
+    /// previously captured confidence (manual offsets carry none).
     pub fn set_sync_offset(&mut self, frames: i64) {
         self.sync_offset_frames = frames;
+        self.sync_method = SyncMethod::Manual;
+        self.sync_confidence = None;
     }
 
     /// Current sync offset in frames.
@@ -335,6 +349,8 @@ impl CalibrationPipeline {
         // Telemetry borrows released here; safe to mutate self.
         if let Some(frames) = sync_computed {
             self.sync_offset_frames = frames;
+            // IMU computes no confidence; leave it `None` (CALB-03/D3-14).
+            self.sync_method = SyncMethod::Imu;
         }
 
         if let Some((roll, pitch, tilt)) = diff_orientation {
@@ -410,6 +426,8 @@ impl CalibrationPipeline {
             result.confidence,
         );
         self.sync_offset_frames = frames;
+        self.sync_confidence = Some(result.confidence);
+        self.sync_method = SyncMethod::Audio;
         Ok(frames)
     }
 
@@ -496,6 +514,11 @@ impl CalibrationPipeline {
         result.calibration.sync_offset = self.sync_offset_frames;
         result.left_lens_profile = self.left_profile_info.clone();
         result.right_lens_profile = self.right_profile_info.clone();
+        result.sync = SyncInfo {
+            method: self.sync_method,
+            confidence: self.sync_confidence,
+            offset_frames: self.sync_offset_frames,
+        };
         Ok(result)
     }
 
@@ -517,5 +540,55 @@ impl CalibrationPipeline {
     /// Get right video info.
     pub fn right_info(&self) -> &VideoInfo {
         &self.right_info
+    }
+}
+
+#[cfg(test)]
+mod sync_info_tests {
+    use super::*;
+
+    fn pipeline() -> CalibrationPipeline {
+        let info = VideoInfo {
+            path: "clip.mp4".into(),
+            width: 1920,
+            height: 1080,
+            fps: 30.0,
+            total_frames: 300,
+        };
+        CalibrationPipeline::new(info.clone(), info, CalibrationConfig::default())
+    }
+
+    #[test]
+    fn default_sync_is_none_without_confidence() {
+        let p = pipeline();
+        assert_eq!(p.sync_method, SyncMethod::None);
+        assert!(p.sync_confidence.is_none());
+        assert_eq!(p.sync_offset(), 0);
+    }
+
+    #[test]
+    fn manual_sync_sets_manual_and_clears_confidence() {
+        let mut p = pipeline();
+        p.sync_confidence = Some(0.9);
+        p.set_sync_offset(7);
+        assert_eq!(p.sync_method, SyncMethod::Manual);
+        assert!(p.sync_confidence.is_none());
+        assert_eq!(p.sync_offset(), 7);
+    }
+
+    #[test]
+    fn audio_sync_captures_confidence() {
+        let mut p = pipeline();
+        // Identical synthetic tone on both channels: correlate finds a
+        // zero-lag peak and reports a confidence value.
+        let samples: Vec<i16> = (0..8000)
+            .map(|i| ((i as f64 * 0.05).sin() * 10_000.0) as i16)
+            .collect();
+        p.audio_sync(&samples, &samples, 44100).unwrap();
+        assert_eq!(p.sync_method, SyncMethod::Audio);
+        assert!(
+            p.sync_confidence.is_some(),
+            "audio sync must capture a confidence value"
+        );
     }
 }

@@ -497,5 +497,12 @@ pub fn calibrate_with(
             trimmed_reprojection_error: trimmed_err,
             angular_error: angular_err,
         }),
+        // Overwritten by `CalibrationPipeline::calibrate_with_progress` when a
+        // pipeline drives this call; the free function has no sync context.
+        sync: types::SyncInfo {
+            method: types::SyncMethod::None,
+            confidence: None,
+            offset_frames: 0,
+        },
     })
 }
