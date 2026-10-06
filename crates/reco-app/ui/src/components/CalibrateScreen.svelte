@@ -18,6 +18,7 @@
   import AdvancedDisclosure from "./AdvancedDisclosure.svelte";
   import Scorecard from "./Scorecard.svelte";
   import FailurePanel from "./FailurePanel.svelte";
+  import DebugSection from "./DebugSection.svelte";
   import CompatibilityBanner from "./CompatibilityBanner.svelte";
   import { importStore } from "../lib/import.svelte";
 
@@ -57,6 +58,7 @@
         <h2 class="screen-title">Calibration result</h2>
       </header>
       <Scorecard scorecard={calibration.result} onRerun={handleRerun} />
+      <DebugSection report={calibration.debug} ran={true} />
     {:else if calibration.status === "failed"}
       <header class="screen-header">
         <h2 class="screen-title">Calibration failed</h2>
@@ -67,6 +69,7 @@
         onTryAgain={handleStart}
         onBackToImport={onBackToImport}
       />
+      <DebugSection report={calibration.debug} ran={true} />
     {:else}
       <header class="screen-header">
         <h2 class="screen-title">

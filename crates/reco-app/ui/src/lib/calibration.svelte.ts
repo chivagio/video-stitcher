@@ -23,6 +23,7 @@ import type {
   CalibrationDiagnosis,
   CalibrationOptions,
   CalibrationStage,
+  DebugReport,
   Scorecard,
   StageStatus,
   WorkerEventTyped,
@@ -138,6 +139,8 @@ class CalibrationStore {
   error = $state<string | null>(null);
   /** The plain-language failure diagnosis (CALB-04) when `status === "failed"`. */
   diagnosis = $state<CalibrationDiagnosis | null>(null);
+  /** The bounded debug inspector payload for the last completed run (CALB-08). */
+  debug = $state<DebugReport | null>(null);
 
   /** Wall-clock time of the last heartbeat tick (for the "last update" line). */
   #lastHeartbeatAt: number | null = null;
@@ -206,6 +209,12 @@ class CalibrationStore {
         this.error = event.data.diagnosis.cause;
         this.status = "failed";
         this.#stopClock();
+        break;
+      }
+      case "calibration_debug": {
+        // CALB-08: the worker publishes the bounded debug payload after the
+        // result/failure; the store only mirrors it for the Debug section.
+        this.debug = event.data.report;
         break;
       }
       case "log": {
@@ -290,6 +299,7 @@ class CalibrationStore {
     this.result = null;
     this.error = null;
     this.diagnosis = null;
+    this.debug = null;
     this.#lastHeartbeatAt = null;
   }
 
