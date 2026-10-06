@@ -236,9 +236,14 @@
       const n = toNormalized(p);
       fieldRoi.moveVertex(drag.index, n[0], n[1]);
     } else {
+      // The pointer deltas are CSS pixels; convert them to intrinsic canvas
+      // pixels (the same scale `pointerPx` uses) before normalizing against the
+      // intrinsic frame rect, or a whole-polygon drag would move at
+      // renderedWidth/intrinsicWidth of the pointer travel (WR-01).
       const r = activeRect;
-      const dx = (e.clientX - drag.lastX) / r.w;
-      const dy = (e.clientY - drag.lastY) / r.h;
+      const scale = displayScale();
+      const dx = ((e.clientX - drag.lastX) * scale) / r.w;
+      const dy = ((e.clientY - drag.lastY) * scale) / r.h;
       drag = { kind: "polygon", lastX: e.clientX, lastY: e.clientY };
       fieldRoi.movePolygon(dx, dy);
     }
