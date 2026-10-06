@@ -49,6 +49,14 @@ pub struct VideoProbe {
     pub fps: f64,
     /// Estimated total frame count (from duration * fps).
     pub total_frames: u64,
+    /// Codec short name (e.g. `"h264"`, `"hevc"`), or `None` when the
+    /// container omits it.
+    pub codec: Option<String>,
+    /// Container duration in seconds, or `None` when unknown.
+    pub duration_secs: Option<f64>,
+    /// Exact frame rate as `(numerator, denominator)`, or `None` when the
+    /// container carries no usable rational (e.g. a zero denominator).
+    pub fps_rational: Option<(i32, i32)>,
 }
 
 /// Probe a video file for calibration-relevant metadata.
@@ -63,12 +71,23 @@ pub fn probe_video(path: &Path) -> Result<VideoProbe, CalibrationIoError> {
         .duration_secs()
         .map(|d| (d * fps) as u64)
         .unwrap_or((fps * 60.0) as u64);
+    let fps_rational = {
+        let r = decoder.frame_rate();
+        if r.1 > 0 {
+            Some((r.0, r.1))
+        } else {
+            None
+        }
+    };
 
     Ok(VideoProbe {
         width: decoder.width(),
         height: decoder.height(),
         fps,
         total_frames,
+        codec: decoder.codec_name(),
+        duration_secs: decoder.duration_secs(),
+        fps_rational,
     })
 }
 

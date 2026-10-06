@@ -34,6 +34,18 @@ fn probe_video_returns_valid_metadata() {
         "total_frames: {}",
         probe.total_frames
     );
+    // E2: codec, duration, and an exact fps rational are now exposed.
+    assert!(probe.codec.is_some(), "codec: {:?}", probe.codec);
+    assert!(
+        probe.duration_secs.is_some(),
+        "duration_secs: {:?}",
+        probe.duration_secs
+    );
+    assert!(
+        probe.fps_rational.is_none_or(|(_, den)| den > 0),
+        "fps_rational must have a positive denominator: {:?}",
+        probe.fps_rational
+    );
 }
 
 #[test]

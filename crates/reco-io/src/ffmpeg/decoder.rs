@@ -650,6 +650,26 @@ impl VideoDecoder {
         }
     }
 
+    /// Codec short name (e.g. `"h264"`, `"hevc"`), or `None` when the
+    /// container carries no codec id.
+    ///
+    /// The name comes straight from FFmpeg's own accessor
+    /// ([`ffmpeg::codec::Id::name`], i.e. `avcodec_get_name`) and is never
+    /// interpreted as a path or command (T-03-05).
+    pub fn codec_name(&self) -> Option<String> {
+        let stream = self.input.stream(self.video_stream_index)?;
+        let id = stream.parameters().id();
+        if id == ffmpeg::codec::Id::None {
+            return None;
+        }
+        let name = id.name();
+        if name.is_empty() {
+            None
+        } else {
+            Some(name.to_string())
+        }
+    }
+
     /// Seek to approximately the given timestamp in seconds.
     ///
     /// Seeks to the nearest keyframe before the target time, then the

@@ -309,8 +309,9 @@ pub fn new_session_transport(
 /// * `fps` — read directly from the decoder → `Probed`.
 /// * `duration` — derived from `total_frames / fps` (and `total_frames` is
 ///   itself a `duration × fps` estimate) → `Estimated`; never authoritative.
-/// * `codec` — not available on `VideoProbe` yet (plan 03-02 adds it) → absent
-///   (`value: None`), rendered as an em-dash, never `0`.
+/// * `codec` — read directly from the container's codec parameters →
+///   `Probed`; absent (`value: None`) when the container omits it, rendered
+///   as an em-dash, never `0`.
 pub fn project_metadata(
     probe: &reco_io::ffmpeg::calibration_io::VideoProbe,
 ) -> crate::events::InputMetadata {
@@ -334,8 +335,11 @@ pub fn project_metadata(
         MetadataField::missing(Provenance::Estimated)
     };
 
-    // Codec is not on `VideoProbe` yet (plan 03-02 extends it). Absent, not zero.
-    let codec = MetadataField::missing(Provenance::Probed);
+    // Codec is read directly from the container (E2). Absent, never zero.
+    let codec = match probe.codec.as_deref() {
+        Some(name) if !name.is_empty() => MetadataField::probed(name.to_string()),
+        _ => MetadataField::missing(Provenance::Probed),
+    };
 
     InputMetadata {
         resolution,
@@ -2880,13 +2884,16 @@ mod tests {
     }
 
     #[test]
-    fn project_metadata_marks_derived_duration_estimated_and_absent_codec_missing() {
+    fn project_metadata_reports_probed_codec_and_derived_duration_estimated() {
         use crate::events::Provenance;
         let probe = reco_io::ffmpeg::calibration_io::VideoProbe {
             width: 1920,
             height: 1080,
             fps: 30.0,
             total_frames: 60,
+            codec: Some("h264".to_string()),
+            duration_secs: Some(2.0),
+            fps_rational: Some((30, 1)),
         };
         let md = project_metadata(&probe);
         assert_eq!(md.resolution.value.as_deref(), Some("1920×1080"));
@@ -2896,8 +2903,9 @@ mod tests {
         // 60 frames / 30 fps = 2 s -> "0:02", and it is DERIVED (estimated).
         assert_eq!(md.duration.value.as_deref(), Some("0:02"));
         assert_eq!(md.duration.provenance, Provenance::Estimated);
-        // Codec is not on VideoProbe yet (plan 03-02) -> absent, never 0.
-        assert_eq!(md.codec.value, None);
+        // E2: a container codec is a direct read -> probed, never absent.
+        assert_eq!(md.codec.value.as_deref(), Some("h264"));
+        assert_eq!(md.codec.provenance, Provenance::Probed);
     }
 
     #[test]
@@ -2908,12 +2916,17 @@ mod tests {
             height: 0,
             fps: 0.0,
             total_frames: 0,
+            codec: None,
+            duration_secs: None,
+            fps_rational: None,
         };
         let md = project_metadata(&probe);
         assert_eq!(md.resolution.value, None);
         assert_eq!(md.fps.value, None);
         assert_eq!(md.duration.value, None);
         assert_eq!(md.duration.provenance, Provenance::Estimated);
+        // Absent codec -> no value, never "0" (IMPT-02).
+        assert_eq!(md.codec.value, None);
     }
 
     #[test]
