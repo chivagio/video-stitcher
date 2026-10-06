@@ -473,4 +473,25 @@ mod tests {
             "an unreadable clip must be an error, got {result:?}"
         );
     }
+
+    #[test]
+    fn detect_audio_sync_estimates_from_the_real_mismatched_clips() {
+        // MANU-02 integration (headless): the real mismatched Xiaomi clips carry
+        // AAC audio, so the engine estimate is exercised end to end. The clips
+        // are gitignored and may be absent on a fresh checkout — skip when so,
+        // so the unit suite never depends on them.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test-media/xiaomi");
+        let left = root.join("xiaomi-11tpro-left.mp4");
+        let right = root.join("xiaomi-14tpro-right.mp4");
+        if !left.exists() || !right.exists() {
+            eprintln!("skipping: the real Xiaomi clips are not present");
+            return;
+        }
+        let estimate = detect_audio_sync(&left, &right, 44100)
+            .expect("the real clips must yield an audio-sync estimate");
+        assert!(
+            estimate.confidence.is_finite(),
+            "a real estimate must carry a finite confidence: {estimate:?}"
+        );
+    }
 }
