@@ -34,6 +34,13 @@
 # observe.
 #
 # Exit 0 with `PHASE2 PROBE: PASS` on success; non-zero otherwise.
+#
+# Phase 3 update (03): the shell now has a persistent 48px top workflow rail and
+# boots on the Import screen (where the native child view is suspended). The
+# native child geometry therefore starts at y=48 and is 680px tall at 1280x800
+# (was 728 before the rail), and the controls-panel toggle now sits below the
+# rail (y≈76, was 28). This probe predates the rail: before it asserts native
+# child geometry it must first navigate to the Preview screen via the rail.
 
 set -euo pipefail
 
@@ -180,7 +187,7 @@ done
   || fail "expected exactly 1 InputOutput child (the panorama child view), found ${INPUTOUTPUT_COUNT}"
 
 # (b) The native child must NOT cover the full window: it is the L-shaped
-# complement of the chrome (1240x728 for the 1280x800 default), i.e. strictly
+# complement of the chrome (1240x680 for the 1280x800 default), i.e. strictly
 # smaller than the window in at least one dimension.
 if [[ "$NATIVE_W" -ge "$SCREEN_W" && "$NATIVE_H" -ge "$SCREEN_H" ]]; then
   fail "native child ${NATIVE_CHILD} (${NATIVE_W}x${NATIVE_H}) covers the whole ${SCREEN_W}x${SCREEN_H} window — the chrome reservation is gone"
@@ -224,7 +231,7 @@ log_count() { sed 's/\x1b\[[0-9;]*m//g' "$LOG_FILE" 2>/dev/null | grep -cE "$1" 
 #
 # Counting *new* occurrences rather than mere presence is load-bearing: the app's
 # mount-time `$effect` already reports the default chrome once at startup, so
-# `viewport reconfigured to 1240x728` is already in the log before a single click
+# `viewport reconfigured to 1240x680` is already in the log before a single click
 # happens. A presence check for that string would therefore succeed whether or not
 # the click was delivered at all — precisely the unfalsifiable-assertion defect
 # this step exists to remove.
@@ -368,8 +375,8 @@ click_strip_until() {
 
 # The controls rail is `position: fixed; right: 0; top: 0` with the 32x32
 # `.panel-toggle` as its first child (UI-SPEC Surface Layout Contract). At the
-# 1280x800 default the rail spans x=1240..1280, y=0..728 and the toggle's centre
-# lands near (1258, 28). EVERY candidate x is > 1240, i.e. outside the native
+# 1280x800 default the rail spans x=1240..1280, y=48..728 and the toggle's centre
+# lands near (1258, 76). EVERY candidate x is > 1240, i.e. outside the native
 # child (which is 1240 wide), so a click that lands here can only be handled by
 # the webview. Exact rendered offsets depend on font metrics, so sweep a tight
 # grid around the computed centre and stop at the first hit.
@@ -378,7 +385,7 @@ click_rail_until() {
   local baseline
   baseline="$(log_count "$pattern")"
   local x y
-  for y in 28 36; do
+  for y in 72 80; do
     for x in 1258 1264 1252 1270 1246; do
       click_at "$x" "$y"
       if wait_for_log_delta "$pattern" "$baseline" 2; then
@@ -411,15 +418,15 @@ echo "PHASE2 PROBE: preview-region click started no engine command (the native c
 #
 #   xdotool click -> webview .panel-toggle -> invoke('set_chrome')
 #     -> WorkerCommand::SetChrome -> GpuEngineBackend::set_chrome
-#     -> reconfigure_viewport -> INFO "viewport reconfigured to 1000x728"
+#     -> reconfigure_viewport -> INFO "viewport reconfigured to 1000x680"
 #
-# 1000 = 1280 - CONTROLS_PANEL_WIDTH (280); 728 = 800 - TRANSPORT_BAR_HEIGHT (72);
+# 1000 = 1280 - CONTROLS_PANEL_WIDTH (280); 680 = 800 - WORKFLOW_RAIL_HEIGHT (48) - TRANSPORT_BAR_HEIGHT (72);
 # both are the numbers Rust's `ViewportRect::for_chrome` computes, so the line can
 # only appear if the click reached the webview, crossed the typed worker channel,
 # and drove a presenter reconfigure. If the pattern never appears the probe FAILS
 # — it does not fall through.
-EXPANDED="viewport reconfigured to 1000x728"
-COLLAPSED="viewport reconfigured to 1240x728"
+EXPANDED="viewport reconfigured to 1000x680"
+COLLAPSED="viewport reconfigured to 1240x680"
 
 click_rail_until "controls-panel expand toggle" "$EXPANDED" \
   || fail "the controls-panel expand toggle was never driven: '${EXPANDED}' did not appear in the log after sweeping the rail — pointer input outside the native child is not reaching the webview"
@@ -441,7 +448,7 @@ echo "PHASE2 PROBE: chrome restored (${COLLAPSED})"
 #
 # The two numbers are hard-coded on purpose, not derived from the screen size.
 # They come from `ViewportRect::for_chrome(1280, 800, …)` — 1000 = 1280 - 280
-# (expanded controls panel), 1240 = 1280 - 40 (collapsed rail), 728 = 800 - 72
+# (expanded controls panel), 1240 = 1280 - 40 (collapsed rail), 680 = 800 - 48 - 72
 # (transport bar). Hard-coding them means a change to the geometry authority
 # itself is a visible failure rather than something the probe silently agrees
 # with by recomputing the same wrong number.
@@ -459,19 +466,19 @@ wait_for_child_width 1000 10 \
 # The app's OWN report must agree with the server's, in the agreeing form only:
 # `mismatch` means the window refused the request and must fail even if the
 # numbers happened to line up afterwards.
-if log_grep -qE 'native viewport: requested 1000x728, child window .*mismatch'; then
+if log_grep -qE 'native viewport: requested 1000x680, child window .*mismatch'; then
   fail "the worker reports a geometry MISMATCH for the expanded state"
 fi
-if ! log_grep -qE 'native viewport: requested 1000x728, child window 1000x728'; then
+if ! log_grep -qE 'native viewport: requested 1000x680, child window 1000x680'; then
   fail "the worker never reported the expanded geometry agreeing with the request"
 fi
-echo "PHASE2 PROBE: expanded geometry — server and worker both report 1000x728"
+echo "PHASE2 PROBE: expanded geometry — server and worker both report 1000x680"
 
 click_rail_until "controls-panel collapse toggle (geometry)" "$COLLAPSED" \
   || fail "could not collapse the panel to restore geometry: '${COLLAPSED}' missing from the log"
 wait_for_child_width 1240 10 \
   || fail "the X server reports '$(child_width)' after collapse — expected 1240"
-if log_grep -qE 'native viewport: requested 1240x728, child window .*mismatch'; then
+if log_grep -qE 'native viewport: requested 1240x680, child window .*mismatch'; then
   fail "the worker reports a geometry MISMATCH for the collapsed state"
 fi
 echo "PHASE2 PROBE: geometry restored to 1240; child is back at its default size"

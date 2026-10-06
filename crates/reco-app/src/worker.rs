@@ -4528,15 +4528,15 @@ mod tests {
                 ..crate::presenter::ChromeState::default()
             },
         );
-        let line = native_geometry_line(rect, Some((1000, 728)), rect_chrome_expanded());
-        assert!(line.contains("requested 1000x728"), "{line}");
-        assert!(line.contains("child window 1000x728"), "{line}");
+        let line = native_geometry_line(rect, Some((1000, 680)), rect_chrome_expanded());
+        assert!(line.contains("requested 1000x680"), "{line}");
+        assert!(line.contains("child window 1000x680"), "{line}");
         assert!(line.contains("panel expanded"), "{line}");
         assert!(line.contains("drawer collapsed"), "{line}");
         assert!(!line.contains("mismatch"), "{line}");
     }
 
-    /// The chrome state that produces a 1000x728 rect at 1280x800.
+    /// The chrome state that produces a 1000x680 rect at 1280x800.
     fn rect_chrome_expanded() -> crate::presenter::ChromeState {
         crate::presenter::ChromeState {
             panel_expanded: true,
@@ -4552,7 +4552,7 @@ mod tests {
         // and the OS window was not, and nothing inside Rust could tell.
         let rect = crate::presenter::ViewportRect::for_chrome(1280, 800, &rect_chrome_expanded());
         let line = native_geometry_line(rect, Some((1240, 728)), rect_chrome_expanded());
-        assert!(line.contains("requested 1000x728"), "{line}");
+        assert!(line.contains("requested 1000x680"), "{line}");
         assert!(line.contains("child window 1240x728"), "{line}");
         assert!(line.contains("mismatch"), "{line}");
     }
@@ -4563,7 +4563,7 @@ mod tests {
         // read as though the request was achieved.
         let rect = crate::presenter::ViewportRect::for_chrome(1280, 800, &Default::default());
         let line = native_geometry_line(rect, None, Default::default());
-        assert!(line.contains("requested 1240x728"), "{line}");
+        assert!(line.contains("requested 1240x680"), "{line}");
         assert!(line.contains("unavailable"), "{line}");
         assert!(!line.contains("mismatch"), "{line}");
     }

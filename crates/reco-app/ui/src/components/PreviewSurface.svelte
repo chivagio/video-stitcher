@@ -225,7 +225,7 @@
     </div>
     <!-- No fixed width/height: paintFrame sets the backing store from each
          frame's header, so the canvas always matches the frame geometry the
-         worker produced (1000x728 panel-expanded, 1240x728 collapsed). -->
+         worker produced (1000x680 panel-expanded, 1240x680 collapsed). -->
     <canvas bind:this={canvasEl} class="readback-canvas"></canvas>
   {/if}
 </div>
@@ -234,9 +234,11 @@
   .preview-surface {
     position: fixed;
     left: 0;
-    top: 0;
+    top: var(--workflow-rail-height);
     width: calc(100% - var(--controls-panel-collapsed-width));
-    height: calc(100% - var(--transport-bar-height));
+    height: calc(
+      100% - var(--transport-bar-height) - var(--workflow-rail-height)
+    );
     background: transparent;
     border: 0;
     box-shadow: none;

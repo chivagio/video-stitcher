@@ -84,6 +84,15 @@ pub type PlatformPresenter = fallback::FallbackPresenter;
 /// Bottom-anchored, full width: timeline row (24px) + control row (48px).
 pub const TRANSPORT_BAR_HEIGHT: u32 = 72;
 
+/// Height in logical pixels of the persistent top workflow rail (UI-SPEC).
+///
+/// The rail is the single screen router and is visible on **every** screen
+/// (D3-01 / UI-SPEC Surface Layout Contract). The native panorama viewport
+/// therefore starts *below* it, so the rail is never covered by the X11 child
+/// view on Preview. Must match the webview token `--workflow-rail-height`
+/// (`crates/reco-app/ui/app.css`).
+pub const WORKFLOW_RAIL_HEIGHT: u32 = 48;
+
 /// Width in logical pixels of the expanded right controls panel (UI-SPEC).
 pub const CONTROLS_PANEL_WIDTH: u32 = 280;
 
@@ -506,8 +515,9 @@ impl ViewportRect {
     /// chrome (UI-SPEC Surface Layout Contract):
     ///
     /// ```text
+    ///   y      = WORKFLOW_RAIL_HEIGHT                       (top workflow rail)
     ///   width  = window_w − chrome.panel_width()          (right rail/panel)
-    ///   height = window_h − TRANSPORT_BAR_HEIGHT − drawer_height()  (bottom bar + drawer)
+    ///   height = window_h − WORKFLOW_RAIL_HEIGHT − TRANSPORT_BAR_HEIGHT − drawer_height()
     /// ```
     ///
     /// Saturates at every step rather than underflowing when the window is
@@ -516,9 +526,10 @@ impl ViewportRect {
     pub fn for_chrome(window_w: u32, window_h: u32, chrome: &ChromeState) -> Self {
         Self {
             x: 0,
-            y: 0,
+            y: WORKFLOW_RAIL_HEIGHT,
             width: window_w.saturating_sub(chrome.panel_width()),
             height: window_h
+                .saturating_sub(WORKFLOW_RAIL_HEIGHT)
                 .saturating_sub(TRANSPORT_BAR_HEIGHT)
                 .saturating_sub(chrome.drawer_height()),
         }
@@ -834,13 +845,14 @@ mod tests {
 
     #[test]
     fn for_chrome_uses_saturating_l_shaped_geometry() {
-        // Default chrome: collapsed 40px right rail + 72px bottom transport bar,
-        // drawer collapsed (0). UI-SPEC Surface Layout Contract.
+        // Default chrome: 48px top workflow rail + collapsed 40px right rail +
+        // 72px bottom transport bar, drawer collapsed (0). UI-SPEC Surface
+        // Layout Contract.
         let rect = ViewportRect::for_chrome(1280, 800, &ChromeState::default());
         assert_eq!(rect.x, 0);
-        assert_eq!(rect.y, 0);
+        assert_eq!(rect.y, WORKFLOW_RAIL_HEIGHT);
         assert_eq!(rect.width, 1280 - 40);
-        assert_eq!(rect.height, 800 - 72);
+        assert_eq!(rect.height, 800 - WORKFLOW_RAIL_HEIGHT - 72);
     }
 
     #[test]
@@ -853,7 +865,7 @@ mod tests {
         let collapsed = ViewportRect::for_chrome(1280, 800, &ChromeState::default());
         assert_eq!(
             (collapsed.x, collapsed.y, collapsed.width, collapsed.height),
-            (0, 0, 1240, 728)
+            (0, WORKFLOW_RAIL_HEIGHT, 1240, 680)
         );
 
         let expanded = ViewportRect::for_chrome(
@@ -867,7 +879,7 @@ mod tests {
         );
         assert_eq!(
             (expanded.x, expanded.y, expanded.width, expanded.height),
-            (0, 0, 1000, 728)
+            (0, WORKFLOW_RAIL_HEIGHT, 1000, 680)
         );
     }
 
@@ -880,7 +892,7 @@ mod tests {
         };
         let rect = ViewportRect::for_chrome(1280, 800, &chrome);
         assert_eq!(rect.width, 1280 - 280);
-        assert_eq!(rect.height, 800 - 72 - 240);
+        assert_eq!(rect.height, 800 - WORKFLOW_RAIL_HEIGHT - 72 - 240);
     }
 
     #[test]
@@ -960,7 +972,7 @@ mod tests {
         assert_eq!(import, preview);
         assert_eq!(
             (preview.x, preview.y, preview.width, preview.height),
-            (0, 0, 1240, 728)
+            (0, WORKFLOW_RAIL_HEIGHT, 1240, 680)
         );
     }
 

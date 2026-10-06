@@ -88,7 +88,7 @@
   .controls-panel {
     position: fixed;
     right: 0;
-    top: 0;
+    top: var(--workflow-rail-height);
     bottom: var(--transport-bar-height);
     width: var(--controls-panel-collapsed-width);
     background: var(--color-secondary);
