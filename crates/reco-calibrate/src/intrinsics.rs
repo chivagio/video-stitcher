@@ -1748,4 +1748,203 @@ mod tests {
             "the same data should still pin k1 to the same order: k1err={mean_k1_mis}"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Alternating layout↔k1 driver + held-out guard (INTR-02)
+    // -----------------------------------------------------------------------
+
+    /// A pool of in-frame raw observations synthesized from `t` at `k1`, with
+    /// seeded pixel noise. Large enough to slice fit/held-out indices from.
+    fn observation_pool(
+        t: &OptParams,
+        k1: f64,
+        n: usize,
+        seed: u64,
+        noise_px: f64,
+    ) -> Vec<RawPixelMatch> {
+        let synth = camera_params(k1);
+        let mut raw = raw_from_plane_points(&synthetic_points(t, n), &synth);
+        add_noise(&mut raw, seed, noise_px);
+        raw
+    }
+
+    /// The synthetic observation pool clears the conditioning gate, so the
+    /// driver's accept/reject tests exercise the held-out guard, not the gate.
+    #[test]
+    fn synthetic_pool_passes_conditioning() {
+        let raw = observation_pool(&truth(), 0.15, 400, 1, 0.25);
+        let c = conditioning(
+            &raw,
+            &layout_from(&truth()),
+            &camera_params(0.0),
+            RECOMMENDED_MIN_MATCHES,
+            RECOMMENDED_MIN_SPREAD,
+        );
+        assert!(
+            c.well_conditioned,
+            "synthetic pool must be conditioned: count={}, spread={}",
+            c.match_count, c.radial_spread
+        );
+    }
+
+    /// Test 1 (accepted): a known rig + known `k1` is refined and accepted; the
+    /// recovered `k1` is within tolerance and the held-out fit improves.
+    #[test]
+    fn refine_intrinsics_accepts_a_genuine_improvement() {
+        let t = truth();
+        let true_k1 = 0.15;
+        // The profile starts 0.05 low; the layout is the rig's (near the layout
+        // solved at the wrong profile k1) — the real-flow case.
+        let base = camera_params(0.10);
+        let base_before = base.clone();
+
+        let raw = observation_pool(&t, true_k1, 400, 7, 0.25);
+        let cfg = IntrinsicsConfig::default();
+        let r = refine_intrinsics(&raw, &layout_from(&t), &base, &cfg).expect("driver should run");
+
+        assert!(r.accepted, "a genuine refinement must be accepted: {r:?}");
+        assert_eq!(r.reason, RefinementReason::Accepted);
+        assert!(
+            (r.k1 - true_k1).abs() <= 0.05,
+            "recovered k1 = {} (true {true_k1})",
+            r.k1
+        );
+        assert!(
+            r.heldout_refined < r.heldout_baseline,
+            "held-out must improve on acceptance: before={} after={}",
+            r.heldout_baseline,
+            r.heldout_refined
+        );
+        // The caller's profile is untouched.
+        assert_eq!(base.d[0].to_bits(), base_before.d[0].to_bits());
+    }
+
+    /// Test 2 (guard rejected): a fit set that improves but a held-out set drawn
+    /// from a different `k1` regresses — the overfitting guard rejects it and
+    /// returns the baseline `k1` (INTR-02, T-04.2-07).
+    #[test]
+    fn refine_intrinsics_rejects_held_out_regression() {
+        let t = truth();
+        let cfg = IntrinsicsConfig::default();
+        let n = 120usize;
+
+        // Fit observations from k1 = +0.2; held-out from k1 = −0.2 (a different
+        // lens). Refining k1 to fit the fit set must worsen the held-out set.
+        let fit_pool = observation_pool(&t, 0.2, 900, 11, 0.1);
+        let held_pool = observation_pool(&t, -0.2, 900, 12, 0.1);
+        assert!(
+            fit_pool.len() >= n && held_pool.len() >= n,
+            "pools too small: fit={} held={}",
+            fit_pool.len(),
+            held_pool.len()
+        );
+
+        let (fit_idx, held_idx) = split_indices(n, &cfg);
+        let mut points = vec![fit_pool[0]; n];
+        for (k, &i) in fit_idx.iter().enumerate() {
+            points[i] = fit_pool[k];
+        }
+        for (k, &i) in held_idx.iter().enumerate() {
+            points[i] = held_pool[k];
+        }
+
+        let base = camera_params(0.0);
+        let r =
+            refine_intrinsics(&points, &layout_from(&t), &base, &cfg).expect("driver should run");
+
+        assert!(!r.accepted, "a held-out regression must be rejected: {r:?}");
+        assert_eq!(r.reason, RefinementReason::GuardRejected);
+        assert_eq!(
+            r.k1, base.d[0],
+            "a rejected refinement must return the baseline k1"
+        );
+    }
+
+    /// Test 3 (conditioning): a centre-weighted set is refused with the
+    /// ill-conditioned reason and never reaches the solve (INTR-02 / plan 02).
+    #[test]
+    fn refine_intrinsics_refuses_ill_conditioned_without_solving() {
+        let base = camera_params(0.0);
+        let points = matches_from(
+            |i| {
+                let a = i as f64 * 0.7;
+                [960.0 + 40.0 * a.cos(), 540.0 + 40.0 * a.sin()]
+            },
+            60,
+        );
+        let r = refine_intrinsics(
+            &points,
+            &layout_from(&truth()),
+            &base,
+            &IntrinsicsConfig::default(),
+        )
+        .expect("a conditioning refusal is a typed result, not an error");
+
+        assert!(!r.accepted);
+        assert_eq!(r.reason, RefinementReason::NotEnoughSpread);
+        assert_eq!(r.k1, base.d[0], "a refusal leaves the profile k1 unchanged");
+    }
+
+    /// Test 4 (never-modify): the caller's profile is never mutated by the
+    /// engine solve — the result is advisory (INTR-02, T-04.2-09).
+    #[test]
+    fn refine_intrinsics_never_mutates_the_base_profile() {
+        let t = truth();
+        let base = camera_params(0.10);
+        let before = base.clone();
+        let raw = observation_pool(&t, 0.15, 400, 5, 0.25);
+
+        let _ = refine_intrinsics(&raw, &layout_from(&t), &base, &IntrinsicsConfig::default())
+            .expect("driver should run");
+
+        assert_eq!(base.d[0].to_bits(), before.d[0].to_bits());
+        assert_eq!(base.fx.to_bits(), before.fx.to_bits());
+        assert_eq!(base.fy.to_bits(), before.fy.to_bits());
+        assert_eq!(base.cx.to_bits(), before.cx.to_bits());
+        assert_eq!(base.cy.to_bits(), before.cy.to_bits());
+        assert_eq!(base.width, before.width);
+        assert_eq!(base.height, before.height);
+    }
+
+    /// Test 5 (no-regression): an accepted result never worsens the held-out
+    /// residual by less than the epsilon (INTR-02, T-04.2-08).
+    #[test]
+    fn refine_intrinsics_accepted_result_never_regresses_held_out() {
+        let t = truth();
+        let base = camera_params(0.10);
+        let raw = observation_pool(&t, 0.15, 400, 9, 0.25);
+        let cfg = IntrinsicsConfig::default();
+
+        let r = refine_intrinsics(&raw, &layout_from(&t), &base, &cfg).expect("driver should run");
+
+        assert!(r.accepted, "this setup must be accepted: {r:?}");
+        assert!(
+            r.heldout_refined < r.heldout_baseline - cfg.improvement_epsilon,
+            "an accepted result must improve the held-out fit beyond epsilon: \
+             before={} after={}",
+            r.heldout_baseline,
+            r.heldout_refined
+        );
+    }
+
+    /// Test 6 (no-improvement): a refinement that cannot improve the held-out
+    /// fit (the profile is already at the optimum) is a rejection, not an
+    /// acceptance (INTR-02 edge probe "no-improvement").
+    #[test]
+    fn refine_intrinsics_rejects_a_non_improving_refinement() {
+        let t = truth();
+        let true_k1 = 0.15;
+        let base = camera_params(true_k1); // already at the optimum
+        let raw = observation_pool(&t, true_k1, 400, 3, 0.0); // clean data
+
+        let r = refine_intrinsics(&raw, &layout_from(&t), &base, &IntrinsicsConfig::default())
+            .expect("driver should run");
+
+        assert!(
+            !r.accepted,
+            "an already-optimal profile must not be 'refined': {r:?}"
+        );
+        assert_eq!(r.reason, RefinementReason::GuardRejected);
+        assert_eq!(r.k1, base.d[0]);
+    }
 }
