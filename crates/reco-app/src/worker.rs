@@ -97,6 +97,93 @@ pub struct CalibrationCancel(pub Arc<AtomicBool>);
 /// The webview readback channel type (raw frame bytes as an `ArrayBuffer`).
 pub type ReadbackChannel = tauri::ipc::Channel<tauri::ipc::Response>;
 
+/// The manual-frame binary channel type (raw RGBA frames as an `ArrayBuffer`).
+///
+/// The manual flow streams its preview and validation pixels over this channel
+/// instead of the JSON `worker-event-typed` bridge: a single bounded frame is
+/// ~2 MB of RGBA, which serializes to ~8 MB of JSON numbers and made the webview
+/// parse millions of numbers per frame (Phase 04.1 OOM). The binary path sends
+/// the bytes verbatim, mirroring the readback presenter.
+pub type ManualFrameChannel = tauri::ipc::Channel<tauri::ipc::Response>;
+
+/// The shared slot the worker and the `manual_attach_preview` command use to
+/// hand over the manual-frame binary channel (MANU-03).
+///
+/// Interior-mutable because the webview attaches the channel on the Tauri
+/// runtime while the worker reads it from its own thread; both hold clones of
+/// the same `Arc`. The worker's [`EventSink`] owns one clone, so every backend
+/// method that receives `&EventSink` can stream a manual frame without a new
+/// trait method.
+pub type ManualFrameSlot = Arc<std::sync::Mutex<Option<ManualFrameChannel>>>;
+
+/// Newtype wrapper so the manual-frame slot can be managed as Tauri app state.
+///
+/// Mirrors [`ReadbackSender`]: `manual_attach_preview` resolves it via
+/// `State<ManualFrameSender>` and stores the webview `Channel<Response>` into
+/// the shared slot the worker already holds.
+pub struct ManualFrameSender(pub ManualFrameSlot);
+
+impl ManualFrameSender {
+    /// Attach (or replace) the manual-frame channel the worker streams to.
+    ///
+    /// A poisoned lock is ignored: the channel is best-effort telemetry and a
+    /// panic elsewhere must not abort the attach command.
+    pub fn attach(&self, channel: ManualFrameChannel) {
+        if let Ok(mut slot) = self.0.lock() {
+            *slot = Some(channel);
+        }
+    }
+}
+
+/// The kind tag that prefixes every manual binary frame.
+///
+/// The manual channel multiplexes four logical streams — the two camera
+/// previews and the validation/reference stitched pair — over one
+/// `Channel<Response>`. The first byte of each frame identifies which one, so
+/// the frontend routes the pixels without a second event or a frame-index
+/// handshake. Values are frozen (the frontend mirrors them).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ManualFrameKind {
+    /// Left camera reference preview.
+    PreviewLeft = 0,
+    /// Right camera reference preview.
+    PreviewRight = 1,
+    /// The validation frame's stitched output.
+    Validation = 2,
+    /// The calibration frame's stitched reference for the blink comparison.
+    Reference = 3,
+}
+
+/// Length in bytes of the manual binary frame header:
+/// `[kind: u8][width: u32 LE][height: u32 LE]`.
+///
+/// The RGBA payload starts at this offset. The frontend mirrors this constant;
+/// its length guard fails closed if the two drift. This extends the readback
+/// convention ([`crate::presenter::readback::READBACK_HEADER_LEN`]) with the
+/// one-byte kind tag.
+pub const MANUAL_FRAME_HEADER_LEN: usize = 9;
+
+/// Prefix `bytes` with the manual frame kind and geometry:
+/// `[kind: u8][width: u32 LE][height: u32 LE][RGBA bytes]`.
+///
+/// Mirrors [`crate::presenter::readback::frame_with_header`] with the kind tag
+/// that distinguishes the four manual streams. Built directly (no intermediate
+/// buffer) because this is the hot path the Phase 04.1 memory fix targets.
+pub fn manual_frame_with_header(
+    kind: ManualFrameKind,
+    bytes: &[u8],
+    width: u32,
+    height: u32,
+) -> Vec<u8> {
+    let mut framed = Vec::with_capacity(MANUAL_FRAME_HEADER_LEN + bytes.len());
+    framed.push(kind as u8);
+    framed.extend_from_slice(&width.to_le_bytes());
+    framed.extend_from_slice(&height.to_le_bytes());
+    framed.extend_from_slice(bytes);
+    framed
+}
+
 /// The presenter chain handed from the setup thread to the worker (PREV-05):
 /// strongest-first `(kind, pre-built presenter)` pairs.
 pub type PresenterChain = Vec<(
@@ -104,20 +191,76 @@ pub type PresenterChain = Vec<(
     Box<dyn crate::presenter::SurfacePresenter + Send>,
 )>;
 
-/// The result of [`spawn_gpu_worker`]: the worker, its event receiver, and the
-/// readback channel sender.
-pub type SpawnedWorker = (EngineWorker, Receiver<WorkerEvent>, Sender<ReadbackChannel>);
+/// The result of [`spawn_gpu_worker`]: the worker, its event receiver, the
+/// readback channel sender, and the manual-frame channel slot.
+pub type SpawnedWorker = (
+    EngineWorker,
+    Receiver<WorkerEvent>,
+    Sender<ReadbackChannel>,
+    ManualFrameSlot,
+);
 
-/// A sink the worker uses to emit [`WorkerEvent`]s to the UI.
+/// A sink the worker uses to emit [`WorkerEvent`]s and stream binary frames to
+/// the UI.
 ///
 /// Emitting is infallible from the worker's point of view: if the UI has gone
 /// away the send fails and the event is dropped. That is deliberate — the
 /// worker's work should not abort because a log line could not be displayed.
+///
+/// The sink also owns the manual-frame binary channel slot (MANU-03): every
+/// backend method already receives `&EventSink`, so routing the manual pixels
+/// through it keeps the `EngineBackend` trait unchanged while guaranteeing no
+/// `Vec<u8>` ever enters the JSON `worker-event-typed` stream.
 pub struct EventSink {
     tx: Sender<WorkerEvent>,
+    /// The webview channel manual frames are streamed to, once the UI attaches
+    /// one via `manual_attach_preview`. `None` until then; frames are dropped
+    /// rather than blocking the worker.
+    manual_frames: ManualFrameSlot,
 }
 
 impl EventSink {
+    /// Build a sink over `tx` with no manual-frame channel attached yet.
+    fn new(tx: Sender<WorkerEvent>) -> Self {
+        Self {
+            tx,
+            manual_frames: Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    /// A clone of the shared manual-frame slot, for `spawn_gpu_worker` to hand
+    /// to the `manual_attach_preview` command layer.
+    fn manual_frame_slot(&self) -> ManualFrameSlot {
+        Arc::clone(&self.manual_frames)
+    }
+
+    /// Attach (or replace) the manual-frame channel (MANU-03). Test-facing.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn attach_manual_frame_channel(&self, channel: ManualFrameChannel) {
+        if let Ok(mut slot) = self.manual_frames.lock() {
+            *slot = Some(channel);
+        }
+    }
+
+    /// Stream one framed manual frame over the attached channel, if any.
+    ///
+    /// The clone-and-drop-guard keeps a slow send from serialising behind the
+    /// `manual_attach_preview` command's lock; a missing channel is a no-op so
+    /// the worker never blocks waiting for a webview.
+    fn send_manual_frame(&self, kind: ManualFrameKind, rgba: &[u8], width: u32, height: u32) {
+        let channel = {
+            let Ok(slot) = self.manual_frames.lock() else {
+                return;
+            };
+            match slot.as_ref() {
+                Some(channel) => channel.clone(),
+                None => return,
+            }
+        };
+        let payload = manual_frame_with_header(kind, rgba, width, height);
+        let _ = channel.send(tauri::ipc::Response::new(payload));
+    }
+
     /// Emit a log line at `level`.
     ///
     /// The line is mirrored to the process log as well as the UI channel, so a
@@ -343,24 +486,24 @@ impl EventSink {
         });
     }
 
-    /// Emit one camera's reference frame rendered under real `CameraParams`
+    /// Stream one camera's reference frame rendered under real `CameraParams`
     /// (MANU-03).
     ///
-    /// The RGBA bytes ride the typed channel only — the process log carries the
-    /// geometry summary, never the payload.
+    /// The RGBA bytes ride the binary [`ManualFrameChannel`] only — the JSON
+    /// typed stream never carries them (Phase 04.1 root fix). `side` selects the
+    /// frame's kind tag. A no-op when no channel is attached.
     fn manual_preview_frame(
         &self,
         side: crate::events::ManualSide,
-        rgba: Vec<u8>,
+        rgba: &[u8],
         width: u32,
         height: u32,
     ) {
-        let _ = self.tx.send(WorkerEvent::ManualPreviewFrame {
-            side,
-            rgba,
-            width,
-            height,
-        });
+        let kind = match side {
+            crate::events::ManualSide::Left => ManualFrameKind::PreviewLeft,
+            crate::events::ManualSide::Right => ManualFrameKind::PreviewRight,
+        };
+        self.send_manual_frame(kind, rgba, width, height);
     }
 
     /// Emit the manual solve's busy/stale state (MANU-03).
@@ -441,24 +584,24 @@ impl EventSink {
         });
     }
 
-    /// Emit a manual validation frame's stitched comparison + advisory verdict
-    /// (MANU-07).
+    /// Stream a manual validation frame's stitched comparison and emit its
+    /// advisory verdict metadata (MANU-07).
     ///
-    /// The stitched RGBA payloads ride the typed channel only — the process log
-    /// carries the residual/verdict summary, never the bytes. `reference` is the
-    /// calibration frame's stitched output `(rgba, width, height)` for the blink
-    /// comparison.
+    /// The stitched RGBA payloads (the validation frame and the calibration
+    /// frame's reference for the blink comparison) ride the binary
+    /// [`ManualFrameChannel`] only. The residual/verdict and geometry ride the
+    /// JSON typed stream, which therefore carries no pixel bytes. `reference` is
+    /// the calibration frame's stitched output `(rgba, width, height)`.
     fn manual_validation_frame(
         &self,
         frame: u32,
-        rgba: Vec<u8>,
+        rgba: &[u8],
         width: u32,
         height: u32,
         residual: f64,
         verdict: crate::events::ValidationVerdict,
-        reference: (Vec<u8>, u32, u32),
+        reference: (&[u8], u32, u32),
     ) {
-        let (reference_rgba, reference_width, reference_height) = reference;
         log::info!(
             "manual validation frame {frame}: residual {residual:.6}, {}",
             match verdict {
@@ -466,14 +609,20 @@ impl EventSink {
                 crate::events::ValidationVerdict::CheckSeam => "check the seam",
             }
         );
+        self.send_manual_frame(ManualFrameKind::Validation, rgba, width, height);
+        let (reference_rgba, reference_width, reference_height) = reference;
+        self.send_manual_frame(
+            ManualFrameKind::Reference,
+            reference_rgba,
+            reference_width,
+            reference_height,
+        );
         let _ = self.tx.send(WorkerEvent::ManualValidationFrame {
             frame,
-            rgba,
             width,
             height,
             residual,
             verdict,
-            reference_rgba,
             reference_width,
             reference_height,
         });
@@ -1162,10 +1311,10 @@ pub trait EngineBackend: Send {
     /// Open a manual calibration session at `frame` (MANU-01 / MANU-03).
     ///
     /// Extracts the reference frame for both clips, retains the YUV planes for
-    /// the session's duration, seeds the per-camera `CameraParams`, and emits a
-    /// typed `ManualSessionStarted` plus one `ManualPreviewFrame` per camera
-    /// rendered by the GPU undistort under the real parameters. The index is
-    /// clamped against the probed frame count (T-04.1-01).
+    /// the session's duration, seeds the per-camera `CameraParams`, emits a typed
+    /// `ManualSessionStarted`, and streams one binary preview per camera (the GPU
+    /// undistort under the real parameters) over the manual-frame channel. The
+    /// index is clamped against the probed frame count (T-04.1-01).
     fn manual_begin(&mut self, frame: u64, events: &EventSink) -> Result<(), WorkerError>;
 
     /// Change the manual session's reference frame (MANU-03).
@@ -2027,10 +2176,28 @@ impl EngineWorker {
     /// Returns the worker (holding the `JoinHandle`) and leaves the command
     /// sender reachable through [`EngineWorker::handle`]. The event receiver is
     /// the caller's to drain (the Tauri bridge does so in Plan 04).
+    // Only the GPU-free tests use this two-tuple form; the app path uses
+    // `spawn_with_manual_slot`.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn spawn<B: EngineBackend + 'static>(backend: B) -> (Self, Receiver<WorkerEvent>) {
+        let (worker, events, _slot) = Self::spawn_with_manual_slot(backend);
+        (worker, events)
+    }
+
+    /// Spawn the worker and also return the shared manual-frame channel slot
+    /// (MANU-03).
+    ///
+    /// [`spawn_gpu_worker`] uses this to hand the slot to the
+    /// `manual_attach_preview` command layer; [`Self::spawn`] discards it so the
+    /// many GPU-free tests keep their two-tuple. Tests that observe the binary
+    /// manual transport can use this to attach a channel to the running worker.
+    pub fn spawn_with_manual_slot<B: EngineBackend + 'static>(
+        backend: B,
+    ) -> (Self, Receiver<WorkerEvent>, ManualFrameSlot) {
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
         let (evt_tx, evt_rx) = std::sync::mpsc::channel();
-        let events = EventSink { tx: evt_tx };
+        let events = EventSink::new(evt_tx);
+        let slot = events.manual_frame_slot();
         let handle = thread::Builder::new()
             .name("reco-engine-worker".to_string())
             .spawn(move || worker_loop(cmd_rx, events, backend, AtomicBool::new(false)))
@@ -2041,6 +2208,7 @@ impl EngineWorker {
                 cmd: WorkerHandle::new(cmd_tx),
             },
             evt_rx,
+            slot,
         )
     }
 
@@ -4059,12 +4227,12 @@ impl EngineBackend for GpuEngineBackend {
                 );
                 events.manual_validation_frame(
                     frame as u32,
-                    rgba,
+                    &rgba,
                     width,
                     height,
                     result.residual_error,
                     verdict,
-                    reference,
+                    (&reference.0, reference.1, reference.2),
                 );
                 Ok(())
             }
@@ -5031,15 +5199,14 @@ impl GpuEngineBackend {
     }
 
     /// Render both sides of the retained reference frame under real
-    /// `CameraParams` and emit one typed `ManualPreviewFrame` per camera
-    /// (MANU-03).
+    /// `CameraParams` and stream one binary preview per camera (MANU-03).
     ///
     /// The worker is the single GPU owner: the readback RGBA is what crosses to
-    /// the webview; no GPU handle ever does (T-04.1-04). Each frame is
-    /// box-downsampled to [`crate::calibration::MANUAL_FRAME_MAX_EDGE`] before it
-    /// crosses, so the event payload stays bounded regardless of source
-    /// resolution; the canvas scales the bounded frame, so the preview remains
-    /// visually correct.
+    /// the webview over the manual-frame channel; no GPU handle ever does
+    /// (T-04.1-04). Each frame is box-downsampled to
+    /// [`crate::calibration::MANUAL_FRAME_MAX_EDGE`] before it crosses, so the
+    /// payload stays bounded regardless of source resolution; the canvas scales
+    /// the bounded frame, so the preview remains visually correct.
     fn render_manual_preview(&self, events: &EventSink) -> Result<(), WorkerError> {
         let Some(session) = self.manual.as_ref() else {
             return Ok(());
@@ -5072,7 +5239,7 @@ impl GpuEngineBackend {
                 h,
                 crate::calibration::MANUAL_FRAME_MAX_EDGE,
             );
-            events.manual_preview_frame(side, rgba, w, h);
+            events.manual_preview_frame(side, &rgba, w, h);
         }
         Ok(())
     }
@@ -5272,9 +5439,11 @@ impl GpuEngineBackend {
 /// created outside the worker. The caller supplies the `Instance` and the
 /// pre-built presenter chain (which owns the render targets).
 ///
-/// Returns the worker, the event receiver, and the **readback channel sender**
-/// (PREV-05): the Tauri command layer hands a webview `Channel<Response>` to the
-/// worker through it, which then attaches it to the readback presenter.
+/// Returns the worker, the event receiver, the **readback channel sender**
+/// (PREV-05), and the **manual-frame channel slot** (MANU-03): the Tauri command
+/// layer hands webview `Channel<Response>`s to the worker through them, which
+/// then attach them to the readback presenter and the manual preview path
+/// respectively.
 ///
 /// # Errors
 ///
@@ -5294,8 +5463,8 @@ pub fn spawn_gpu_worker(
         calibration_cancel,
     )?;
     let readback_tx = backend.readback_sender();
-    let (worker, events) = EngineWorker::spawn(backend);
-    Ok((worker, events, readback_tx))
+    let (worker, events, manual_frame_slot) = EngineWorker::spawn_with_manual_slot(backend);
+    Ok((worker, events, readback_tx, manual_frame_slot))
 }
 
 // `Arc<AtomicBool>` is the shape the CLI preview uses for its Ctrl-C flag; the
@@ -6265,12 +6434,12 @@ mod tests {
             // `2 * 1 * 4 = 8` bytes.
             events.manual_validation_frame(
                 frame,
-                vec![0u8; 8],
+                &[0u8; 8],
                 2,
                 1,
                 0.25,
                 crate::events::ValidationVerdict::LooksGood,
-                (vec![0u8; 8], 2, 1),
+                (&[0u8; 8], 2, 1),
             );
             Ok(())
         }
@@ -6316,8 +6485,8 @@ mod tests {
             if !std::mem::take(&mut self.manual_preview_dirty) {
                 return Ok(());
             }
-            events.manual_preview_frame(crate::events::ManualSide::Left, vec![0u8; 8], 2, 1);
-            events.manual_preview_frame(crate::events::ManualSide::Right, vec![0u8; 8], 2, 1);
+            events.manual_preview_frame(crate::events::ManualSide::Left, &[0u8; 8], 2, 1);
+            events.manual_preview_frame(crate::events::ManualSide::Right, &[0u8; 8], 2, 1);
             Ok(())
         }
 
@@ -6838,12 +7007,16 @@ mod tests {
     }
 
     #[test]
-    fn manual_begin_emits_session_and_a_preview_frame_with_matching_rgba_length() {
+    fn manual_begin_streams_one_preview_per_camera_and_emits_session_started() {
         // MANU-01 / MANU-03: opening a manual session must emit the typed
-        // session-started payload and one `ManualPreviewFrame` per camera, each
-        // with `rgba.len() == width * height * 4`.
+        // session-started payload and stream one binary preview per camera, each
+        // with `rgba.len() == width * height * 4` and the right kind tag. No
+        // preview bytes may cross the JSON event stream.
         let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let (worker, events) = EngineWorker::spawn(MockBackend::new(Arc::clone(&ops)));
+        let (worker, events, slot) =
+            EngineWorker::spawn_with_manual_slot(MockBackend::new(Arc::clone(&ops)));
+        let (channel, frames) = capturing_manual_channel();
+        *slot.lock().unwrap() = Some(channel);
         let handle = worker.handle();
         handle
             .send(WorkerCommand::ManualBegin { frame: 0 })
@@ -6856,29 +7029,28 @@ mod tests {
                 .any(|e| matches!(e, WorkerEvent::ManualSessionStarted { .. })),
             "manual_begin must emit ManualSessionStarted: {seen:?}"
         );
-        let previews: Vec<&WorkerEvent> = seen
-            .iter()
-            .filter(|e| matches!(e, WorkerEvent::ManualPreviewFrame { .. }))
-            .collect();
+
+        let previews = frames.lock().unwrap().clone();
         assert_eq!(
             previews.len(),
             2,
-            "manual_begin must emit one preview frame per camera: {seen:?}"
+            "manual_begin must stream one preview frame per camera"
         );
-        for event in previews {
-            match event {
-                WorkerEvent::ManualPreviewFrame {
-                    rgba,
-                    width,
-                    height,
-                    ..
-                } => assert_eq!(
-                    rgba.len() as u32,
-                    width * height * 4,
-                    "RGBA length must equal width * height * 4"
-                ),
-                other => panic!("expected ManualPreviewFrame, got {other:?}"),
-            }
+        assert_eq!(previews[0][0], ManualFrameKind::PreviewLeft as u8);
+        assert_eq!(previews[1][0], ManualFrameKind::PreviewRight as u8);
+        for framed in &previews {
+            let (_, width, height, payload) = split_manual_frame(framed);
+            assert_eq!(
+                payload.len() as u32,
+                width * height * 4,
+                "RGBA length must equal width * height * 4"
+            );
+        }
+        for event in &seen {
+            assert!(
+                !serde_json::to_string(event).unwrap().contains("rgba"),
+                "no preview bytes may cross the JSON event stream: {event:?}"
+            );
         }
     }
 
@@ -6888,7 +7060,7 @@ mod tests {
         // state, so the flow can clear without losing a profile.
         let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
         let (evt_tx, evt_rx) = std::sync::mpsc::channel();
-        let events = EventSink { tx: evt_tx };
+        let events = EventSink::new(evt_tx);
         let interrupted = AtomicBool::new(false);
         let mut mock = MockBackend::new(Arc::clone(&ops));
 
@@ -6961,19 +7133,21 @@ mod tests {
     }
 
     #[test]
-    fn manual_preview_coalesces_a_mutation_burst_into_one_drain_frame() {
-        // Regression (Phase 04.1 headless pass): a handle drag posts one command
-        // per pointer event. Emitting a full-resolution preview for each flooded
-        // the event channel and drove WebKit RSS to tens of GB. Every mutation
-        // must mark the preview dirty only; the loop's single flush per drain
-        // emits one bounded preview pair, and a burst of N mutations must not
+    fn manual_preview_coalesces_a_mutation_burst_into_one_binary_drain_frame() {
+        // Regression (Phase 04.1): a handle drag posts one command per pointer
+        // event. Emitting a full-resolution preview for each flooded the JSON
+        // event channel and drove WebKit RSS to tens of GB. Every mutation must
+        // mark the preview dirty only; the loop's single flush per drain streams
+        // one bounded binary preview pair, and a burst of N mutations must not
         // produce N frames.
         let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut mock = MockBackend::new(ops);
         mock.current_calibration = Some(sample_mock_calibration());
         mock.has_result = true;
         let (evt_tx, evt_rx) = std::sync::mpsc::channel();
-        let events = EventSink { tx: evt_tx };
+        let events = EventSink::new(evt_tx);
+        let (channel, frames) = capturing_manual_channel();
+        events.attach_manual_frame_channel(channel);
         let interrupted = AtomicBool::new(false);
 
         // Open the session and flush its own preview so the count below is only
@@ -6985,6 +7159,7 @@ mod tests {
             &interrupted,
         );
         mock.flush_manual_preview(&events).unwrap();
+        frames.lock().unwrap().clear();
         let _ = evt_rx.try_iter().count();
 
         // A burst of 25 layout edits, all in one "drain" (no flush between).
@@ -7002,49 +7177,113 @@ mod tests {
             );
         }
         assert_eq!(
-            evt_rx
-                .try_iter()
-                .filter(|e| matches!(e, WorkerEvent::ManualPreviewFrame { .. }))
-                .count(),
+            frames.lock().unwrap().len(),
             0,
-            "a mutation must not emit a preview directly"
+            "a mutation must not stream a preview directly"
         );
 
         mock.flush_manual_preview(&events).unwrap();
-        let previews: Vec<WorkerEvent> = evt_rx
-            .try_iter()
-            .filter(|e| matches!(e, WorkerEvent::ManualPreviewFrame { .. }))
-            .collect();
+        let previews = frames.lock().unwrap().clone();
         assert_eq!(
             previews.len(),
             2,
-            "one coalesced preview pair per drain, not one per mutation: {previews:?}"
+            "one coalesced preview pair per drain, not one per mutation"
         );
-        for event in &previews {
-            if let WorkerEvent::ManualPreviewFrame {
-                rgba,
-                width,
-                height,
-                ..
-            } = event
-            {
-                assert_eq!(rgba.len() as u32, width * height * 4);
-                assert!(
-                    (*width).max(*height) <= crate::calibration::MANUAL_FRAME_MAX_EDGE,
-                    "preview frame must be bounded: {width}x{height}"
-                );
-            }
+        // Kind tags: left then right (the loop's order).
+        assert_eq!(previews[0][0], ManualFrameKind::PreviewLeft as u8);
+        assert_eq!(previews[1][0], ManualFrameKind::PreviewRight as u8);
+        for framed in &previews {
+            let (kind, width, height, payload) = split_manual_frame(framed);
+            assert!(matches!(
+                kind,
+                ManualFrameKind::PreviewLeft | ManualFrameKind::PreviewRight
+            ));
+            assert_eq!(
+                payload.len() as u32,
+                width * height * 4,
+                "RGBA length must equal width * height * 4"
+            );
+            assert!(
+                width.max(height) <= crate::calibration::MANUAL_FRAME_MAX_EDGE,
+                "preview frame must be bounded: {width}x{height}"
+            );
         }
 
-        // A second flush with nothing dirty emits nothing (the flag was taken).
+        // No preview bytes cross the JSON event path: every event the burst
+        // produced serializes without an `rgba` field.
+        let json_events: Vec<String> = evt_rx
+            .try_iter()
+            .map(|e| serde_json::to_string(&e).unwrap())
+            .collect();
+        for json in &json_events {
+            assert!(
+                !json.contains("rgba"),
+                "no pixel payload may cross the JSON bridge: {json}"
+            );
+        }
+
+        // A second flush with nothing dirty streams nothing (the flag was taken).
         mock.flush_manual_preview(&events).unwrap();
         assert_eq!(
-            evt_rx
-                .try_iter()
-                .filter(|e| matches!(e, WorkerEvent::ManualPreviewFrame { .. }))
-                .count(),
-            0,
-            "an already-flushed preview must not re-emit"
+            frames.lock().unwrap().len(),
+            2,
+            "an already-flushed preview must not re-stream"
+        );
+    }
+
+    /// A manual-frame channel that records every framed payload it receives, so
+    /// a test can assert the binary transport without a webview.
+    fn capturing_manual_channel() -> (ManualFrameChannel, Arc<std::sync::Mutex<Vec<Vec<u8>>>>) {
+        let frames: Arc<std::sync::Mutex<Vec<Vec<u8>>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&frames);
+        let channel = tauri::ipc::Channel::<tauri::ipc::Response>::new(move |body| {
+            if let tauri::ipc::InvokeResponseBody::Raw(bytes) = body {
+                sink.lock().unwrap().push(bytes);
+            }
+            Ok(())
+        });
+        (channel, frames)
+    }
+
+    /// Split a manual binary frame into `(kind, width, height, rgba)`.
+    fn split_manual_frame(framed: &[u8]) -> (ManualFrameKind, u32, u32, &[u8]) {
+        assert!(
+            framed.len() >= MANUAL_FRAME_HEADER_LEN,
+            "framed frame shorter than its header"
+        );
+        let kind = match framed[0] {
+            0 => ManualFrameKind::PreviewLeft,
+            1 => ManualFrameKind::PreviewRight,
+            2 => ManualFrameKind::Validation,
+            3 => ManualFrameKind::Reference,
+            other => panic!("unknown manual frame kind {other}"),
+        };
+        let width = u32::from_le_bytes(framed[1..5].try_into().unwrap());
+        let height = u32::from_le_bytes(framed[5..9].try_into().unwrap());
+        (kind, width, height, &framed[MANUAL_FRAME_HEADER_LEN..])
+    }
+
+    #[test]
+    fn manual_frame_header_is_kind_then_two_little_endian_dims() {
+        // The wire layout is `[kind: u8][width: u32 LE][height: u32 LE][RGBA]`,
+        // so the payload starts at offset 9. The frontend mirrors the layout and
+        // its length guard fails closed if the two ever drift.
+        assert_eq!(MANUAL_FRAME_HEADER_LEN, 9);
+        let framed = manual_frame_with_header(ManualFrameKind::Reference, &[1, 2, 3, 4], 1000, 728);
+        assert_eq!(framed.len(), MANUAL_FRAME_HEADER_LEN + 4);
+        assert_eq!(framed[0], 3, "kind 3 is the reference buffer");
+        assert_eq!(&framed[1..5], &1000u32.to_le_bytes());
+        assert_eq!(&framed[5..9], &728u32.to_le_bytes());
+        assert_eq!(&framed[MANUAL_FRAME_HEADER_LEN..], &[1, 2, 3, 4]);
+        // A different kind or geometry must change the bytes.
+        assert_ne!(
+            framed,
+            manual_frame_with_header(ManualFrameKind::Validation, &[1, 2, 3, 4], 1000, 728)
+        );
+        assert_ne!(
+            framed,
+            manual_frame_with_header(ManualFrameKind::Reference, &[1, 2, 3, 4], 1240, 728)
         );
     }
 
@@ -7116,16 +7355,19 @@ mod tests {
     }
 
     #[test]
-    fn manual_validate_and_save_emit_typed_events_and_record_the_path() {
-        // MANU-07: validating a frame crosses as a typed ManualValidationFrame
-        // carrying the stitched comparison geometry + an advisory verdict;
-        // saving crosses as ManualSaved with the written path. Neither command
+    fn manual_validate_streams_binary_frames_and_emits_metadata_only() {
+        // MANU-07: validating a frame streams the stitched comparison (validation
+        // + reference) over the binary channel with kind tags, and emits a
+        // metadata-only `ManualValidationFrame` (residual + advisory verdict +
+        // geometry, NO pixels). Saving crosses as `ManualSaved`. Neither command
         // runs the solver synchronously.
         let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut mock = MockBackend::new(Arc::clone(&ops));
         mock.current_calibration = Some(sample_mock_calibration());
         mock.has_result = true;
-        let (worker, events) = EngineWorker::spawn(mock);
+        let (worker, events, slot) = EngineWorker::spawn_with_manual_slot(mock);
+        let (channel, frames) = capturing_manual_channel();
+        *slot.lock().unwrap() = Some(channel);
         let handle = worker.handle();
         handle
             .send(WorkerCommand::ManualBegin { frame: 0 })
@@ -7146,21 +7388,17 @@ mod tests {
             .find_map(|e| match e {
                 WorkerEvent::ManualValidationFrame {
                     frame,
-                    rgba,
                     width,
                     height,
                     verdict,
-                    reference_rgba,
                     reference_width,
                     reference_height,
                     ..
                 } => Some((
                     *frame,
-                    rgba.len(),
                     *width,
                     *height,
                     *verdict,
-                    reference_rgba.len(),
                     *reference_width,
                     *reference_height,
                 )),
@@ -7168,17 +7406,48 @@ mod tests {
             })
             .expect("ManualValidate must emit a ManualValidationFrame");
         assert_eq!(validation.0, 3, "the validated frame index must cross");
-        assert_eq!(
-            validation.1 as u32,
-            validation.2 * validation.3 * 4,
-            "the validation RGBA must match its geometry"
+        assert_eq!(validation.3, crate::events::ValidationVerdict::LooksGood);
+        // The metadata event must not carry pixel arrays.
+        let validation_json = seen
+            .iter()
+            .filter_map(|e| serde_json::to_string(e).ok())
+            .find(|json| json.contains("manual_validation_frame"))
+            .expect("the validation event must serialize");
+        assert!(
+            !validation_json.contains("rgba"),
+            "no pixel payload may cross the JSON bridge: {validation_json}"
         );
-        assert_eq!(validation.4, crate::events::ValidationVerdict::LooksGood);
+
+        // The two stitched buffers stream over the binary channel, tagged
+        // validation then reference, each matching its geometry.
+        let streamed = frames.lock().unwrap().clone();
+        let validation_frames: Vec<(ManualFrameKind, u32, u32, usize)> = streamed
+            .iter()
+            .map(|f| {
+                let (kind, w, h, payload) = split_manual_frame(f);
+                (kind, w, h, payload.len())
+            })
+            .filter(|(kind, ..)| {
+                matches!(
+                    kind,
+                    ManualFrameKind::Validation | ManualFrameKind::Reference
+                )
+            })
+            .collect();
         assert_eq!(
-            validation.5 as u32,
-            validation.6 * validation.7 * 4,
-            "the reference RGBA must match its geometry"
+            validation_frames.len(),
+            2,
+            "validate must stream the validation + reference buffers: {validation_frames:?}"
         );
+        assert_eq!(validation_frames[0].0, ManualFrameKind::Validation);
+        assert_eq!(validation_frames[1].0, ManualFrameKind::Reference);
+        for (_, width, height, len) in &validation_frames {
+            assert_eq!(
+                *len as u32,
+                width * height * 4,
+                "streamed RGBA must match its geometry"
+            );
+        }
         assert!(
             seen.iter().any(|e| matches!(
                 e,
@@ -7279,7 +7548,7 @@ mod tests {
         // The receiver is dropped: these tests assert stored state, not events,
         // and a failed `send` is ignored by the sink (as everywhere else).
         let (evt_tx, _evt_rx) = std::sync::mpsc::channel();
-        let events = EventSink { tx: evt_tx };
+        let events = EventSink::new(evt_tx);
         let interrupted = AtomicBool::new(false);
         let _ = handle_command(
             WorkerCommand::ManualBegin { frame: 0 },
@@ -7523,7 +7792,7 @@ mod tests {
         mock.current_calibration = Some(base.clone());
         mock.has_result = true;
         let (evt_tx, _evt_rx) = std::sync::mpsc::channel();
-        let events = EventSink { tx: evt_tx };
+        let events = EventSink::new(evt_tx);
         let interrupted = AtomicBool::new(false);
 
         let _ = handle_command(
@@ -7582,7 +7851,7 @@ mod tests {
         // worker rejects with a typed error and leaves the state unchanged.
         let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
         let (evt_tx, evt_rx) = std::sync::mpsc::channel();
-        let events = EventSink { tx: evt_tx };
+        let events = EventSink::new(evt_tx);
         let interrupted = AtomicBool::new(false);
         let mut mock = MockBackend::new(Arc::clone(&ops));
 
@@ -7616,7 +7885,7 @@ mod tests {
         // polygon with fewer than three vertices on both cameras clears it.
         let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
         let (evt_tx, evt_rx) = std::sync::mpsc::channel();
-        let events = EventSink { tx: evt_tx };
+        let events = EventSink::new(evt_tx);
         let interrupted = AtomicBool::new(false);
         let mut mock = MockBackend::new(Arc::clone(&ops));
 
@@ -7694,7 +7963,7 @@ mod tests {
         // so the worker must publish the profile's ROI when it is adopted.
         let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
         let (evt_tx, evt_rx) = std::sync::mpsc::channel();
-        let events = EventSink { tx: evt_tx };
+        let events = EventSink::new(evt_tx);
         let interrupted = AtomicBool::new(false);
         let mut mock = MockBackend::new(Arc::clone(&ops));
         mock.mock_field_roi = Some(reco_core::calibration::FieldRoi {
@@ -8488,7 +8757,7 @@ mod tests {
         // just created, or the UI shows Loop off while the user left it on.
         let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
         let (evt_tx, evt_rx) = std::sync::mpsc::channel();
-        let events = EventSink { tx: evt_tx };
+        let events = EventSink::new(evt_tx);
         let interrupted = AtomicBool::new(false);
         let mut mock = MockBackend::new(Arc::clone(&ops));
 
@@ -8525,7 +8794,7 @@ mod tests {
         // back into the import-built transport or it is lost for the next Play.
         let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
         let (evt_tx, _evt_rx) = std::sync::mpsc::channel();
-        let events = EventSink { tx: evt_tx };
+        let events = EventSink::new(evt_tx);
         let interrupted = AtomicBool::new(false);
         let mut mock = MockBackend::new(Arc::clone(&ops));
 
@@ -8877,7 +9146,7 @@ mod tests {
         let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut backend = MockBackend::new(Arc::clone(&ops)).with_pointer_gesture(wheel);
         let (evt_tx, _rx) = std::sync::mpsc::channel();
-        let events = EventSink { tx: evt_tx };
+        let events = EventSink::new(evt_tx);
         let fov_before = backend.pose.lock().unwrap().target_pose().fov_degrees;
         backend.drain_pointer_input(&events);
         let (yaw, fov_after) = {

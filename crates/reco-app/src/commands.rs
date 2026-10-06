@@ -245,6 +245,30 @@ pub async fn preview_attach_readback(
         .map_err(|_| WorkerError::ChannelClosed)
 }
 
+/// Attach the webview binary channel for manual preview/validation frames
+/// (MANU-03).
+///
+/// The manual flow streams its preview and validation RGBA over a binary
+/// `Channel<Response>` rather than the JSON `worker-event-typed` bridge: a
+/// bounded frame is ~2 MB, which serializes to ~8 MB of JSON numbers and made
+/// the webview parse millions of numbers per frame (Phase 04.1 OOM). The
+/// channel receives `[kind: u8][width: u32 LE][height: u32 LE][RGBA]` frames,
+/// the readback convention plus a kind tag. Stores the channel in the shared
+/// slot the worker's event sink already holds; a later attach replaces it.
+///
+/// # Errors
+///
+/// Currently infallible, but returns `Result` for a uniform command surface
+/// with [`preview_attach_readback`].
+#[tauri::command]
+pub async fn manual_attach_preview(
+    sender: tauri::State<'_, crate::worker::ManualFrameSender>,
+    on_frame: tauri::ipc::Channel<tauri::ipc::Response>,
+) -> Result<(), WorkerError> {
+    sender.attach(on_frame);
+    Ok(())
+}
+
 /// Show the separate preview window (PREV-05 "Show preview window" action).
 ///
 /// Thin: posts `ShowPreviewWindow`; the worker shows the Rust-owned preview
@@ -569,9 +593,9 @@ pub async fn set_field_roi(
 ///
 /// Thin, same contract as [`set_field_roi`]: post a typed
 /// `WorkerCommand::ManualBegin` and return. The worker extracts the reference
-/// frame pair, retains its YUV planes, and emits a typed
-/// `ManualSessionStarted` plus one `ManualPreviewFrame` per camera rendered
-/// under real `CameraParams`. Names no engine type.
+/// frame pair, retains its YUV planes, emits a typed `ManualSessionStarted`, and
+/// streams one binary preview per camera rendered under real `CameraParams` over
+/// the channel attached by [`manual_attach_preview`]. Names no engine type.
 ///
 /// # Why `rename_all = "snake_case"`
 ///
@@ -1164,10 +1188,11 @@ pub enum WorkerCommand {
     ///
     /// The worker extracts the reference frame for both clips, retains the YUV
     /// planes for the session's duration, seeds the per-camera `CameraParams`
-    /// from the loaded profile (or a neutral default), and emits a typed
-    /// `ManualSessionStarted` plus one `ManualPreviewFrame` per camera. The
-    /// frame index is clamped against the probed frame count (T-04.1-01). No
-    /// calibration `.json` is required to begin.
+    /// from the loaded profile (or a neutral default), emits a typed
+    /// `ManualSessionStarted`, and streams one binary preview per camera over the
+    /// `manual_attach_preview` channel. The frame index is clamped against the
+    /// probed frame count (T-04.1-01). No calibration `.json` is required to
+    /// begin.
     ManualBegin {
         /// The reference frame index (0-based; clamped by the worker).
         frame: u64,

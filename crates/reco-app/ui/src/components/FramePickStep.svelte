@@ -4,7 +4,7 @@
   readout and a `Use this frame` CTA. The preview canvases paint the RGBA bytes
   the worker produced (readback-canvas idiom: validate header/length, resize
   backing store only on change, fail closed). Scrubbing posts a debounced
-  `manual_set_frame`; the canvas repaints on the resulting `manual_preview_frame`.
+  `manual_set_frame`; the canvas repaints on the resulting binary preview frame.
 -->
 <script lang="ts">
   import { onDestroy } from "svelte";

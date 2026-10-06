@@ -353,10 +353,6 @@ export type WorkerEventTyped =
       kind: "manual_session_started";
       data: { frame: number; fps: number; frames_total: number };
     }
-  | {
-      kind: "manual_preview_frame";
-      data: { side: ManualSide; rgba: number[]; width: number; height: number };
-    }
   | { kind: "manual_solve_state"; data: { busy: boolean; stale: boolean } }
   | { kind: "manual_pins"; data: { pins: ManualPinView[]; seeded: boolean } }
   | {
@@ -407,15 +403,11 @@ export type WorkerEventTyped =
       kind: "manual_validation_frame";
       data: {
         frame: number;
-        /** The validation frame's stitched RGBA (`width * height * 4`). */
-        rgba: number[];
         width: number;
         height: number;
         /** Per-frame residual (px). */
         residual: number;
         verdict: ValidationVerdict;
-        /** The calibration frame's stitched RGBA for the blink comparison. */
-        reference_rgba: number[];
         reference_width: number;
         reference_height: number;
       };

@@ -73,6 +73,7 @@ fn main() -> anyhow::Result<()> {
             commands::set_chrome,
             commands::set_presenter,
             commands::preview_attach_readback,
+            commands::manual_attach_preview,
             commands::show_preview_window,
             commands::set_view,
             commands::intent,
@@ -226,7 +227,7 @@ fn run_skeleton(app: &mut tauri::App) -> Result<(), SkeletonError> {
     // the documented bypass of the command channel the blocked worker cannot
     // drain (RESEARCH E8 / Pitfall 3).
     let calibration_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let (worker, events, readback_tx) = worker::spawn_gpu_worker(
+    let (worker, events, readback_tx, manual_frame_slot) = worker::spawn_gpu_worker(
         instance,
         presenter_chain,
         rect,
@@ -278,6 +279,11 @@ fn run_skeleton(app: &mut tauri::App) -> Result<(), SkeletonError> {
     // lifetime; the webview owns the lifetime from here.
     app.manage(handle);
     app.manage(worker::ReadbackSender(readback_tx));
+    // The manual-frame binary channel slot (MANU-03): `manual_attach_preview`
+    // stores the webview `Channel<Response>` into this shared slot, which the
+    // worker's `EventSink` already holds a clone of. This is what keeps the
+    // manual preview/validation RGBA off the JSON `worker-event-typed` bridge.
+    app.manage(worker::ManualFrameSender(manual_frame_slot));
     app.manage(worker::CalibrationCancel(calibration_cancel));
     app.manage(window);
 

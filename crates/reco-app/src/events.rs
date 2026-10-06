@@ -881,24 +881,6 @@ pub enum WorkerEvent {
         frames_total: u64,
     },
 
-    /// One camera's reference frame rendered under its real `CameraParams`
-    /// (MANU-03).
-    ///
-    /// `rgba` is `width * height * 4` bytes — the same RGBA-to-webview payload
-    /// convention as the CALB-08 debug thumbnails. Every pixel is produced by
-    /// the GPU undistort under real `CameraParams`; the frontend paints the
-    /// bytes and never touches the GPU (T-04.1-04).
-    ManualPreviewFrame {
-        /// Which camera this frame belongs to.
-        side: ManualSide,
-        /// RGBA bytes (`width * height * 4`).
-        rgba: Vec<u8>,
-        /// Frame width in pixels.
-        width: u32,
-        /// Frame height in pixels.
-        height: u32,
-    },
-
     /// The manual solve's busy/stale state (MANU-03).
     ///
     /// `busy` is true while a background solve is in flight; `stale` marks that
@@ -1006,21 +988,21 @@ pub enum WorkerEvent {
         offset_semantics: String,
     },
 
-    /// A manual validation frame's stitched comparison + advisory residual
-    /// (MANU-07).
+    /// A manual validation frame's stitched comparison metadata + advisory
+    /// residual (MANU-07).
     ///
-    /// Carries the validation frame's stitched RGBA (`rgba`, `width`,
-    /// `height`), the engine's per-frame residual under the current manual
-    /// parameters, and the advisory [`ValidationVerdict`]. `reference_rgba` /
-    /// `reference_width` / `reference_height` are the *calibration frame's*
-    /// stitched output under the same parameters/layout, so the webview can
-    /// blink/blend between the two (MANU-07). Validation is advisory only —
-    /// never a hard gate; the operator decides whether to save.
+    /// Carries only non-pixel state: the validated frame index, the engine's
+    /// per-frame residual under the current manual parameters, and the advisory
+    /// [`ValidationVerdict`], plus the geometry of both stitched frames. The
+    /// stitched RGBA itself (the validation frame and the *calibration frame's*
+    /// reference, so the webview can blink/blend between the two) is streamed
+    /// over the manual-frame binary `Channel` — never over this JSON event, whose
+    /// multi-million-number arrays are what drove the webview OOM (Phase 04.1).
+    /// Validation is advisory only — never a hard gate; the operator decides
+    /// whether to save.
     ManualValidationFrame {
         /// The validated frame index (0-based).
         frame: u32,
-        /// The validation frame's stitched RGBA (`width * height * 4`).
-        rgba: Vec<u8>,
         /// Stitched width in pixels.
         width: u32,
         /// Stitched height in pixels.
@@ -1029,8 +1011,6 @@ pub enum WorkerEvent {
         residual: f64,
         /// The advisory verdict (never a gate).
         verdict: ValidationVerdict,
-        /// The calibration frame's stitched RGBA (`reference_width * reference_height * 4`).
-        reference_rgba: Vec<u8>,
         /// Reference (calibration frame) stitched width in pixels.
         reference_width: u32,
         /// Reference (calibration frame) stitched height in pixels.
@@ -1282,17 +1262,6 @@ impl WorkerEvent {
                 message: format!(
                     "manual session started: frame {frame}/{frames_total} @ {fps:.3} fps"
                 ),
-            },
-            // The RGBA payload is deliberately NOT logged: a log line carries a
-            // human-readable summary, never a megabyte of frame bytes.
-            WorkerEvent::ManualPreviewFrame {
-                side,
-                width,
-                height,
-                ..
-            } => LogLine {
-                level: Level::Info,
-                message: format!("manual preview frame: {side:?} {width}×{height}"),
             },
             WorkerEvent::ManualSolveState { busy, stale } => LogLine {
                 level: Level::Info,
@@ -2164,35 +2133,36 @@ mod tests {
     }
 
     #[test]
-    fn manual_preview_frame_roundtrips_and_projects_to_an_info_line() {
-        // MANU-03: the rendered RGBA crosses as a typed event whose length is
-        // exactly `width * height * 4`; the log projection carries the geometry,
-        // never the bytes.
-        let event = WorkerEvent::ManualPreviewFrame {
-            side: ManualSide::Left,
-            rgba: vec![0, 0, 0, 255, 255, 255, 255, 255],
+    fn manual_preview_and_validation_events_carry_no_rgba_payload() {
+        // Phase 04.1 root fix: preview/validation RGBA is streamed over the
+        // binary channel, never the JSON `worker-event-typed` bridge. This pins
+        // the JSON contract: the validation event carries only metadata, so its
+        // serialized form contains no pixel array (a multi-million-element JSON
+        // number array per frame was what blew the webview RSS up to GB).
+        let frame = WorkerEvent::ManualValidationFrame {
+            frame: 42,
             width: 2,
             height: 1,
+            residual: 0.4,
+            verdict: ValidationVerdict::LooksGood,
+            reference_width: 2,
+            reference_height: 1,
         };
-        let json = serde_json::to_string(&event).unwrap();
+        let json = serde_json::to_string(&frame).unwrap();
         assert!(
-            json.contains("\"kind\":\"manual_preview_frame\""),
+            json.contains("\"kind\":\"manual_validation_frame\""),
             "unexpected json: {json}"
         );
         assert!(
-            json.contains("\"side\":\"left\""),
-            "unexpected json: {json}"
+            !json.contains("rgba"),
+            "no pixel payload may cross the JSON bridge: {json}"
         );
-        let back: WorkerEvent = serde_json::from_str(&json).unwrap();
-        assert_eq!(event, back);
-
-        let line = event.to_log_line();
-        assert_eq!(line.level, Level::Info);
-        assert_eq!(line.message, "manual preview frame: Left 2×1");
         assert!(
-            !line.message.contains("255"),
-            "the log line must not carry frame bytes: {line:?}"
+            json.len() < 256,
+            "the metadata event must stay tiny, got {} bytes: {json}",
+            json.len()
         );
+        assert_eq!(serde_json::from_str::<WorkerEvent>(&json).unwrap(), frame);
     }
 
     #[test]
@@ -2410,17 +2380,15 @@ mod tests {
 
     #[test]
     fn manual_validation_frame_and_saved_roundtrip_and_project() {
-        // MANU-07: the validation frame carries the stitched comparison plus an
-        // advisory residual/verdict; the save event carries the written path.
-        // A `CheckSeam` verdict projects to WARN, never a hard gate.
+        // MANU-07: the validation frame carries the stitched comparison metadata
+        // plus an advisory residual/verdict; the save event carries the written
+        // path. A `CheckSeam` verdict projects to WARN, never a hard gate.
         let frame = WorkerEvent::ManualValidationFrame {
             frame: 42,
-            rgba: vec![0u8; 8],
             width: 2,
             height: 1,
             residual: 0.4,
             verdict: ValidationVerdict::LooksGood,
-            reference_rgba: vec![0u8; 8],
             reference_width: 2,
             reference_height: 1,
         };
@@ -2438,12 +2406,10 @@ mod tests {
 
         let check_seam = WorkerEvent::ManualValidationFrame {
             frame: 42,
-            rgba: vec![0u8; 8],
             width: 2,
             height: 1,
             residual: 0.4,
             verdict: ValidationVerdict::CheckSeam,
-            reference_rgba: vec![0u8; 8],
             reference_width: 2,
             reference_height: 1,
         };

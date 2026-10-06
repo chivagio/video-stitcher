@@ -4,10 +4,14 @@
  * Wraps the typed `WorkerCommand`/`WorkerEvent` protocol for the manual
  * calibration flow. The worker is authoritative for the session, the retained
  * reference frame, and the rendered preview (UI-SPEC Interaction rule 1): this
- * store mirrors the typed `ManualSessionStarted` / `ManualPreviewFrame` /
+ * store mirrors the typed `ManualSessionStarted` / `ManualValidationFrame` /
  * `ManualSolveState` events and **never derives them locally**.
  *
- * The preview buffers are the RGBA bytes the worker produced by the GPU
+ * The preview/validation RGBA is streamed over a binary
+ * `Channel<ArrayBuffer>` (the `manual_attach_preview` command), NOT the JSON
+ * `worker-event-typed` bridge: a bounded frame is ~2 MB, which serializes to
+ * ~8 MB of JSON numbers and made the webview parse millions of numbers per
+ * frame (Phase 04.1 OOM). The bytes are the RGBA the worker produced by the GPU
  * undistort under real `CameraParams`; the frontend paints them on a canvas and
  * never touches the GPU (D-06 / T-04.1-04).
  *
@@ -15,7 +19,7 @@
  * worker events. It never touches engine types or window lifecycle.
  */
 
-import { invoke } from "@tauri-apps/api/core";
+import { Channel, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type {
   CameraParamsView,
@@ -69,24 +73,31 @@ export const MANUAL_STEPS: ManualStep[] = [
   "validate",
 ];
 
-/** One camera's rendered preview frame (mirror `events::ManualPreviewFrame`). */
+/**
+ * One camera's rendered preview frame (MANU-03).
+ *
+ * The pixels arrive over the binary manual-frame channel; `rgba` is the
+ * RGBA bytes (`width * height * 4`) the worker produced.
+ */
 export interface ManualPreview {
   /** RGBA bytes (`width * height * 4`). */
-  rgba: number[];
+  rgba: Uint8ClampedArray;
   width: number;
   height: number;
 }
 
 /**
- * One stitched validation comparison (mirror `events::ManualValidationFrame`,
- * MANU-07). Carries the validation frame's stitched RGBA plus the calibration
- * frame's reference for the blink/blend comparison.
+ * One stitched validation comparison (MANU-07). Carries the validation frame's
+ * stitched RGBA plus the calibration frame's reference for the blink/blend
+ * comparison. The residual/verdict/geometry arrive on the metadata-only
+ * `manual_validation_frame` event; the two RGBA buffers arrive over the binary
+ * manual-frame channel.
  */
 export interface ValidationFrame {
   /** The validated frame index (0-based). */
   frame: number;
   /** The validation frame's stitched RGBA (`width * height * 4`). */
-  rgba: number[];
+  rgba: Uint8ClampedArray;
   width: number;
   height: number;
   /** Per-frame residual (px). */
@@ -94,9 +105,52 @@ export interface ValidationFrame {
   /** The advisory verdict (never a gate). */
   verdict: ValidationVerdict;
   /** The calibration frame's stitched RGBA for the blink comparison. */
-  referenceRgba: number[];
+  referenceRgba: Uint8ClampedArray;
   referenceWidth: number;
   referenceHeight: number;
+}
+
+/**
+ * The binary manual-frame wire format (mirrors `worker::MANUAL_FRAME_HEADER_LEN`
+ * and `worker::ManualFrameKind`): `[kind: u8][width: u32 LE][height: u32 LE][RGBA]`.
+ * The length guard fails closed (no paint) if the two ever drift.
+ */
+const MANUAL_FRAME_HEADER_LEN = 9;
+/** Manual-frame kind tags (mirror `worker::ManualFrameKind`). */
+const MANUAL_KIND_LEFT = 0;
+const MANUAL_KIND_RIGHT = 1;
+const MANUAL_KIND_VALIDATION = 2;
+const MANUAL_KIND_REFERENCE = 3;
+
+/** One parsed binary manual frame. */
+interface ManualBinaryFrame {
+  kind: number;
+  rgba: Uint8ClampedArray;
+  width: number;
+  height: number;
+}
+
+/**
+ * Parse one binary manual frame, or `null` when it is malformed (short header,
+ * zero dimension, or a payload length that does not match the header). Fails
+ * closed so a bad frame cannot throw inside the uncaught Channel handler.
+ */
+function parseManualFrame(buffer: ArrayBuffer): ManualBinaryFrame | null {
+  if (buffer.byteLength < MANUAL_FRAME_HEADER_LEN) return null;
+  const view = new DataView(buffer);
+  const kind = view.getUint8(0);
+  const width = view.getUint32(1, true);
+  const height = view.getUint32(5, true);
+  if (width === 0 || height === 0) return null;
+  if (buffer.byteLength !== MANUAL_FRAME_HEADER_LEN + width * height * 4) {
+    return null;
+  }
+  const rgba = new Uint8ClampedArray(
+    buffer,
+    MANUAL_FRAME_HEADER_LEN,
+    width * height * 4,
+  );
+  return { kind, rgba, width, height };
 }
 
 /**
@@ -203,6 +257,33 @@ class ManualStore {
   /** Unlisten function for the typed worker-event listener. */
   #unlisten: (() => void) | null = null;
 
+  /**
+   * The binary manual-frame channel (MANU-03). Created and attached in
+   * `begin()`; the pixels arrive here, never on the JSON event stream.
+   */
+  #frameChannel: Channel<ArrayBuffer> | null = null;
+
+  /** The metadata of the in-flight validation frame, awaiting its buffers. */
+  #pendingValidationMeta: {
+    frame: number;
+    residual: number;
+    verdict: ValidationVerdict;
+    referenceWidth: number;
+    referenceHeight: number;
+  } | null = null;
+  /** The validation frame's stitched buffer, awaiting the reference/metadata. */
+  #pendingValidation: {
+    rgba: Uint8ClampedArray;
+    width: number;
+    height: number;
+  } | null = null;
+  /** The calibration reference buffer, awaiting the validation/metadata. */
+  #pendingReference: {
+    rgba: Uint8ClampedArray;
+    width: number;
+    height: number;
+  } | null = null;
+
   /** Start listening for typed worker events (idempotent). */
   async init(): Promise<void> {
     if (this.#unlisten !== null) return;
@@ -220,6 +301,102 @@ class ManualStore {
       this.#unlisten();
       this.#unlisten = null;
     }
+    this.#detachFrameChannel();
+  }
+
+  /**
+   * Create the binary manual-frame channel and attach it to the worker
+   * (MANU-03). Idempotent within a session: a re-begin replaces the channel.
+   *
+   * The RGBA frames stream here instead of the JSON event bridge, so the
+   * handler parses the `[kind][width][height][RGBA]` header and routes the
+   * pixels by kind. Mirroring `PreviewSurface.svelte`'s readback path, a later
+   * attach replaces the stored channel; cleanup only clears the JS handler.
+   */
+  async attachFrameChannel(): Promise<void> {
+    this.#detachFrameChannel();
+    const channel = new Channel<ArrayBuffer>();
+    channel.onmessage = (buffer: ArrayBuffer) => {
+      const frame = parseManualFrame(buffer);
+      if (frame === null) return;
+      switch (frame.kind) {
+        case MANUAL_KIND_LEFT:
+          this.previewLeft = {
+            rgba: frame.rgba,
+            width: frame.width,
+            height: frame.height,
+          };
+          break;
+        case MANUAL_KIND_RIGHT:
+          this.previewRight = {
+            rgba: frame.rgba,
+            width: frame.width,
+            height: frame.height,
+          };
+          break;
+        case MANUAL_KIND_VALIDATION:
+          this.#pendingValidation = {
+            rgba: frame.rgba,
+            width: frame.width,
+            height: frame.height,
+          };
+          this.#maybeAssembleValidation();
+          break;
+        case MANUAL_KIND_REFERENCE:
+          this.#pendingReference = {
+            rgba: frame.rgba,
+            width: frame.width,
+            height: frame.height,
+          };
+          this.#maybeAssembleValidation();
+          break;
+        default:
+          break;
+      }
+    };
+    this.#frameChannel = channel;
+    try {
+      await invoke("manual_attach_preview", { onFrame: channel });
+    } catch (e) {
+      this.error = formatWorkerError(e);
+    }
+  }
+
+  /** Clear the JS handler on the current binary channel, if any. */
+  #detachFrameChannel(): void {
+    if (this.#frameChannel !== null) {
+      this.#frameChannel.onmessage = () => {};
+      this.#frameChannel = null;
+    }
+  }
+
+  /**
+   * Assemble a `ValidationFrame` once its metadata and both RGBA buffers have
+   * arrived (they ride two transports, so either may land first). Replaces the
+   * entry for the frame rather than accumulating.
+   */
+  #maybeAssembleValidation(): void {
+    const meta = this.#pendingValidationMeta;
+    const validation = this.#pendingValidation;
+    const reference = this.#pendingReference;
+    if (meta === null || validation === null || reference === null) return;
+    this.validationFrames = {
+      ...this.validationFrames,
+      [meta.frame]: {
+        frame: meta.frame,
+        rgba: validation.rgba,
+        width: validation.width,
+        height: validation.height,
+        residual: meta.residual,
+        verdict: meta.verdict,
+        referenceRgba: reference.rgba,
+        referenceWidth: reference.width,
+        referenceHeight: reference.height,
+      },
+    };
+    this.#pendingValidationMeta = null;
+    this.#pendingValidation = null;
+    this.#pendingReference = null;
   }
 
   /** Apply a typed worker event to the store state (worker-authoritative). */
@@ -230,16 +407,6 @@ class ManualStore {
         this.frame = frame;
         this.fps = fps;
         this.framesTotal = frames_total;
-        break;
-      }
-      case "manual_preview_frame": {
-        const { side, rgba, width, height } = event.data;
-        const preview: ManualPreview = { rgba, width, height };
-        if (side === "left") {
-          this.previewLeft = preview;
-        } else {
-          this.previewRight = preview;
-        }
         break;
       }
       case "manual_solve_state": {
@@ -298,31 +465,18 @@ class ManualStore {
         break;
       }
       case "manual_validation_frame": {
-        const {
+        // Metadata only: the two RGBA buffers stream over the binary channel.
+        // Store the metadata and assemble once the buffers arrive (either order).
+        const { frame, residual, verdict, reference_width, reference_height } =
+          event.data;
+        this.#pendingValidationMeta = {
           frame,
-          rgba,
-          width,
-          height,
           residual,
           verdict,
-          reference_rgba,
-          reference_width,
-          reference_height,
-        } = event.data;
-        this.validationFrames = {
-          ...this.validationFrames,
-          [frame]: {
-            frame,
-            rgba,
-            width,
-            height,
-            residual,
-            verdict,
-            referenceRgba: reference_rgba,
-            referenceWidth: reference_width,
-            referenceHeight: reference_height,
-          },
+          referenceWidth: reference_width,
+          referenceHeight: reference_height,
         };
+        this.#maybeAssembleValidation();
         break;
       }
       case "manual_saved": {
@@ -343,16 +497,23 @@ class ManualStore {
   /**
    * Open a manual session at `frame` (MANU-01).
    *
-   * Subscribes first, then posts `manual_begin`, so the worker's
-   * `manual_session_started` / `manual_preview_frame` events are never dropped
-   * by a not-yet-registered listener (the Tauri bridge is fire-and-forget).
+   * Subscribes and attaches the binary frame channel first, then posts
+   * `manual_begin`, so the worker's `manual_session_started` event and the
+   * session's first preview frames are never dropped by a not-yet-registered
+   * listener/channel (the Tauri bridge is fire-and-forget).
    */
   async begin(frame = 0): Promise<void> {
     await this.init();
+    // Attach the binary frame channel BEFORE posting `manual_begin`, so the
+    // session's first preview pair is streamed rather than dropped.
+    await this.attachFrameChannel();
     this.open = true;
     this.error = null;
     this.previewLeft = null;
     this.previewRight = null;
+    this.#pendingValidationMeta = null;
+    this.#pendingValidation = null;
+    this.#pendingReference = null;
     this.audioConfidence = null;
     this.syncOffset = 0;
     this.syncMethod = "none";
@@ -647,8 +808,12 @@ class ManualStore {
    */
   async exit(): Promise<void> {
     this.open = false;
+    this.#detachFrameChannel();
     this.previewLeft = null;
     this.previewRight = null;
+    this.#pendingValidationMeta = null;
+    this.#pendingValidation = null;
+    this.#pendingReference = null;
     this.solving = false;
     this.stale = false;
     this.error = null;
