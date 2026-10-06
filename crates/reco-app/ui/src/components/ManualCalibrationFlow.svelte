@@ -163,13 +163,17 @@
     color: var(--color-log-info);
     font-family: var(--font-ui);
     font-size: var(--text-label);
-    font-weight: var(--weight-semibold);
+    /* Visited/future steps are regular; the current step is the only
+       semibold one, so "current" is marked by text weight and not by hue
+       alone (UI-SPEC Accessibility contract). */
+    font-weight: var(--weight-regular);
     cursor: pointer;
   }
 
   .step-btn.current {
     color: var(--color-accent);
     border-color: var(--color-accent);
+    font-weight: var(--weight-semibold);
   }
 
   .step-btn.visited {
