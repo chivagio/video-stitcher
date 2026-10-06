@@ -507,8 +507,17 @@ impl EventSink {
     }
 
     /// Emit the manual solve's busy/stale state (MANU-03).
-    fn manual_solve_state(&self, busy: bool, stale: bool) {
-        let _ = self.tx.send(WorkerEvent::ManualSolveState { busy, stale });
+    ///
+    /// `degenerate` is the precise degeneracy signal: true only when the last
+    /// completed solve was rejected because the pin set is coincident/collinear.
+    /// The editor drives its warning from this flag rather than inferring it
+    /// from `stale` (which also covers a debounce gap or a failed re-solve).
+    fn manual_solve_state(&self, busy: bool, stale: bool, degenerate: bool) {
+        let _ = self.tx.send(WorkerEvent::ManualSolveState {
+            busy,
+            stale,
+            degenerate,
+        });
     }
 
     /// Emit the manual session's current correspondence pins (MANU-03).
@@ -3662,7 +3671,7 @@ impl EngineBackend for GpuEngineBackend {
         self.manual_solve_at = None;
         self.manual_relens_pending = false;
         events.info("manual calibration session ended");
-        events.manual_solve_state(false, false);
+        events.manual_solve_state(false, false, false);
         Ok(())
     }
 
@@ -3897,7 +3906,7 @@ impl EngineBackend for GpuEngineBackend {
         // path under the edited intrinsics (MANU-05). Never solved here.
         self.manual_relens_pending = true;
         self.manual_solve_at = Some(std::time::Instant::now() + MANUAL_SOLVE_DEBOUNCE);
-        events.manual_solve_state(true, true);
+        events.manual_solve_state(true, true, false);
         Ok(())
     }
 
@@ -3940,7 +3949,7 @@ impl EngineBackend for GpuEngineBackend {
         // it only arms a confirmation solve (T-04.1-14).
         self.manual_relens_pending = false;
         self.manual_solve_at = Some(std::time::Instant::now() + MANUAL_SOLVE_DEBOUNCE);
-        events.manual_solve_state(true, true);
+        events.manual_solve_state(true, true, false);
         Ok(())
     }
 
@@ -4039,7 +4048,7 @@ impl EngineBackend for GpuEngineBackend {
                 ),
                 None => {
                     // No session: nothing to solve, preview stays stale.
-                    events.manual_solve_state(false, true);
+                    events.manual_solve_state(false, true, false);
                     return Ok(());
                 }
             };
@@ -4119,12 +4128,16 @@ impl EngineBackend for GpuEngineBackend {
                     result.residual, result.pins_used, result.auto_used
                 ));
                 self.mark_manual_preview_dirty();
-                events.manual_solve_state(false, false);
+                events.manual_solve_state(false, false, false);
             }
             Err(e) => {
                 // Degenerate/insufficient: a defined non-result. Keep the last
                 // good result (stale) and WARN — never present a garbage rig.
-                events.manual_solve_state(false, true);
+                // Only the engine's degenerate-set rejection is surfaced as
+                // `degenerate`; the editor's "spread the pins" warning is driven
+                // by that precise flag, not by `stale` alone.
+                let degenerate = matches!(e, reco_calibrate::CalibrateError::InvalidConfig(_));
+                events.manual_solve_state(false, true, degenerate);
                 events.log(Level::Warn, format!("manual solve: {e}"));
             }
         }
@@ -5325,14 +5338,14 @@ impl GpuEngineBackend {
             .is_some_and(|session| session.pins.is_empty());
         if empty {
             self.manual_solve_at = None;
-            events.manual_solve_state(false, true);
+            events.manual_solve_state(false, true, false);
             events.log(
                 Level::Warn,
                 "manual solve skipped: no pins — click the left frame to start",
             );
         } else {
             self.manual_solve_at = Some(std::time::Instant::now() + MANUAL_SOLVE_DEBOUNCE);
-            events.manual_solve_state(true, true);
+            events.manual_solve_state(true, true, false);
         }
         Ok(())
     }
@@ -5914,10 +5927,10 @@ mod tests {
             self.manual_preview_dirty = true;
             if self.manual_pins.is_empty() {
                 self.manual_solve_at = None;
-                events.manual_solve_state(false, true);
+                events.manual_solve_state(false, true, false);
             } else {
                 self.manual_solve_at = Some(std::time::Instant::now() + MOCK_SOLVE_DEBOUNCE);
-                events.manual_solve_state(true, true);
+                events.manual_solve_state(true, true, false);
             }
         }
 
@@ -6205,7 +6218,7 @@ mod tests {
             self.manual_preview_dirty = true;
             events.manual_pins(Vec::new(), false);
             self.emit_mock_manual_params(events);
-            events.manual_solve_state(false, false);
+            events.manual_solve_state(false, false, false);
             Ok(())
         }
 
@@ -6226,7 +6239,7 @@ mod tests {
             self.manual_solve_at = None;
             // IN-01 parity: drop any armed re-solve too.
             self.manual_relens_pending = false;
-            events.manual_solve_state(false, false);
+            events.manual_solve_state(false, false, false);
             Ok(())
         }
 
@@ -6338,7 +6351,7 @@ mod tests {
             }
             self.manual_relens_pending = true;
             self.manual_solve_at = Some(std::time::Instant::now() + MOCK_SOLVE_DEBOUNCE);
-            events.manual_solve_state(true, true);
+            events.manual_solve_state(true, true, false);
             Ok(())
         }
 
@@ -6370,7 +6383,7 @@ mod tests {
             }
             self.manual_relens_pending = false;
             self.manual_solve_at = Some(std::time::Instant::now() + MOCK_SOLVE_DEBOUNCE);
-            events.manual_solve_state(true, true);
+            events.manual_solve_state(true, true, false);
             Ok(())
         }
 
@@ -6513,7 +6526,7 @@ mod tests {
                 layout.x_ty - self.manual_layout.x_ty,
                 layout.x_rz - self.manual_layout.x_rz,
             );
-            events.manual_solve_state(false, false);
+            events.manual_solve_state(false, false, false);
             Ok(())
         }
 
@@ -7081,7 +7094,8 @@ mod tests {
                 e,
                 WorkerEvent::ManualSolveState {
                     busy: false,
-                    stale: false
+                    stale: false,
+                    degenerate: false
                 }
             )),
             "manual_exit must emit the reset solve state"
@@ -7337,7 +7351,8 @@ mod tests {
                 e,
                 WorkerEvent::ManualSolveState {
                     busy: true,
-                    stale: true
+                    stale: true,
+                    degenerate: false
                 }
             )),
             "a pin add must mark the solve busy/stale: {seen:?}"
@@ -7516,7 +7531,8 @@ mod tests {
                 e,
                 WorkerEvent::ManualSolveState {
                     busy: true,
-                    stale: true
+                    stale: true,
+                    degenerate: false
                 }
             )),
             "a lens edit must mark the solve busy/stale: {seen:?}"

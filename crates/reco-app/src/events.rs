@@ -886,11 +886,18 @@ pub enum WorkerEvent {
     /// `busy` is true while a background solve is in flight; `stale` marks that
     /// the preview currently shows the last solved result rather than a fresh
     /// one. No per-drag re-solve in v1 (UI-SPEC stale-vs-fresh contract).
+    /// `degenerate` is the precise degeneracy signal: true only when the last
+    /// completed solve was rejected because the pin set is coincident or
+    /// collinear. The editor drives its "spread the pins" warning from this flag,
+    /// never by inferring degeneracy from `stale` (which also covers a debounce
+    /// gap or a failed re-solve).
     ManualSolveState {
         /// Whether a background solve is running.
         busy: bool,
         /// Whether the preview shows the last solved (stale) result.
         stale: bool,
+        /// Whether the last completed solve was rejected as degenerate.
+        degenerate: bool,
     },
 
     /// The manual session's current correspondence pins (MANU-03).
@@ -1263,12 +1270,18 @@ impl WorkerEvent {
                     "manual session started: frame {frame}/{frames_total} @ {fps:.3} fps"
                 ),
             },
-            WorkerEvent::ManualSolveState { busy, stale } => LogLine {
+            WorkerEvent::ManualSolveState {
+                busy,
+                stale,
+                degenerate,
+            } => LogLine {
                 level: Level::Info,
                 message: format!(
                     "manual solve: {}",
                     if *busy {
                         "solving…"
+                    } else if *degenerate {
+                        "degenerate pin set"
                     } else if *stale {
                         "preview shows last solved result"
                     } else {
@@ -2183,19 +2196,31 @@ mod tests {
         let busy = WorkerEvent::ManualSolveState {
             busy: true,
             stale: false,
+            degenerate: false,
         };
         assert_eq!(busy.to_log_line().message, "manual solve: solving…");
         let stale = WorkerEvent::ManualSolveState {
             busy: false,
             stale: true,
+            degenerate: false,
         };
         assert_eq!(
             stale.to_log_line().message,
             "manual solve: preview shows last solved result"
         );
+        let degenerate = WorkerEvent::ManualSolveState {
+            busy: false,
+            stale: true,
+            degenerate: true,
+        };
+        assert_eq!(
+            degenerate.to_log_line().message,
+            "manual solve: degenerate pin set"
+        );
         let fresh = WorkerEvent::ManualSolveState {
             busy: false,
             stale: false,
+            degenerate: false,
         };
         assert_eq!(fresh.to_log_line().message, "manual solve: solved");
     }

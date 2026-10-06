@@ -176,6 +176,13 @@ class ManualStore {
   solving = $state(false);
   /** Whether the preview shows the last solved (stale) result. */
   stale = $state(false);
+  /**
+   * Whether the last completed solve was rejected as degenerate (coincident or
+   * collinear pins). Worker-authoritative: the editor drives its "spread the
+   * pins" warning from this precise flag, never by inferring it from `stale`
+   * (which also covers a debounce gap or a failed re-solve).
+   */
+  degenerate = $state(false);
   /** The last typed rejection, or null. */
   error = $state<string | null>(null);
 
@@ -412,6 +419,7 @@ class ManualStore {
       case "manual_solve_state": {
         this.solving = event.data.busy;
         this.stale = event.data.stale;
+        this.degenerate = event.data.degenerate;
         break;
       }
       case "manual_pins": {
@@ -509,6 +517,9 @@ class ManualStore {
     await this.attachFrameChannel();
     this.open = true;
     this.error = null;
+    this.solving = false;
+    this.stale = false;
+    this.degenerate = false;
     this.previewLeft = null;
     this.previewRight = null;
     this.#pendingValidationMeta = null;
@@ -816,6 +827,7 @@ class ManualStore {
     this.#pendingReference = null;
     this.solving = false;
     this.stale = false;
+    this.degenerate = false;
     this.error = null;
     this.audioConfidence = null;
     this.syncOffset = 0;

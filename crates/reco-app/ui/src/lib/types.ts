@@ -353,7 +353,7 @@ export type WorkerEventTyped =
       kind: "manual_session_started";
       data: { frame: number; fps: number; frames_total: number };
     }
-  | { kind: "manual_solve_state"; data: { busy: boolean; stale: boolean } }
+  | { kind: "manual_solve_state"; data: { busy: boolean; stale: boolean; degenerate: boolean } }
   | { kind: "manual_pins"; data: { pins: ManualPinView[]; seeded: boolean } }
   | {
       kind: "manual_solve_result";

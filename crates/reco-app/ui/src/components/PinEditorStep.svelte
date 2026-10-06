@@ -25,11 +25,11 @@
 
   const pinCount = $derived(manual.pins.length);
 
-  /** A settled stale state with pins present means the last solve did not land
-   *  (degenerate or insufficient) — the UI-SPEC degenerate warning. */
-  const degenerate = $derived(
-    pinCount > 0 && manual.stale && !manual.solving,
-  );
+  /** Worker-authoritative degeneracy: true only when the last completed solve
+   *  was rejected because the pin set is coincident/collinear. Driven from the
+   *  typed solve state, never inferred from `stale` (which also covers a
+   *  debounce gap or a failed re-solve). */
+  const degenerate = $derived(manual.degenerate);
 
   function rePair(pin: ManualPinView): void {
     // Re-pair: drop the old pin and restart the pair from its left point, so
