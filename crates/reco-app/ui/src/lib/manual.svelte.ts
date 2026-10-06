@@ -122,6 +122,15 @@ class ManualStore {
   params = $state<{ left: CameraParamsView; right: CameraParamsView } | null>(
     null,
   );
+  /**
+   * The profile-baseline parameters captured on the first `manual_params` of a
+   * session (MANU-05). The handles clamp against it so their travel range stays
+   * anchored to the profile, not to the moving current value.
+   */
+  baselineParams = $state<{
+    left: CameraParamsView;
+    right: CameraParamsView;
+  } | null>(null);
   /** The layout currently in effect (MANU-06), or null before the first event. */
   layout = $state<PlaneLayoutView | null>(null);
   /** The last background re-solve's layout delta, or null (MANU-05). */
@@ -222,6 +231,9 @@ class ManualStore {
         const { left, right, layout } = event.data;
         this.params = { left, right };
         this.layout = layout;
+        // The first emit of a session carries the profile baseline; the handles
+        // clamp against it (MANU-05). Later emits carry edited values.
+        if (this.baselineParams === null) this.baselineParams = { left, right };
         break;
       }
       case "manual_layout_delta": {
@@ -279,6 +291,7 @@ class ManualStore {
     this.seeded = false;
     this.solveResult = null;
     this.params = null;
+    this.baselineParams = null;
     this.layout = null;
     this.layoutDelta = null;
     this.#undoStack = [];
@@ -416,34 +429,46 @@ class ManualStore {
   }
 
   /**
+   * Snapshot the current lens value for one camera before a handle interaction
+   * (MANU-05). Called once at the start of a drag so one drag is one undo step.
+   */
+  snapshotLens(side: ManualSide): void {
+    if (!this.params) return;
+    this.#pushUndo({
+      kind: "lens",
+      side,
+      params: { ...(side === "left" ? this.params.left : this.params.right) },
+    });
+  }
+
+  /** Snapshot the current layout before a handle interaction (MANU-06). */
+  snapshotLayout(): void {
+    if (!this.layout) return;
+    this.#pushUndo({ kind: "layout", layout: { ...this.layout } });
+  }
+
+  /**
    * Apply an on-image lens-handle edit to one camera (MANU-05).
    *
-   * Pushes the pre-edit value onto the undo stack, then posts
-   * `manual_set_lens`. The worker clamps, enforces `fy = fx`, persists the
+   * Posts `manual_set_lens`; the worker clamps, enforces `fy = fx`, persists the
    * edited `CameraParams`, re-renders the instant preview without re-solving,
    * and arms the debounced background re-solve. The store never derives a
-   * parameter locally.
+   * parameter locally. Undo is snapshotted separately at drag start
+   * (`snapshotLens`), so an intermediate move does not flood the stack.
    */
   async setLens(
     side: ManualSide,
     values: { fx: number; cx: number; cy: number; k1: number },
   ): Promise<void> {
-    if (this.params) {
-      this.#pushUndo({
-        kind: "lens",
-        side,
-        params: { ...(side === "left" ? this.params.left : this.params.right) },
-      });
-    }
     await this.#postLens(side, values);
   }
 
   /**
    * Apply a constrained layout-handle edit (MANU-06).
    *
-   * Pushes the pre-edit layout onto the undo stack, then posts
-   * `manual_set_layout`. One handle moves one parameter; no free 2-D
-   * manipulation.
+   * Posts `manual_set_layout`. One handle moves one parameter; no free 2-D
+   * manipulation. Undo is snapshotted separately at interaction start
+   * (`snapshotLayout`).
    */
   async setLayout(values: {
     cam_d: number;
@@ -451,9 +476,6 @@ class ManualStore {
     x_ty: number;
     x_rz: number;
   }): Promise<void> {
-    if (this.layout) {
-      this.#pushUndo({ kind: "layout", layout: { ...this.layout } });
-    }
     await this.#postLayout(values);
   }
 
@@ -534,6 +556,7 @@ class ManualStore {
     this.seeded = false;
     this.solveResult = null;
     this.params = null;
+    this.baselineParams = null;
     this.layout = null;
     this.layoutDelta = null;
     this.#undoStack = [];
