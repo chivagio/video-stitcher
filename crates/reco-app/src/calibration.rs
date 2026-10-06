@@ -1755,4 +1755,78 @@ mod tests {
         assert!((loaded.layout.intersect - 0.42).abs() < 1e-9);
         let _ = std::fs::remove_file(&path);
     }
+
+    #[test]
+    fn project_intrinsics_refinement_maps_accept_and_reject_verbatim() {
+        // INTR-03: an accepted refinement carries the real new k1, the baseline
+        // (for `old → new`), and the held-out delta — nothing is fabricated.
+        let accepted = IntrinsicsRefinement {
+            k1: 0.21,
+            residual: 0.5,
+            accepted: true,
+            reason: RefinementReason::Accepted,
+            heldout_baseline: 1.25,
+            heldout_refined: 0.75,
+        };
+        let view = project_intrinsics_refinement(&accepted, 0.10);
+        assert_eq!(view.k1, 0.21);
+        assert_eq!(view.baseline_k1, 0.10);
+        assert!(view.accepted);
+        assert_eq!(view.heldout_baseline, Some(1.25));
+        assert_eq!(view.heldout_refined, Some(0.75));
+        assert_eq!(view.reason, "Refinement accepted.");
+
+        // A guard rejection returns the baseline k1 (never a new value) plus the
+        // engine-authored user-facing reason.
+        let rejected = IntrinsicsRefinement {
+            k1: 0.10,
+            residual: 1.0,
+            accepted: false,
+            reason: RefinementReason::GuardRejected,
+            heldout_baseline: 1.25,
+            heldout_refined: 1.30,
+        };
+        let view = project_intrinsics_refinement(&rejected, 0.10);
+        assert_eq!(
+            view.k1, 0.10,
+            "a rejection must show the unchanged baseline k1"
+        );
+        assert_eq!(view.baseline_k1, 0.10);
+        assert!(!view.accepted);
+        assert!(
+            view.reason.contains("did not improve"),
+            "reason: {}",
+            view.reason
+        );
+        assert_eq!(view.heldout_baseline, Some(1.25));
+        assert_eq!(view.heldout_refined, Some(1.30));
+    }
+
+    #[test]
+    fn project_intrinsics_refinement_never_fabricates_a_held_out_zero() {
+        // INTR-03 edge probe "reject is visible": a conditioning refusal
+        // evaluates no held-out split, so the residuals are `None` (rendered
+        // "Not reported"), never a fabricated 0.0, and the profile k1 is shown
+        // unchanged.
+        for reason in [
+            RefinementReason::InsufficientMatches,
+            RefinementReason::NotEnoughSpread,
+            RefinementReason::IllConditioned,
+        ] {
+            let refusal = IntrinsicsRefinement {
+                k1: 0.10,
+                residual: 0.0,
+                accepted: false,
+                reason,
+                heldout_baseline: 0.0,
+                heldout_refined: 0.0,
+            };
+            let view = project_intrinsics_refinement(&refusal, 0.10);
+            assert!(!view.accepted, "reason {reason:?}");
+            assert_eq!(view.heldout_baseline, None, "reason {reason:?}");
+            assert_eq!(view.heldout_refined, None, "reason {reason:?}");
+            assert_eq!(view.k1, 0.10, "reason {reason:?}");
+            assert!(!view.reason.is_empty(), "reason {reason:?}");
+        }
+    }
 }

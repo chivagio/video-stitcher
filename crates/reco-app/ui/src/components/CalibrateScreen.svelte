@@ -19,6 +19,8 @@
   import Scorecard from "./Scorecard.svelte";
   import FailurePanel from "./FailurePanel.svelte";
   import DebugSection from "./DebugSection.svelte";
+  import IntrinsicsReadout from "./IntrinsicsReadout.svelte";
+  import InlineNotice from "./InlineNotice.svelte";
   import FieldRoiEditor from "./FieldRoiEditor.svelte";
   import CompatibilityBanner from "./CompatibilityBanner.svelte";
   import ManualCalibrationFlow from "./ManualCalibrationFlow.svelte";
@@ -76,6 +78,30 @@
         <h2 class="screen-title">Calibration result</h2>
       </header>
       <Scorecard scorecard={calibration.result} onRerun={handleRerun} />
+
+      <!-- Opt-in lens refinement (INTR-03): never runs inside the wizard, so
+           the trigger exists only here on the result state. -->
+      <section class="refine-section">
+        <ActionButton
+          variant="secondary"
+          disabled={calibration.refining}
+          title="Refine the lens k1 against the verified matches (opt-in)"
+          onClick={() => void calibration.refineLens()}
+        >
+          <Icon name="wrench" />
+          Refine lens (k1)
+        </ActionButton>
+        {#if calibration.refining}
+          <span class="refining-chip" role="status">refining…</span>
+        {/if}
+      </section>
+      {#if calibration.refineError !== null}
+        <InlineNotice level="error" message={calibration.refineError} />
+      {/if}
+      {#if calibration.intrinsicsRefinement !== null}
+        <IntrinsicsReadout refinement={calibration.intrinsicsRefinement} />
+      {/if}
+
       <section class="roi-section">
         <button
           type="button"
@@ -231,6 +257,19 @@
     display: flex;
     align-items: center;
     gap: var(--space-md);
+  }
+
+  .refine-section {
+    display: flex;
+    align-items: center;
+    gap: var(--space-md);
+  }
+
+  /* Static text (never a flashing animation): `refining…` respects
+     `prefers-reduced-motion` by construction. */
+  .refining-chip {
+    color: var(--color-log-info);
+    font-size: var(--text-body);
   }
 
   .roi-section {

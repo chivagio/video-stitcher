@@ -8144,6 +8144,129 @@ mod tests {
     }
 
     #[test]
+    fn refine_lens_rejects_without_a_calibration() {
+        // INTR-03: there is nothing to refine before a run/load, so the worker
+        // rejects with a typed error and leaves the state unchanged.
+        let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (evt_tx, evt_rx) = std::sync::mpsc::channel();
+        let events = EventSink::new(evt_tx);
+        let interrupted = AtomicBool::new(false);
+        let mut mock = MockBackend::new(Arc::clone(&ops));
+
+        assert!(handle_command(
+            WorkerCommand::RefineLens {
+                heldout_fraction: 0.2,
+            },
+            &mut mock,
+            &events,
+            &interrupted,
+        ));
+
+        assert!(
+            mock.current_calibration.is_none(),
+            "the calibration must be unchanged by a rejected command"
+        );
+        let failed = evt_rx.try_iter().any(|e| {
+            matches!(
+                e,
+                WorkerEvent::Failed(WorkerError::InvalidInput { field, .. })
+                    if field == "refine_lens"
+            )
+        });
+        assert!(failed, "a missing calibration must be a typed rejection");
+    }
+
+    #[test]
+    fn refine_lens_writes_k1_only_when_accepted() {
+        // INTR-03 / T-04.2-10: an accepted refinement writes the refined k1 onto
+        // both cameras and emits the typed event.
+        let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (evt_tx, evt_rx) = std::sync::mpsc::channel();
+        let events = EventSink::new(evt_tx);
+        let interrupted = AtomicBool::new(false);
+        let mut mock = MockBackend::new(Arc::clone(&ops));
+
+        assert!(handle_command(
+            WorkerCommand::LoadProfile {
+                path: "/media/match.json".to_string(),
+            },
+            &mut mock,
+            &events,
+            &interrupted,
+        ));
+        let baseline = mock.current_calibration.as_ref().unwrap().left.d[0];
+
+        assert!(handle_command(
+            WorkerCommand::RefineLens {
+                heldout_fraction: 0.2,
+            },
+            &mut mock,
+            &events,
+            &interrupted,
+        ));
+
+        let cal = mock.current_calibration.as_ref().unwrap();
+        assert!(
+            cal.left.d[0] > baseline,
+            "an accepted refinement must write the refined k1"
+        );
+        assert_eq!(
+            cal.right.d[0], cal.left.d[0],
+            "the refined k1 must be written onto both cameras"
+        );
+        assert!(
+            evt_rx.try_iter().any(|e| {
+                matches!(e, WorkerEvent::IntrinsicsRefined { refinement } if refinement.accepted)
+            }),
+            "an accepted refinement must emit a typed IntrinsicsRefined"
+        );
+    }
+
+    #[test]
+    fn refine_lens_rejected_result_leaves_the_profile_unchanged() {
+        // INTR-03 / T-04.2-10: a rejected refinement never writes k1 and still
+        // emits the typed event so the rejection is visible.
+        let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (evt_tx, evt_rx) = std::sync::mpsc::channel();
+        let events = EventSink::new(evt_tx);
+        let interrupted = AtomicBool::new(false);
+        let mut mock = MockBackend::new(Arc::clone(&ops));
+        mock.mock_refine_accepted = false;
+
+        assert!(handle_command(
+            WorkerCommand::LoadProfile {
+                path: "/media/match.json".to_string(),
+            },
+            &mut mock,
+            &events,
+            &interrupted,
+        ));
+        let baseline = mock.current_calibration.as_ref().unwrap().left.d[0];
+
+        assert!(handle_command(
+            WorkerCommand::RefineLens {
+                heldout_fraction: 0.2,
+            },
+            &mut mock,
+            &events,
+            &interrupted,
+        ));
+
+        let cal = mock.current_calibration.as_ref().unwrap();
+        assert_eq!(
+            cal.left.d[0], baseline,
+            "a rejected refinement must not write k1"
+        );
+        assert_eq!(cal.right.d[0], baseline);
+        assert!(
+            evt_rx.try_iter().any(|e| {
+                matches!(e, WorkerEvent::IntrinsicsRefined { refinement } if !refinement.accepted)
+            }),
+            "a rejected refinement must still emit a typed event"
+        );
+    }
+
+    #[test]
     fn field_roi_round_trips_through_match_calibration_json() {
         // CALB-09: the polygon must survive profile save/load, which serializes
         // the whole `MatchCalibration` (including `field_roi`).
