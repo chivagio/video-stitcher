@@ -109,6 +109,13 @@ use types::{FrameMatches, MatchedPoint};
 /// reliably produce sub-pixel calibration.
 const FULL_CONFIDENCE_MATCHES: f64 = 50.0;
 
+/// Frame rate assumed by the free calibration entry points that carry no
+/// video metadata. Only used by the rolling-shutter row-dependent bound, which
+/// is inert unless [`MatchConfig::rolling_shutter`] is explicitly enabled; the
+/// [`CalibrationPipeline`](crate::pipeline::CalibrationPipeline) path threads
+/// the probed `VideoInfo::fps` instead.
+const DEFAULT_FPS: f64 = 30.0;
+
 /// Fraction of [`MatchConfig::exposure_target`] below which a frame is
 /// considered too dark to exposure-normalize (guards uniform-black frames).
 const EXPOSURE_DARK_FRACTION: f64 = 0.01;
@@ -130,7 +137,9 @@ fn srgb_to_linear(v: u8) -> f64 {
 
 /// Convert a linear-light value back to an 8-bit sRGB channel.
 fn linear_to_srgb_byte(x: f64) -> u8 {
-    (x.max(0.0).powf(1.0 / 2.2) * 255.0).round().clamp(0.0, 255.0) as u8
+    (x.max(0.0).powf(1.0 / 2.2) * 255.0)
+        .round()
+        .clamp(0.0, 255.0) as u8
 }
 
 /// Mean linear luminance of an RGBA frame, from a bounded downsample.
@@ -236,6 +245,7 @@ fn process_undistorted_pair(
     rw: u32,
     rh: u32,
     frame_idx: usize,
+    fps: f64,
     config: &CalibrationConfig,
     detector: &dyn traits::FeatureDetector,
     matcher: &dyn traits::FeatureMatcher,
@@ -308,8 +318,17 @@ fn process_undistorted_pair(
     }
 
     // Spatial overlap filter
-    let spatial_matches =
-        filter::spatial_filter(&raw_matches, &kp_left, &kp_right, lw, lh, rw, rh, config);
+    let spatial_matches = filter::spatial_filter(
+        &raw_matches,
+        &kp_left,
+        &kp_right,
+        lw,
+        lh,
+        rw,
+        rh,
+        fps,
+        config,
+    );
     let post_spatial_filter = spatial_matches.len();
 
     // RANSAC outlier rejection
@@ -415,8 +434,16 @@ pub fn calibrate_with_progress(
     config: &CalibrationConfig,
     on_progress: &mut dyn FnMut(&CalibrationProgress),
 ) -> Result<CalibrationResult, CalibrateError> {
-    calibrate_with_progress_diagnostic(gpu, frames, left_params, right_params, config, on_progress)
-        .map_err(|failure| failure.error)
+    calibrate_with_progress_diagnostic(
+        gpu,
+        frames,
+        left_params,
+        right_params,
+        config,
+        DEFAULT_FPS,
+        on_progress,
+    )
+    .map_err(|failure| failure.error)
 }
 
 /// Run the full calibration pipeline, returning a typed [`CalibrationFailure`]
@@ -427,12 +454,18 @@ pub fn calibrate_with_progress(
 /// failure instead of a bare [`CalibrateError`]. The host maps it to a
 /// plain-language diagnosis; callers that only want the error use
 /// [`calibrate_with_progress`].
+///
+/// `fps` is the source frame rate, threaded into the rolling-shutter
+/// row-dependent vertical-disparity bound (CALB-07); it is only consulted when
+/// [`MatchConfig::rolling_shutter`] is enabled.
+#[allow(clippy::too_many_arguments)]
 pub fn calibrate_with_progress_diagnostic(
     gpu: &GpuContext,
     frames: &[(YuvFrame, YuvFrame)],
     left_params: &CameraParams,
     right_params: &CameraParams,
     config: &CalibrationConfig,
+    fps: f64,
     on_progress: &mut dyn FnMut(&CalibrationProgress),
 ) -> Result<CalibrationResult, CalibrationFailure> {
     let detector = defaults::AkazeDetector::new(config.akaze.threshold);
@@ -444,6 +477,7 @@ pub fn calibrate_with_progress_diagnostic(
         left_params,
         right_params,
         config,
+        fps,
         &detector,
         &matcher,
         &filter,
@@ -487,6 +521,7 @@ pub fn calibrate_with(
         left_params,
         right_params,
         config,
+        DEFAULT_FPS,
         detector,
         matcher,
         point_filter,
@@ -511,6 +546,7 @@ fn calibrate_impl(
     left_params: &CameraParams,
     right_params: &CameraParams,
     config: &CalibrationConfig,
+    fps: f64,
     detector: &dyn traits::FeatureDetector,
     matcher: &dyn traits::FeatureMatcher,
     point_filter: &dyn traits::PointFilter,
@@ -596,6 +632,7 @@ fn calibrate_impl(
                 rw,
                 rh,
                 i,
+                fps,
                 config,
                 detector,
                 matcher,
@@ -749,9 +786,7 @@ mod exposure_tests {
     /// Mean linear luminance of an RGBA buffer, for assertions.
     fn mean_linear(rgba: &[u8]) -> f64 {
         let n = rgba.len() / 4;
-        let sum: f64 = (0..n)
-            .map(|i| (rgba[i * 4] as f64 / 255.0).powf(2.2))
-            .sum();
+        let sum: f64 = (0..n).map(|i| (rgba[i * 4] as f64 / 255.0).powf(2.2)).sum();
         sum / n as f64
     }
 
@@ -780,8 +815,14 @@ mod exposure_tests {
 
         normalize_exposure(&mut left, &mut right, w, h, w, h, &MatchConfig::default());
 
-        assert_eq!(left, original, "unit gain must leave the left frame unchanged");
-        assert_eq!(right, original, "unit gain must leave the right frame unchanged");
+        assert_eq!(
+            left, original,
+            "unit gain must leave the left frame unchanged"
+        );
+        assert_eq!(
+            right, original,
+            "unit gain must leave the right frame unchanged"
+        );
     }
 
     #[test]

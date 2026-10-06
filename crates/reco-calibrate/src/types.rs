@@ -437,9 +437,11 @@ impl CalibrationConfig {
                 self.matching.ratio_min, self.matching.ratio_max
             )));
         }
-        if !(self.matching.rolling_shutter_slope >= 0.0) {
+        if self.matching.rolling_shutter_slope < 0.0
+            || !self.matching.rolling_shutter_slope.is_finite()
+        {
             return Err(CalibrateError::InvalidConfig(format!(
-                "rolling_shutter_slope must be >= 0, got {}",
+                "rolling_shutter_slope must be finite and >= 0, got {}",
                 self.matching.rolling_shutter_slope
             )));
         }
@@ -606,4 +608,53 @@ pub struct CalibrationQuality {
     pub mean_reprojection_error: f64,
     pub trimmed_reprojection_error: f64,
     pub angular_error: f64,
+}
+
+#[cfg(test)]
+mod serde_defaults_tests {
+    use super::*;
+
+    /// A config JSON predating the CALB-07 fields must still load, with the
+    /// new fields taking their documented defaults (must-have: old configs
+    /// continue to load unchanged).
+    #[test]
+    fn legacy_config_without_calb07_fields_loads_with_defaults() {
+        let json = r#"{
+            "num_frames": 2,
+            "skip_start_secs": 0.0,
+            "skip_end_secs": 0.0,
+            "imu_xrz_seed": null,
+            "imu_xrx_seed": null,
+            "imu_zrx_seed": null,
+            "akaze_threshold": 0.0001,
+            "max_keypoints": 2000,
+            "detect_y_min": 0.05,
+            "detect_y_max": 0.95,
+            "lowe_ratio": 0.75,
+            "min_matches": 6,
+            "spatial_x_threshold": 0.5,
+            "spatial_x_inner": 0.0,
+            "spatial_y_low": 0.2,
+            "spatial_y_high": 0.8,
+            "max_y_disparity": 0.08,
+            "ransac_threshold": 1.0,
+            "lock_cam_d": false,
+            "lock_z_rx": false,
+            "enable_x_rx": false,
+            "seam_sigma": 0.08,
+            "trim_fraction": 0.3,
+            "max_optimizer_iters": 5000
+        }"#;
+
+        let cfg: CalibrationConfig = serde_json::from_str(json).expect("legacy config must load");
+
+        assert!(cfg.matching.exposure_normalize);
+        assert_eq!(cfg.matching.exposure_target, 0.5);
+        assert!(cfg.matching.adaptive_ratio);
+        assert_eq!(cfg.matching.ratio_min, 0.65);
+        assert_eq!(cfg.matching.ratio_max, 0.85);
+        assert!(cfg.matching.multi_scale);
+        assert!(!cfg.matching.rolling_shutter);
+        assert_eq!(cfg.matching.rolling_shutter_slope, 0.5);
+    }
 }

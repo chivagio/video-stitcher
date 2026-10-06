@@ -507,10 +507,12 @@ pub fn match_descriptors_multiscale(
     }
 
     fine.into_iter()
-        .filter(|m| match coarse_l2r.get(m.left_idx / 2).copied().flatten() {
-            Some(coarse_right) => coarse_right == m.right_idx / 2,
-            None => true,
-        })
+        .filter(
+            |m| match coarse_l2r.get(m.left_idx / 2).copied().flatten() {
+                Some(coarse_right) => coarse_right == m.right_idx / 2,
+                None => true,
+            },
+        )
         .collect()
 }
 

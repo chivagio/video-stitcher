@@ -11,14 +11,25 @@ use crate::types::{CalibrationConfig, MatchConfig};
 
 /// Row-dependent maximum allowed vertical disparity, in pixels (CALB-07).
 ///
-/// (RED stub — implementation added in the GREEN step.)
-pub fn max_y_disparity_for_row(
-    cfg: &MatchConfig,
-    _row_frac: f64,
-    _fps: f64,
-    avg_h: f64,
-) -> f64 {
-    cfg.max_y_disparity * avg_h
+/// When [`MatchConfig::rolling_shutter`] is `false` this is byte-for-byte the
+/// historical fixed bound (`max_y_disparity * avg_h`). When it is set, the
+/// bound grows toward the bottom of the frame and shrinks toward the top,
+/// scaled by [`MatchConfig::rolling_shutter_slope`] and the inter-frame time
+/// (`1 / fps`), centred so the midpoint row equals the fixed bound — consistent
+/// with a top-to-bottom sensor readout. A non-positive or non-finite `fps`
+/// leaves the bound at the fixed value (guards division by zero, T-04-06).
+pub fn max_y_disparity_for_row(cfg: &MatchConfig, row_frac: f64, fps: f64, avg_h: f64) -> f64 {
+    let base = cfg.max_y_disparity * avg_h;
+    if !cfg.rolling_shutter {
+        return base;
+    }
+    let frame_time = if fps.is_finite() && fps > 0.0 {
+        1.0 / fps
+    } else {
+        0.0
+    };
+    let slope = cfg.rolling_shutter_slope * avg_h * frame_time;
+    (base + slope * (2.0 * row_frac - 1.0)).max(0.0)
 }
 
 /// Apply spatial overlap filter to raw matches.
@@ -27,9 +38,12 @@ pub fn max_y_disparity_for_row(
 /// - Left keypoint x >= `spatial_x_threshold * width` (right portion of left image)
 /// - Right keypoint x <= `spatial_x_threshold * width` (left portion of right image)
 /// - Both keypoints y in `[spatial_y_low * height, spatial_y_high * height]`
+/// - The vertical disparity is within the row-dependent bound
+///   ([`max_y_disparity_for_row`]).
 ///
 /// Returns the filtered results as-is, even if fewer than `min_matches`.
 /// The caller is responsible for deciding how to handle insufficient matches.
+#[allow(clippy::too_many_arguments)]
 pub fn spatial_filter(
     matches: &[RawMatch],
     kp_left: &[KeyPoint],
@@ -38,6 +52,7 @@ pub fn spatial_filter(
     img_h_left: u32,
     img_w_right: u32,
     img_h_right: u32,
+    fps: f64,
     config: &CalibrationConfig,
 ) -> Vec<RawMatch> {
     let x_thresh_left = config.matching.spatial_x_threshold * img_w_left as f64;
@@ -50,12 +65,11 @@ pub fn spatial_filter(
     let y_low_right = config.matching.spatial_y_low * img_h_right as f64;
     let y_high_right = config.matching.spatial_y_high * img_h_right as f64;
 
-    // Max vertical disparity in pixels (average of both image heights).
-    // In a side-by-side stereo rig, matched features should have nearly
-    // the same y-coordinate. This catches cross-region mismatches like
-    // field markings matched to clouds.
+    // Average of both image heights, used by the row-dependent vertical
+    // disparity bound. In a side-by-side stereo rig, matched features should
+    // have nearly the same y-coordinate; this catches cross-region mismatches
+    // like field markings matched to clouds.
     let avg_h = (img_h_left as f64 + img_h_right as f64) / 2.0;
-    let max_y_disp = config.matching.max_y_disparity * avg_h;
 
     let filtered: Vec<RawMatch> = matches
         .iter()
@@ -69,6 +83,8 @@ pub fn spatial_filter(
             let right_y = rp.y as f64;
 
             let y_disp = (left_y - right_y).abs();
+            let row_frac = left_y / img_h_left as f64;
+            let max_y_disp = max_y_disparity_for_row(&config.matching, row_frac, fps, avg_h);
 
             left_x >= x_thresh_left
                 && left_x <= x_inner_left
@@ -199,7 +215,7 @@ mod tests {
         ];
 
         let result = spatial_filter(
-            &matches, &kp_left, &kp_right, 1920, 1080, 1920, 1080, &config,
+            &matches, &kp_left, &kp_right, 1920, 1080, 1920, 1080, 30.0, &config,
         );
 
         assert_eq!(result.len(), 1);
@@ -229,7 +245,7 @@ mod tests {
         }];
 
         let result = spatial_filter(
-            &matches, &kp_left, &kp_right, 1920, 1080, 1920, 1080, &config,
+            &matches, &kp_left, &kp_right, 1920, 1080, 1920, 1080, 30.0, &config,
         );
 
         // No fallback: out-of-region match is rejected, result is empty
@@ -276,8 +292,14 @@ mod tests {
         let top = max_y_disparity_for_row(&cfg, 0.0, 30.0, avg_h);
         let mid = max_y_disparity_for_row(&cfg, 0.5, 30.0, avg_h);
         let bottom = max_y_disparity_for_row(&cfg, 1.0, 30.0, avg_h);
-        assert!(top < bottom, "top {top} should be tighter than bottom {bottom}");
-        assert!((mid - base).abs() < 1e-9, "midpoint {mid} must equal base {base}");
+        assert!(
+            top < bottom,
+            "top {top} should be tighter than bottom {bottom}"
+        );
+        assert!(
+            (mid - base).abs() < 1e-9,
+            "midpoint {mid} must equal base {base}"
+        );
     }
 
     #[test]

@@ -60,6 +60,13 @@ pub struct CalibrateVideosOptions {
     pub right_params: Option<CameraParams>,
     /// Manual sync offset in frames. Auto-detects via IMU/audio if `None`.
     pub sync_offset: Option<i64>,
+    /// Explicit rolling-shutter indication (CALB-07).
+    ///
+    /// `None` (default) leaves [`MatchConfig::rolling_shutter`] at its
+    /// configured value (default `false`, inert). Set `Some(true)` for sources
+    /// with a known rolling-shutter readout to enable the row-dependent
+    /// vertical-disparity bound. The filter is never enabled silently.
+    pub rolling_shutter: Option<bool>,
 }
 
 /// Errors from [`calibrate_videos`]. `Clone + Send + Sync` so a
@@ -231,7 +238,11 @@ pub fn calibrate_videos_with_gpu(
 ) -> Result<CalibrationResult, CalibrateVideosError> {
     reco_io::init();
 
-    let config = options.config.unwrap_or_default();
+    let mut config = options.config.unwrap_or_default();
+    // Explicit rolling-shutter indication only; never enabled silently (CALB-07).
+    if let Some(rolling_shutter) = options.rolling_shutter {
+        config.matching.rolling_shutter = rolling_shutter;
+    }
 
     // Probe video metadata
     check_interrupted(interrupted)?;

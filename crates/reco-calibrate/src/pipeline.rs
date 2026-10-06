@@ -543,6 +543,7 @@ impl CalibrationPipeline {
             left_params,
             right_params,
             &config,
+            self.left_info.fps,
             on_progress,
         )?;
         result.calibration.rig_tilt = self.rig_tilt;
