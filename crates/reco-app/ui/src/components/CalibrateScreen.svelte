@@ -61,6 +61,7 @@
       </header>
       <FailurePanel
         diagnosis={calibration.diagnosis}
+        error={calibration.error}
         onTryAgain={handleStart}
         onBackToImport={onBackToImport}
       />

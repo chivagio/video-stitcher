@@ -12,10 +12,12 @@
 
   let {
     diagnosis,
+    error = null,
     onTryAgain,
     onBackToImport,
   }: {
     diagnosis: CalibrationDiagnosis | null;
+    error?: string | null;
     onTryAgain: () => void;
     onBackToImport: () => void;
   } = $props();
@@ -64,7 +66,22 @@
       </div>
     </details>
   {:else}
-    <p class="cause">Calibration failed, but no diagnosis was reported.</p>
+    <div class="block">
+      <h3 class="block-label cause-label">
+        <Icon name="alert-triangle" />
+        What happened
+      </h3>
+      <p class="cause">
+        {error ?? "Calibration failed, but no diagnosis was reported."}
+      </p>
+    </div>
+    <div class="block">
+      <h3 class="block-label fix-label">
+        <Icon name="wrench" />
+        What to try
+      </h3>
+      <p class="fix">Try again, or go back to Import to change the clips.</p>
+    </div>
   {/if}
 
   <div class="actions">
