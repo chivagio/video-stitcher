@@ -194,6 +194,16 @@
 
   // Keyboard routing (focus-scoped).
   function handleGlobalKeyDown(e: KeyboardEvent): void {
+    // Never hijack a text field: the lens search and the advanced number
+    // inputs need Space, `l`, `v`, etc. to type, not to drive playback (WR-04).
+    const target = e.target as HTMLElement | null;
+    if (
+      target &&
+      (target.isContentEditable ||
+        /^(input|textarea|select)$/i.test(target.tagName))
+    ) {
+      return;
+    }
     if (e.key === " ") {
       e.preventDefault();
       handlePlayPause();
