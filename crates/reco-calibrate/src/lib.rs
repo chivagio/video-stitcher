@@ -109,19 +109,117 @@ use types::{FrameMatches, MatchedPoint};
 /// reliably produce sub-pixel calibration.
 const FULL_CONFIDENCE_MATCHES: f64 = 50.0;
 
-/// Exposure-normalize an undistorted RGBA frame pair in linear light.
+/// Fraction of [`MatchConfig::exposure_target`] below which a frame is
+/// considered too dark to exposure-normalize (guards uniform-black frames).
+const EXPOSURE_DARK_FRACTION: f64 = 0.01;
+
+/// Maximum number of pixels sampled when computing exposure statistics.
 ///
-/// (RED stub — implementation added in the GREEN step.)
+/// Bounds the cost of the statistics pass on large frames (T-04-04).
+const EXPOSURE_SAMPLE_BUDGET: usize = 65_536;
+
+/// Lower bound on the per-frame exposure gain.
+const EXPOSURE_GAIN_MIN: f64 = 0.25;
+/// Upper bound on the per-frame exposure gain.
+const EXPOSURE_GAIN_MAX: f64 = 4.0;
+
+/// Convert an 8-bit sRGB channel to linear light (gamma 2.2 approximation).
+fn srgb_to_linear(v: u8) -> f64 {
+    (v as f64 / 255.0).powf(2.2)
+}
+
+/// Convert a linear-light value back to an 8-bit sRGB channel.
+fn linear_to_srgb_byte(x: f64) -> u8 {
+    (x.max(0.0).powf(1.0 / 2.2) * 255.0).round().clamp(0.0, 255.0) as u8
+}
+
+/// Mean linear luminance of an RGBA frame, from a bounded downsample.
+///
+/// Returns `0.0` for a zero-sized or undersized buffer. Samples at most
+/// [`EXPOSURE_SAMPLE_BUDGET`] pixels so the cost stays bounded on 4K frames.
+fn mean_linear_luminance(rgba: &[u8], w: u32, h: u32) -> f64 {
+    let pixels = w as u64 * h as u64;
+    if pixels == 0 || (rgba.len() as u64) < pixels * 4 {
+        return 0.0;
+    }
+    let pixels = pixels as usize;
+    let step = (pixels / EXPOSURE_SAMPLE_BUDGET).max(1);
+    let mut sum = 0.0;
+    let mut count = 0usize;
+    let mut i = 0usize;
+    while i < pixels {
+        let idx = i * 4;
+        let r = srgb_to_linear(rgba[idx]);
+        let g = srgb_to_linear(rgba[idx + 1]);
+        let b = srgb_to_linear(rgba[idx + 2]);
+        // Rec. 709 luma weights on linearized channels.
+        sum += 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        count += 1;
+        i += step;
+    }
+    if count == 0 { 0.0 } else { sum / count as f64 }
+}
+
+/// Scale the RGB channels of an RGBA buffer by `gain` in linear light.
+///
+/// Uses a 256-entry transfer LUT so the inner loop is a table lookup rather
+/// than a `powf` per pixel. Alpha is left untouched.
+fn apply_exposure_gain(rgba: &mut [u8], w: u32, h: u32, gain: f64) {
+    if (gain - 1.0).abs() < f64::EPSILON {
+        return;
+    }
+    let mut lut = [0u8; 256];
+    for (v, out) in lut.iter_mut().enumerate() {
+        *out = linear_to_srgb_byte(srgb_to_linear(v as u8) * gain);
+    }
+    let pixels = (w as u64 * h as u64) as usize;
+    let limit = pixels.min(rgba.len() / 4);
+    for i in 0..limit {
+        let idx = i * 4;
+        rgba[idx] = lut[rgba[idx] as usize];
+        rgba[idx + 1] = lut[rgba[idx + 1] as usize];
+        rgba[idx + 2] = lut[rgba[idx + 2] as usize];
+        // alpha (idx + 3) untouched
+    }
+}
+
+/// Exposure-normalize an undistorted RGBA frame pair in linear light (CALB-07).
+///
+/// Computes each frame's mean linear luminance from a bounded downsample and
+/// scales both frames toward their shared average, so two clips with different
+/// exposure converge to a comparable level. Identical frames receive a unit
+/// gain and are left numerically unchanged. A frame whose mean luminance is
+/// below a small fraction of [`MatchConfig::exposure_target`] (e.g. a
+/// uniform-black frame) causes the whole pair to pass through unchanged,
+/// avoiding division by zero and amplification of near-zero noise. RGB channels
+/// are scaled; alpha is untouched. Disabled entirely when
+/// [`MatchConfig::exposure_normalize`] is `false`.
 #[allow(clippy::too_many_arguments)]
 fn normalize_exposure(
-    _left: &mut [u8],
-    _right: &mut [u8],
-    _lw: u32,
-    _lh: u32,
-    _rw: u32,
-    _rh: u32,
-    _cfg: &MatchConfig,
+    left: &mut [u8],
+    right: &mut [u8],
+    lw: u32,
+    lh: u32,
+    rw: u32,
+    rh: u32,
+    cfg: &MatchConfig,
 ) {
+    if !cfg.exposure_normalize {
+        return;
+    }
+    let mean_left = mean_linear_luminance(left, lw, lh);
+    let mean_right = mean_linear_luminance(right, rw, rh);
+    let floor = (cfg.exposure_target * EXPOSURE_DARK_FRACTION).max(f64::EPSILON);
+    if mean_left < floor || mean_right < floor {
+        return;
+    }
+    // Equalize toward the pair's average luminance. When the frames are
+    // identical the shared level equals each mean, so the gain is exactly 1.0.
+    let shared = 0.5 * (mean_left + mean_right);
+    let gain_left = (shared / mean_left).clamp(EXPOSURE_GAIN_MIN, EXPOSURE_GAIN_MAX);
+    let gain_right = (shared / mean_right).clamp(EXPOSURE_GAIN_MIN, EXPOSURE_GAIN_MAX);
+    apply_exposure_gain(left, lw, lh, gain_left);
+    apply_exposure_gain(right, rw, rh, gain_right);
 }
 
 /// Process an undistorted RGBA frame pair through the feature matching pipeline.
@@ -469,12 +567,24 @@ fn calibrate_impl(
             step: CalibrationStep::Undistorting,
             detail: format!("Undistorting frame {}/{}", i + 1, frames.len()),
         });
-        let (left_rgba, right_rgba) = {
+        let (mut left_rgba, mut right_rgba) = {
             profile_scope!("gpu_undistort");
             let l = left_undistort.undistort(gpu, &left.y, &left.u, &left.v, left_params);
             let r = right_undistort.undistort(gpu, &right.y, &right.u, &right.v, right_params);
             (l, r)
         };
+        {
+            profile_scope!("exposure_normalize");
+            normalize_exposure(
+                &mut left_rgba,
+                &mut right_rgba,
+                lw,
+                lh,
+                rw,
+                rh,
+                &config.matching,
+            );
+        }
         let result = {
             profile_scope!("akaze_detect_match");
             process_undistorted_pair(
