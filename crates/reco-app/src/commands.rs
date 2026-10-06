@@ -277,18 +277,16 @@ pub async fn set_view(
 /// Validate an operator-supplied input path at the command boundary.
 ///
 /// The path is a local file string chosen by the native dialog or an HTML5
-/// drop; this is a cheap sanity gate, not a path constructor. It rejects
-/// empty/whitespace paths before they reach the worker so a blank selection
-/// cannot trigger an FFmpeg open (T-03-01). Extracted as a pure function so the
-/// boundary check is unit-testable without a Tauri `State`.
+/// drop; this is a cheap sanity gate, not a path constructor. It delegates to
+/// [`validate_profile_path`] so the video-input path and the profile path
+/// apply the **same** untrusted-path policy — empty/whitespace and the
+/// forbidden FFmpeg protocol prefixes — and the two cannot drift (T-03-01).
+/// Before this, `set_input` accepted `http://…`/`pipe:…`, which the worker then
+/// handed straight to FFmpeg's `format::input`; the profile path already
+/// rejected them. Extracted as a pure function so the boundary check is
+/// unit-testable without a Tauri `State`.
 fn validate_input_path(path: &str) -> Result<(), WorkerError> {
-    if path.trim().is_empty() {
-        return Err(WorkerError::InvalidInput {
-            field: "path".to_string(),
-            reason: "path must not be empty".to_string(),
-        });
-    }
-    Ok(())
+    validate_profile_path(path)
 }
 
 /// Set the operator-chosen video path for one camera input (IMPT-01).
@@ -939,6 +937,28 @@ mod tests {
                 }
                 other => panic!("expected InvalidInput for {bad:?}, got {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn validate_input_path_rejects_ffmpeg_protocol_prefixes() {
+        // CR-01: the video-input path applies the same forbidden-prefix guard
+        // as the profile path, so a crafted `set_input` cannot reach FFmpeg's
+        // protocol handlers (`http://`, `concat:`, `pipe:`, `data:`).
+        for bad in [
+            "https://example.com/clip.mp4",
+            "http://example.com/clip.mp4",
+            "concat:seg1.mp4|seg2.mp4",
+            "pipe:0",
+            "data:video/mp4;base64,AAAA",
+        ] {
+            assert!(
+                matches!(
+                    validate_input_path(bad),
+                    Err(WorkerError::InvalidInput { .. })
+                ),
+                "expected {bad:?} to be rejected"
+            );
         }
     }
 
