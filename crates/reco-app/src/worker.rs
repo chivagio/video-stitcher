@@ -1301,6 +1301,17 @@ pub trait EngineBackend: Send {
     /// log line and the stale state, never a garbage rig.
     fn manual_solve(&mut self, events: &EventSink) -> Result<(), WorkerError>;
 
+    /// Render and emit the manual preview if a mutation marked it dirty, then
+    /// clear the flag (MANU-03).
+    ///
+    /// The worker loop calls this once after draining pending commands, so a
+    /// drag burst (one command per pointer event) produces at most one bounded
+    /// preview frame per drain rather than one per event. A backend without a
+    /// manual preview keeps the default no-op.
+    fn flush_manual_preview(&mut self, _events: &EventSink) -> Result<(), WorkerError> {
+        Ok(())
+    }
+
     /// Begin a preview **session**: build/ensure the renderer, paint the idle
     /// frame, and start the transport, but do NOT run a frame loop.
     ///
@@ -1867,6 +1878,14 @@ fn worker_loop<B: EngineBackend>(
         loop {
             match rx.try_recv() {
                 Ok(cmd) => {
+                    // Flush a coalesced manual preview before teardown so a
+                    // pending frame is not lost when the worker stops; `shutdown`
+                    // tears down engine state the preview render needs.
+                    if matches!(cmd, WorkerCommand::Shutdown)
+                        && let Err(e) = backend.flush_manual_preview(&events)
+                    {
+                        events.failed(e);
+                    }
                     let is_job = matches!(
                         cmd,
                         WorkerCommand::Import
@@ -1904,6 +1923,15 @@ fn worker_loop<B: EngineBackend>(
             && std::time::Instant::now() >= deadline
             && let Err(e) = backend.manual_solve(&events)
         {
+            events.failed(e);
+        }
+
+        // Render the coalesced manual preview at most once per command-drain
+        // (MANU-03). A drag burst marks the preview dirty on every pointer event
+        // but produces a single bounded frame here (last state wins), so the
+        // event channel never queues one full frame per event. Placed after the
+        // solve so a solved preview is included in the same flush.
+        if let Err(e) = backend.flush_manual_preview(&events) {
             events.failed(e);
         }
 
@@ -2337,6 +2365,14 @@ pub struct GpuEngineBackend {
     /// edit leaves it false, so those paths never pay the ~629 ms detection
     /// cost (T-04.1-14).
     manual_relens_pending: bool,
+    /// Whether the manual preview needs re-rendering (MANU-03).
+    ///
+    /// A handle drag or pin move posts one command per pointer event; rendering
+    /// a bounded frame for each still floods the event channel. Every manual
+    /// mutation sets this flag instead, and the worker loop renders at most once
+    /// per command-drain ([`Self::flush_manual_preview`]), so a burst collapses
+    /// to a single frame (last state wins). Cleared by the flush.
+    manual_preview_dirty: bool,
     /// The open decode source, if `Import` has run.
     ///
     /// Drops **first** (declaration order): the CLI documents that the decode
@@ -2522,6 +2558,7 @@ impl GpuEngineBackend {
             verified_seed_frame: None,
             manual_solve_at: None,
             manual_relens_pending: false,
+            manual_preview_dirty: false,
             source: None,
             input_size: None,
             presenter,
@@ -3409,11 +3446,11 @@ impl EngineBackend for GpuEngineBackend {
         events.manual_session_started(frame, probe.fps, frames_total);
         events.manual_pins(self.manual_pin_views(), seeded);
         self.emit_manual_params(events);
-        self.render_manual_preview(events)?;
+        self.mark_manual_preview_dirty();
         Ok(())
     }
 
-    fn manual_set_frame(&mut self, frame: u64, events: &EventSink) -> Result<(), WorkerError> {
+    fn manual_set_frame(&mut self, frame: u64, _events: &EventSink) -> Result<(), WorkerError> {
         if self.manual.is_none() {
             return Err(WorkerError::InvalidInput {
                 field: "frame".to_string(),
@@ -3443,7 +3480,7 @@ impl EngineBackend for GpuEngineBackend {
                 session.right_frame = right_frame;
             }
         }
-        self.render_manual_preview(events)?;
+        self.mark_manual_preview_dirty();
         Ok(())
     }
 
@@ -3496,7 +3533,7 @@ impl EngineBackend for GpuEngineBackend {
                 // would pair mismatched instants (CR-01).
                 if changed {
                     self.reextract_right_reference()?;
-                    self.render_manual_preview(events)?;
+                    self.mark_manual_preview_dirty();
                 }
                 events.audio_sync_result(estimate.offset_frames, Some(estimate.confidence));
             }
@@ -3515,7 +3552,7 @@ impl EngineBackend for GpuEngineBackend {
                 }
                 if changed {
                     self.reextract_right_reference()?;
-                    self.render_manual_preview(events)?;
+                    self.mark_manual_preview_dirty();
                 }
                 log::warn!("manual audio sync unavailable: {e}");
                 events.audio_sync_result(0, None);
@@ -3548,7 +3585,7 @@ impl EngineBackend for GpuEngineBackend {
         // so re-extract the right reference frame and re-render (MANU-02/03).
         if reextract_right {
             self.reextract_right_reference()?;
-            self.render_manual_preview(events)?;
+            self.mark_manual_preview_dirty();
         }
         events.manual_sync_set(offset_frames, crate::events::SyncMethod::Manual);
         Ok(())
@@ -3679,7 +3716,7 @@ impl EngineBackend for GpuEngineBackend {
         }
         // Instant preview under the edited real parameters; the layout stays
         // frozen (no solve here).
-        self.render_manual_preview(events)?;
+        self.mark_manual_preview_dirty();
         self.emit_manual_params(events);
         if clamped {
             events.log(
@@ -3723,7 +3760,7 @@ impl EngineBackend for GpuEngineBackend {
         if let Some(cal) = self.current_calibration.as_mut() {
             cal.layout = edited;
         }
-        self.render_manual_preview(events)?;
+        self.mark_manual_preview_dirty();
         self.emit_manual_params(events);
         if clamped {
             events.log(
@@ -3758,7 +3795,7 @@ impl EngineBackend for GpuEngineBackend {
             cal.left = left;
             cal.right = right;
         }
-        self.render_manual_preview(events)?;
+        self.mark_manual_preview_dirty();
         self.emit_manual_params(events);
         // IN-02: drop any solve a prior lens edit armed — the baseline is
         // restored, so re-detecting under it would be wasted work.
@@ -3782,7 +3819,7 @@ impl EngineBackend for GpuEngineBackend {
         if let Some(cal) = self.current_calibration.as_mut() {
             cal.layout = baseline;
         }
-        self.render_manual_preview(events)?;
+        self.mark_manual_preview_dirty();
         self.emit_manual_params(events);
         // IN-02: drop any solve a prior layout edit armed — the baseline is
         // restored, so a confirmation solve would only re-run under it.
@@ -3794,6 +3831,13 @@ impl EngineBackend for GpuEngineBackend {
 
     fn manual_solve_deadline(&self) -> Option<std::time::Instant> {
         self.manual_solve_at
+    }
+
+    fn flush_manual_preview(&mut self, events: &EventSink) -> Result<(), WorkerError> {
+        if !std::mem::take(&mut self.manual_preview_dirty) {
+            return Ok(());
+        }
+        self.render_manual_preview(events)
     }
 
     fn manual_solve(&mut self, events: &EventSink) -> Result<(), WorkerError> {
@@ -3898,7 +3942,15 @@ impl EngineBackend for GpuEngineBackend {
                     result.layout.x_ty - before.x_ty,
                     result.layout.x_rz - before.x_rz,
                 );
-                self.render_manual_preview(events)?;
+                // The success path mirrors the failure WARN with an INFO line so
+                // a headless run can observe the solve lifecycle end-to-end (the
+                // failure path already logs; this closes the asymmetry). The
+                // message is a bounded summary, never the full layout payload.
+                events.info(format!(
+                    "manual solve succeeded: residual {:.6} px, pins_used {}, auto_used {}",
+                    result.residual, result.pins_used, result.auto_used
+                ));
+                self.mark_manual_preview_dirty();
                 events.manual_solve_state(false, false);
             }
             Err(e) => {
@@ -3960,7 +4012,18 @@ impl EngineBackend for GpuEngineBackend {
         );
 
         // Stitched comparison under the current manual parameters/layout. The
-        // calibration-frame reference is what the UI blinks against.
+        // calibration-frame reference is what the UI blinks against. Both
+        // stitched frames are bounded to `MANUAL_FRAME_MAX_EDGE` before they
+        // cross, exactly as the preview path is: a full-res stitched frame is
+        // 8.29 MB, and the blink comparison carries two per validation.
+        let bound = |(rgba, w, h): (Vec<u8>, u32, u32)| {
+            crate::calibration::downsample_rgba(
+                &rgba,
+                w,
+                h,
+                crate::calibration::MANUAL_FRAME_MAX_EDGE,
+            )
+        };
         let reference = if cal_frame == frame {
             None
         } else {
@@ -3969,9 +4032,12 @@ impl EngineBackend for GpuEngineBackend {
                 &right_path,
                 self.right_frame_index(cal_frame, right_frames_total),
             )?;
-            Some(self.render_stitched(&match_cal, &cal_left, &cal_right)?)
+            Some(bound(
+                self.render_stitched(&match_cal, &cal_left, &cal_right)?,
+            ))
         };
-        let (rgba, width, height) = self.render_stitched(&match_cal, &left_frame, &right_frame)?;
+        let (rgba, width, height) =
+            bound(self.render_stitched(&match_cal, &left_frame, &right_frame)?);
         let reference = reference.unwrap_or_else(|| (rgba.clone(), width, height));
 
         // Run the engine on the validation frame under the current intrinsics to
@@ -4953,12 +5019,27 @@ impl GpuEngineBackend {
         (left, right)
     }
 
+    /// Mark the manual preview stale so the worker loop renders it once per
+    /// command-drain (MANU-03).
+    ///
+    /// Every manual mutation (pin move, handle drag, frame change, solve) calls
+    /// this instead of rendering inline, so a drag burst collapses to a single
+    /// bounded frame in [`Self::flush_manual_preview`]. See
+    /// [`Self::manual_preview_dirty`].
+    fn mark_manual_preview_dirty(&mut self) {
+        self.manual_preview_dirty = true;
+    }
+
     /// Render both sides of the retained reference frame under real
     /// `CameraParams` and emit one typed `ManualPreviewFrame` per camera
     /// (MANU-03).
     ///
     /// The worker is the single GPU owner: the readback RGBA is what crosses to
-    /// the webview; no GPU handle ever does (T-04.1-04).
+    /// the webview; no GPU handle ever does (T-04.1-04). Each frame is
+    /// box-downsampled to [`crate::calibration::MANUAL_FRAME_MAX_EDGE`] before it
+    /// crosses, so the event payload stays bounded regardless of source
+    /// resolution; the canvas scales the bounded frame, so the preview remains
+    /// visually correct.
     fn render_manual_preview(&self, events: &EventSink) -> Result<(), WorkerError> {
         let Some(session) = self.manual.as_ref() else {
             return Ok(());
@@ -4985,6 +5066,12 @@ impl GpuEngineBackend {
             let undistort =
                 reco_core::lens::undistort::GpuUndistort::new(gpu, w, h, w as f32 / h as f32);
             let rgba = undistort.undistort(gpu, &frame.y, &frame.u, &frame.v, params);
+            let (rgba, w, h) = crate::calibration::downsample_rgba(
+                &rgba,
+                w,
+                h,
+                crate::calibration::MANUAL_FRAME_MAX_EDGE,
+            );
             events.manual_preview_frame(side, rgba, w, h);
         }
         Ok(())
@@ -5064,7 +5151,7 @@ impl GpuEngineBackend {
         }
         events.manual_pins(self.manual_pin_views(), false);
         // Instant preview under the current real parameters.
-        self.render_manual_preview(events)?;
+        self.mark_manual_preview_dirty();
         let empty = self
             .manual
             .as_ref()
@@ -5545,6 +5632,10 @@ mod tests {
         manual_baseline_layout: reco_core::calibration::PlaneLayout,
         /// Whether the mock's armed solve should re-detect (MANU-05).
         manual_relens_pending: bool,
+        /// Whether the mock's manual preview needs re-emitting (MANU-03).
+        /// Mirrors the real backend's coalescing flag so a burst of pin
+        /// mutations collapses to one preview pair, not one per command.
+        manual_preview_dirty: bool,
     }
 
     /// The mock's debounce window (MANU-03): short, so a worker test observes
@@ -5595,6 +5686,7 @@ mod tests {
                 manual_layout: super::default_plane_layout(),
                 manual_baseline_layout: super::default_plane_layout(),
                 manual_relens_pending: false,
+                manual_preview_dirty: false,
             }
         }
 
@@ -5650,7 +5742,7 @@ mod tests {
                 return;
             }
             events.manual_pins(self.mock_pin_views(), false);
-            events.manual_preview_frame(crate::events::ManualSide::Left, vec![0u8; 8], 2, 1);
+            self.manual_preview_dirty = true;
             if self.manual_pins.is_empty() {
                 self.manual_solve_at = None;
                 events.manual_solve_state(false, true);
@@ -5939,18 +6031,22 @@ mod tests {
             self.manual_baseline_layout = layout.clone();
             self.manual_layout = layout;
             events.manual_session_started(frame, 30.0, 5);
-            // A 2×1 frame => `2 * 1 * 4 = 8` RGBA bytes.
-            events.manual_preview_frame(crate::events::ManualSide::Left, vec![0u8; 8], 2, 1);
-            events.manual_preview_frame(crate::events::ManualSide::Right, vec![0u8; 8], 2, 1);
+            // A 2×1 frame => `2 * 1 * 4 = 8` RGBA bytes; the preview pair is
+            // emitted by the loop's coalesced flush, not here.
+            self.manual_preview_dirty = true;
             events.manual_pins(Vec::new(), false);
             self.emit_mock_manual_params(events);
             events.manual_solve_state(false, false);
             Ok(())
         }
 
-        fn manual_set_frame(&mut self, _frame: u64, events: &EventSink) -> Result<(), WorkerError> {
+        fn manual_set_frame(
+            &mut self,
+            _frame: u64,
+            _events: &EventSink,
+        ) -> Result<(), WorkerError> {
             self.record("manual_set_frame");
-            events.manual_preview_frame(crate::events::ManualSide::Left, vec![0u8; 8], 2, 1);
+            self.manual_preview_dirty = true;
             Ok(())
         }
 
@@ -6066,7 +6162,7 @@ mod tests {
                     crate::events::ManualSide::Right => cal.right = edited,
                 }
             }
-            events.manual_preview_frame(crate::events::ManualSide::Left, vec![0u8; 8], 2, 1);
+            self.manual_preview_dirty = true;
             self.emit_mock_manual_params(events);
             if clamped {
                 events.log(Level::Warn, "lens handle reached its safe travel limit");
@@ -6098,7 +6194,7 @@ mod tests {
             if let Some(cal) = self.current_calibration.as_mut() {
                 cal.layout = edited;
             }
-            events.manual_preview_frame(crate::events::ManualSide::Left, vec![0u8; 8], 2, 1);
+            self.manual_preview_dirty = true;
             self.emit_mock_manual_params(events);
             if clamped {
                 events.log(Level::Warn, "layout handle reached its safe travel limit");
@@ -6127,7 +6223,7 @@ mod tests {
                 cal.left = left;
                 cal.right = right;
             }
-            events.manual_preview_frame(crate::events::ManualSide::Left, vec![0u8; 8], 2, 1);
+            self.manual_preview_dirty = true;
             self.emit_mock_manual_params(events);
             // IN-02 parity: drop any armed re-solve.
             self.manual_solve_at = None;
@@ -6147,7 +6243,7 @@ mod tests {
             if let Some(cal) = self.current_calibration.as_mut() {
                 cal.layout = self.manual_baseline_layout.clone();
             }
-            events.manual_preview_frame(crate::events::ManualSide::Left, vec![0u8; 8], 2, 1);
+            self.manual_preview_dirty = true;
             self.emit_mock_manual_params(events);
             // IN-02 parity: drop any armed re-solve.
             self.manual_solve_at = None;
@@ -6212,6 +6308,17 @@ mod tests {
 
         fn manual_solve_deadline(&self) -> Option<std::time::Instant> {
             self.manual_solve_at
+        }
+
+        fn flush_manual_preview(&mut self, events: &EventSink) -> Result<(), WorkerError> {
+            // Mirror the real backend's coalescing: one preview pair per drain,
+            // not one per mutation. A 2×1 frame => `2 * 1 * 4 = 8` RGBA bytes.
+            if !std::mem::take(&mut self.manual_preview_dirty) {
+                return Ok(());
+            }
+            events.manual_preview_frame(crate::events::ManualSide::Left, vec![0u8; 8], 2, 1);
+            events.manual_preview_frame(crate::events::ManualSide::Right, vec![0u8; 8], 2, 1);
+            Ok(())
         }
 
         fn manual_solve(&mut self, events: &EventSink) -> Result<(), WorkerError> {
@@ -6851,6 +6958,94 @@ mod tests {
             .expect("ManualSetSync must emit a ManualSyncSet");
         assert_eq!(set.0, -4);
         assert_eq!(set.1, crate::events::SyncMethod::Manual);
+    }
+
+    #[test]
+    fn manual_preview_coalesces_a_mutation_burst_into_one_drain_frame() {
+        // Regression (Phase 04.1 headless pass): a handle drag posts one command
+        // per pointer event. Emitting a full-resolution preview for each flooded
+        // the event channel and drove WebKit RSS to tens of GB. Every mutation
+        // must mark the preview dirty only; the loop's single flush per drain
+        // emits one bounded preview pair, and a burst of N mutations must not
+        // produce N frames.
+        let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut mock = MockBackend::new(ops);
+        mock.current_calibration = Some(sample_mock_calibration());
+        mock.has_result = true;
+        let (evt_tx, evt_rx) = std::sync::mpsc::channel();
+        let events = EventSink { tx: evt_tx };
+        let interrupted = AtomicBool::new(false);
+
+        // Open the session and flush its own preview so the count below is only
+        // the burst's.
+        let _ = handle_command(
+            WorkerCommand::ManualBegin { frame: 0 },
+            &mut mock,
+            &events,
+            &interrupted,
+        );
+        mock.flush_manual_preview(&events).unwrap();
+        let _ = evt_rx.try_iter().count();
+
+        // A burst of 25 layout edits, all in one "drain" (no flush between).
+        for i in 0..25 {
+            let _ = handle_command(
+                WorkerCommand::ManualSetLayout {
+                    cam_d: 0.2,
+                    intersect: 0.5,
+                    x_ty: 0.001 * i as f64,
+                    x_rz: 0.0,
+                },
+                &mut mock,
+                &events,
+                &interrupted,
+            );
+        }
+        assert_eq!(
+            evt_rx
+                .try_iter()
+                .filter(|e| matches!(e, WorkerEvent::ManualPreviewFrame { .. }))
+                .count(),
+            0,
+            "a mutation must not emit a preview directly"
+        );
+
+        mock.flush_manual_preview(&events).unwrap();
+        let previews: Vec<WorkerEvent> = evt_rx
+            .try_iter()
+            .filter(|e| matches!(e, WorkerEvent::ManualPreviewFrame { .. }))
+            .collect();
+        assert_eq!(
+            previews.len(),
+            2,
+            "one coalesced preview pair per drain, not one per mutation: {previews:?}"
+        );
+        for event in &previews {
+            if let WorkerEvent::ManualPreviewFrame {
+                rgba,
+                width,
+                height,
+                ..
+            } = event
+            {
+                assert_eq!(rgba.len() as u32, width * height * 4);
+                assert!(
+                    (*width).max(*height) <= crate::calibration::MANUAL_FRAME_MAX_EDGE,
+                    "preview frame must be bounded: {width}x{height}"
+                );
+            }
+        }
+
+        // A second flush with nothing dirty emits nothing (the flag was taken).
+        mock.flush_manual_preview(&events).unwrap();
+        assert_eq!(
+            evt_rx
+                .try_iter()
+                .filter(|e| matches!(e, WorkerEvent::ManualPreviewFrame { .. }))
+                .count(),
+            0,
+            "an already-flushed preview must not re-emit"
+        );
     }
 
     #[test]

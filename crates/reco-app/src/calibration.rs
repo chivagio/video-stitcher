@@ -389,6 +389,20 @@ pub const DEBUG_THUMB_MAX_EDGE: u32 = 960;
 /// freeze the canvas; the report records the truncation in `points_capped`.
 pub const DEBUG_POINT_CAP: usize = 2000;
 
+/// Maximum edge (px) of a manual preview/validation frame crossing the event
+/// channel (MANU-03 / MANU-07).
+///
+/// Every manual frame the worker renders is box-downsampled to this bound before
+/// it is emitted, exactly as [`build_debug_report`] bounds its thumbnails.
+/// Without it the preview path shipped full-resolution readback RGBA on every
+/// handle drag (1920×1080×4 ≈ 8.29 MB per frame, two cameras per mutation),
+/// which flooded the webview event queue and drove `WebKitWebProcess` RSS to tens
+/// of GB with 20–40 s input lag. At 960 px a 16:9 frame is ~960×540×4 ≈ 2.07 MB
+/// (a ~4× reduction); the canvas scales the bounded frame, so the preview stays
+/// visually correct. The bound matches [`DEBUG_THUMB_MAX_EDGE`] so both
+/// RGBA-to-webview paths share one payload ceiling.
+pub const MANUAL_FRAME_MAX_EDGE: u32 = 960;
+
 /// Build the bounded debug inspector report for a completed run (CALB-08).
 ///
 /// Pure (no device/file/channel): the worker passes the run's per-frame
@@ -521,8 +535,10 @@ pub fn build_debug_report(
 ///
 /// Returns `(rgba, width, height)`; a zero-sized or short buffer yields an
 /// empty fail-closed result. A buffer already within the bound is copied
-/// unchanged (still bounded by `max_edge`).
-fn downsample_rgba(src: &[u8], w: u32, h: u32, max_edge: u32) -> (Vec<u8>, u32, u32) {
+/// unchanged (still bounded by `max_edge`). Shared by the CALB-08 debug
+/// thumbnails and the MANU-03/MANU-07 manual preview/validation frames, so both
+/// RGBA-to-webview paths cross the same bounded size.
+pub(crate) fn downsample_rgba(src: &[u8], w: u32, h: u32, max_edge: u32) -> (Vec<u8>, u32, u32) {
     let (w, h) = (w as usize, h as usize);
     if w == 0 || h == 0 || src.len() < w * h * 4 || max_edge == 0 {
         return (Vec::new(), 0, 0);
@@ -1298,6 +1314,51 @@ mod tests {
             report.left_width * report.left_height * 4,
             "thumbnail length must match its geometry"
         );
+    }
+
+    #[test]
+    fn manual_frame_bound_caps_full_resolution_rgba() {
+        // Regression (Phase 04.1 headless pass): the manual preview/validation
+        // path must never cross the event channel at full resolution. A
+        // 1920×1080 RGBA frame (8.29 MB) must be bounded to
+        // `MANUAL_FRAME_MAX_EDGE` on its longest edge, with the returned
+        // geometry still matching the byte length.
+        let (w, h) = (1920u32, 1080u32);
+        let src = vec![200u8; (w * h * 4) as usize];
+        let (rgba, bw, bh) = downsample_rgba(&src, w, h, MANUAL_FRAME_MAX_EDGE);
+        assert!(
+            bw.max(bh) <= MANUAL_FRAME_MAX_EDGE,
+            "manual frame must be bounded to {MANUAL_FRAME_MAX_EDGE}px, got {bw}x{bh}"
+        );
+        assert_eq!(
+            rgba.len() as u32,
+            bw * bh * 4,
+            "bounded frame length must match its geometry"
+        );
+        assert!(
+            rgba.len() < src.len(),
+            "a full-resolution frame must actually shrink"
+        );
+    }
+
+    #[test]
+    fn manual_frame_bound_leaves_a_small_frame_untouched() {
+        // A frame already within the bound is copied unchanged, so the bound is
+        // not a quality tax on the mock/small-frame paths.
+        let (w, h) = (320u32, 180u32);
+        let src = vec![7u8; (w * h * 4) as usize];
+        let (rgba, bw, bh) = downsample_rgba(&src, w, h, MANUAL_FRAME_MAX_EDGE);
+        assert_eq!((bw, bh), (w, h));
+        assert_eq!(rgba, src);
+    }
+
+    #[test]
+    fn manual_frame_bound_fails_closed_on_a_short_buffer() {
+        // A malformed payload never crosses as a truncated frame; it becomes an
+        // empty fail-closed result the frontend ignores.
+        let (rgba, w, h) = downsample_rgba(&[0u8; 8], 1920, 1080, MANUAL_FRAME_MAX_EDGE);
+        assert!(rgba.is_empty());
+        assert_eq!((w, h), (0, 0));
     }
 
     #[test]
