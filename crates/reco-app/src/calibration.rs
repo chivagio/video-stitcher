@@ -19,7 +19,7 @@ use reco_core::calibration::CameraParams;
 use crate::events::{
     CalibrationDiagnosis, CalibrationOptions, CalibrationStage, ConfidenceBand, DiagnosisMetrics,
     InputMetadata, LensProfileView, ReadinessCode, ReadinessFinding, ReadinessReport,
-    ReadinessSeverity, Scorecard, SyncMethod, SyncView,
+    ReadinessSeverity, Scorecard, SyncMethod, SyncProvenance, SyncView, SYNC_OFFSET_SEMANTICS,
 };
 
 /// Sampled statistics feeding the readiness estimate (CALB-05).
@@ -357,6 +357,13 @@ pub fn project_scorecard(result: &CalibrationResult) -> Scorecard {
         sync: SyncView {
             method: map_sync_method(result.sync.method),
             confidence: result.sync.confidence,
+            // (RED stub — populated from `result.sync` in the GREEN step.)
+            offset_frames: 0,
+            provenance: SyncProvenance {
+                ran: SyncMethod::None,
+                is_manual: false,
+            },
+            offset_semantics: String::new(),
         },
     }
 }
@@ -786,6 +793,86 @@ mod tests {
         let card = project_scorecard(&result);
         assert_eq!(card.sync.method, SyncMethod::Imu);
         assert_eq!(card.sync.confidence, None);
+    }
+
+    #[test]
+    fn imu_sync_projects_no_confidence_and_marks_the_imu_provenance_step() {
+        let mut result = sample_result();
+        result.sync = SyncInfo {
+            method: EngineSyncMethod::Imu,
+            confidence: None,
+            offset_frames: 12,
+        };
+        let card = project_scorecard(&result);
+        assert_eq!(card.sync.confidence, None, "IMU computes no confidence");
+        assert_eq!(card.sync.provenance.ran, SyncMethod::Imu);
+        assert!(!card.sync.provenance.is_manual);
+    }
+
+    #[test]
+    fn audio_sync_projects_the_confidence_and_marks_the_audio_provenance_step() {
+        let mut result = sample_result();
+        result.sync = SyncInfo {
+            method: EngineSyncMethod::Audio,
+            confidence: Some(0.9),
+            offset_frames: -3,
+        };
+        let card = project_scorecard(&result);
+        assert_eq!(card.sync.confidence, Some(0.9));
+        assert_eq!(card.sync.provenance.ran, SyncMethod::Audio);
+        assert!(!card.sync.provenance.is_manual);
+    }
+
+    #[test]
+    fn no_sync_projects_none_and_makes_no_provenance_claim() {
+        let mut result = sample_result();
+        result.sync = SyncInfo {
+            method: EngineSyncMethod::None,
+            confidence: None,
+            offset_frames: 0,
+        };
+        let card = project_scorecard(&result);
+        assert_eq!(card.sync.confidence, None);
+        assert_eq!(card.sync.provenance.ran, SyncMethod::None);
+        assert!(!card.sync.provenance.is_manual);
+    }
+
+    #[test]
+    fn a_manual_sync_is_marked_manual() {
+        let mut result = sample_result();
+        result.sync = SyncInfo {
+            method: EngineSyncMethod::Manual,
+            confidence: None,
+            offset_frames: 4,
+        };
+        let card = project_scorecard(&result);
+        assert!(card.sync.provenance.is_manual);
+        assert_eq!(card.sync.provenance.ran, SyncMethod::Manual);
+    }
+
+    #[test]
+    fn the_offset_frames_sign_is_projected_verbatim() {
+        let mut result = sample_result();
+        result.sync = SyncInfo {
+            method: EngineSyncMethod::Audio,
+            confidence: Some(0.8),
+            offset_frames: 12,
+        };
+        assert_eq!(project_scorecard(&result).sync.offset_frames, 12);
+
+        result.sync.offset_frames = -7;
+        assert_eq!(project_scorecard(&result).sync.offset_frames, -7);
+    }
+
+    #[test]
+    fn the_offset_semantics_string_matches_the_fixed_constant() {
+        let result = sample_result();
+        let card = project_scorecard(&result);
+        assert_eq!(card.sync.offset_semantics, SYNC_OFFSET_SEMANTICS);
+        assert_eq!(
+            SYNC_OFFSET_SEMANTICS,
+            "positive offset skips right frames, negative skips left frames"
+        );
     }
 
     #[test]

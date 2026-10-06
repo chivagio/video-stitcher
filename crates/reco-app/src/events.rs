@@ -355,15 +355,45 @@ pub struct LensProfileView {
     pub source: String,
 }
 
-/// The sync method and its confidence, if any (CALB-03).
+/// The fixed offset-semantics wording (CALB-06).
 ///
-/// IMU/manual paths report `confidence: None` — never a fabricated number.
+/// Authored **once** here and carried on [`SyncView::offset_semantics`] so every
+/// surface renders the identical sentence and it is never re-typed in a second
+/// component (UI-SPEC Sync Diagnostics Contract). The semantics match the
+/// engine's authoritative frame selection (`reco-calibrate/src/pipeline.rs`):
+/// a positive offset advances the right stream, skipping right frames; a
+/// negative offset advances the left stream, skipping left frames.
+pub const SYNC_OFFSET_SEMANTICS: &str =
+    "positive offset skips right frames, negative skips left frames";
+
+/// Which path produced a calibration's temporal offset, as a provenance mark
+/// over the `IMU → Audio → Manual` chain (CALB-06).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SyncProvenance {
+    /// The step in `IMU → Audio → Manual` that produced the offset.
+    pub ran: SyncMethod,
+    /// Whether the operator set the offset manually (no confidence computed).
+    pub is_manual: bool,
+}
+
+/// The sync method, its confidence, the signed offset, and the fixed semantics
+/// (CALB-03 / CALB-06).
+///
+/// IMU/manual paths report `confidence: None` — never a fabricated number. The
+/// offset is always carried (with its sign) and the semantics string is the
+/// single [`SYNC_OFFSET_SEMANTICS`] constant, so no surface re-authors it.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SyncView {
     /// Which sync path ran.
     pub method: SyncMethod,
     /// Confidence of the estimate, when the path reports one.
     pub confidence: Option<f64>,
+    /// Applied sync offset in frames (signed; 0 when no offset was applied).
+    pub offset_frames: i64,
+    /// The provenance chain mark (which path ran, and whether it was manual).
+    pub provenance: SyncProvenance,
+    /// The fixed offset-semantics sentence ([`SYNC_OFFSET_SEMANTICS`]).
+    pub offset_semantics: String,
 }
 
 /// The CALB-03 scorecard — exactly the locked field set, no invented metrics.
@@ -1265,6 +1295,12 @@ mod tests {
             sync: SyncView {
                 method: SyncMethod::Imu,
                 confidence: None,
+                offset_frames: 12,
+                provenance: SyncProvenance {
+                    ran: SyncMethod::Imu,
+                    is_manual: false,
+                },
+                offset_semantics: SYNC_OFFSET_SEMANTICS.to_string(),
             },
         };
         let json = serde_json::to_string(&scorecard).unwrap();
@@ -1275,6 +1311,14 @@ mod tests {
         assert!(
             json.contains("\"method\":\"imu\""),
             "unexpected json: {json}"
+        );
+        assert!(
+            json.contains("\"offset_frames\":12"),
+            "the signed offset must ride the payload: {json}"
+        );
+        assert!(
+            json.contains("\"offset_semantics\":\"positive offset skips right frames"),
+            "the fixed semantics must ride the payload: {json}"
         );
         assert!(
             json.contains("\"confidence\":null"),

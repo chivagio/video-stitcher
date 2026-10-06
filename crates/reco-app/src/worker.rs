@@ -3340,6 +3340,12 @@ mod tests {
             sync: crate::events::SyncView {
                 method: crate::events::SyncMethod::None,
                 confidence: None,
+                offset_frames: 0,
+                provenance: crate::events::SyncProvenance {
+                    ran: crate::events::SyncMethod::None,
+                    is_manual: false,
+                },
+                offset_semantics: crate::events::SYNC_OFFSET_SEMANTICS.to_string(),
             },
         }
     }
