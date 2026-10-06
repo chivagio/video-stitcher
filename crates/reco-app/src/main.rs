@@ -23,6 +23,7 @@
 //! This binary is the only place `anyhow` is used; the presenter/engine types
 //! use typed `thiserror` errors (CONVENTIONS.md).
 
+mod calibration;
 mod commands;
 mod events;
 mod hardcoded;
