@@ -55,7 +55,11 @@ pub trait Optimizer {
 /// Rotation bounds set to ±0.3 rad (~17 deg) to accommodate cameras
 /// with larger mounting misalignment (e.g. DJI Action 4 with rotation-
 /// corrected left video requires z_rx ≈ -0.14 rad).
-const BOUNDS_5: [(f64, f64); 5] = [
+///
+/// `pub(crate)` so the intrinsics driver's warm-started layout re-solve
+/// (`crate::intrinsics`) uses the same bounds as the production layout solve
+/// rather than a drifting copy.
+pub(crate) const BOUNDS_5: [(f64, f64); 5] = [
     (0.1, 0.30), // cam_d: camera distance
     (0.0, 1.0),  // intersect: overlap ratio
     (-0.1, 0.1), // x_ty: vertical translation

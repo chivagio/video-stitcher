@@ -90,8 +90,8 @@ pub use defaults::{
 };
 pub use error::{CalibrateError, CalibrationFailure};
 pub use intrinsics::{
-    IntrinsicsConfig, IntrinsicsRefinement, RawPixelMatch, optimize_intrinsics,
-    raw_to_matched_point,
+    Conditioning, IntrinsicsConfig, IntrinsicsRefinement, RawPixelMatch, RefinementReason,
+    conditioning, optimize_intrinsics, raw_to_matched_point, refine_intrinsics,
 };
 pub use manual::{ManualPin, ManualSolveResult, pin_to_matched_point, solve_manual_calibration};
 pub use traits::{CostFunction, FeatureDetector, FeatureMatcher, PointFilter};

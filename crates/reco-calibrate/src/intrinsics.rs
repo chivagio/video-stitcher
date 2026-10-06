@@ -88,6 +88,35 @@ pub struct IntrinsicsConfig {
     /// Fraction of worst points to drop in the trimmed objective
     /// (`0.0` = no trimming).
     pub trim_fraction: f64,
+    /// Seed for the deterministic fit/held-out split (INTR-02).
+    ///
+    /// The split is a seeded shuffle of the observation indices, so a given
+    /// `(seed, observation count)` always yields the same fit and held-out
+    /// sets — the held-out guard is reproducible run to run.
+    pub seed: u64,
+    /// Fraction of observations reserved as the held-out guard set.
+    ///
+    /// `0.2` matches the phase decision (≈20% held out). At least one
+    /// observation is always held out and at least one kept for the fit, so a
+    /// small set is still guarded.
+    pub heldout_fraction: f64,
+    /// Minimum held-out improvement required to accept a refinement (INTR-02).
+    ///
+    /// A refinement is accepted only when the held-out seam-weighted
+    /// reprojection error improves by more than this epsilon:
+    /// `heldout_refined < heldout_baseline - improvement_epsilon`. The epsilon
+    /// stops an epsilon-sized or numerical-noise "improvement" from being
+    /// reported as a real refinement (INTR-02 edge probe "no-improvement").
+    pub improvement_epsilon: f64,
+    /// Maximum alternating layout↔`k1` rounds.
+    ///
+    /// The loop stops early when the held-out residual stops improving, so this
+    /// is an upper bound (2-3 rounds is enough in practice).
+    pub max_rounds: usize,
+    /// Minimum observation count for the conditioning gate (plan 02).
+    pub min_matches: usize,
+    /// Minimum mean normalized radial spread for the conditioning gate.
+    pub min_spread: f64,
 }
 
 impl Default for IntrinsicsConfig {
@@ -97,6 +126,12 @@ impl Default for IntrinsicsConfig {
             max_iters: 5000,
             sigma: 0.08,
             trim_fraction: 0.3,
+            seed: 0x5EED_0420,
+            heldout_fraction: 0.2,
+            improvement_epsilon: 1e-6,
+            max_rounds: 3,
+            min_matches: RECOMMENDED_MIN_MATCHES,
+            min_spread: RECOMMENDED_MIN_SPREAD,
         }
     }
 }
@@ -104,13 +139,51 @@ impl Default for IntrinsicsConfig {
 /// Typed result of a reduced `k1` refinement.
 ///
 /// `fx/fy`, `cx/cy`, and `cam_d` are fixed by construction and never appear
-/// here — only the refined `k1` and the objective residual at the optimum.
+/// here — only the refined `k1`, the fit residual, and the held-out guard
+/// verdict. The caller (worker) writes `k1` into the profile **only** when
+/// [`Self::accepted`] is `true`; on any rejection [`Self::k1`] is the baseline
+/// `base.d[0]`, so a rejected refinement is never applied (INTR-02).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct IntrinsicsRefinement {
     /// The refined first radial distortion coefficient.
+    ///
+    /// Equals the baseline `base.d[0]` whenever the refinement is rejected, so
+    /// an unconditional write of this value is always safe.
     pub k1: f64,
-    /// Trimmed seam-weighted reprojection error at the optimum.
+    /// Fit-set seam-weighted reprojection error at the returned solution.
     pub residual: f64,
+    /// Whether the refinement passed the held-out guard and may be applied.
+    pub accepted: bool,
+    /// Why the refinement was accepted or rejected.
+    pub reason: RefinementReason,
+    /// Held-out seam-weighted reprojection error at the baseline `k1`.
+    ///
+    /// `0.0` when the conditioning gate refused before any held-out evaluation.
+    pub heldout_baseline: f64,
+    /// Held-out seam-weighted reprojection error at the returned `k1`.
+    ///
+    /// `0.0` when the conditioning gate refused before any held-out evaluation.
+    pub heldout_refined: f64,
+}
+
+/// Why a reduced `k1` refinement was accepted or rejected (INTR-02).
+///
+/// The caller renders this directly; it never invents a reason. A rejection
+/// always leaves the profile's `k1` unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefinementReason {
+    /// The held-out reprojection improved beyond
+    /// [`IntrinsicsConfig::improvement_epsilon`].
+    Accepted,
+    /// The refinement did not improve the held-out fit (a regression or a
+    /// tie within epsilon); the profile is unchanged (the overfitting guard).
+    GuardRejected,
+    /// Too few observations to split into fit/held-out and constrain `k1`.
+    InsufficientMatches,
+    /// The observations lack the radial spread `k1` needs (centre-weighted).
+    NotEnoughSpread,
+    /// The layout cannot host a solve (non-finite).
+    IllConditioned,
 }
 
 /// Result of the conditioning gate that guards the reduced solve.
@@ -344,9 +417,18 @@ pub fn optimize_intrinsics(
             max_evals: cfg.max_iters,
         })?;
 
+    // The unguarded reduced solve always returns its bounded optimum; the
+    // held-out guard fields are populated by [`refine_intrinsics`]. There is no
+    // fit/held-out split here, so the two held-out fields mirror the fit
+    // residual and the result is reported as accepted.
+    let best_cost = result.state().get_best_cost();
     Ok(IntrinsicsRefinement {
         k1: best[0],
-        residual: result.state().get_best_cost(),
+        residual: best_cost,
+        accepted: true,
+        reason: RefinementReason::Accepted,
+        heldout_baseline: best_cost,
+        heldout_refined: best_cost,
     })
 }
 
@@ -423,6 +505,409 @@ pub fn conditioning(
         well_conditioned: match_count >= min_matches
             && radial_spread >= min_spread
             && layout_finite,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Alternating layout ↔ k1 driver with a held-out guard (INTR-02)
+// ---------------------------------------------------------------------------
+
+/// Whether every [`PlaneLayout`] field is finite (a layout that cannot host a
+/// solve).
+fn layout_is_finite(layout: &PlaneLayout) -> bool {
+    layout.x_ty.is_finite()
+        && layout.intersect.is_finite()
+        && layout.camera_axis_offset.is_finite()
+        && layout.x_rz.is_finite()
+        && layout.z_rx.is_finite()
+}
+
+/// Map the conditioning verdict to the typed refusal reason.
+fn conditioning_reason(
+    cond: &Conditioning,
+    layout: &PlaneLayout,
+    cfg: &IntrinsicsConfig,
+) -> RefinementReason {
+    if !layout_is_finite(layout) {
+        RefinementReason::IllConditioned
+    } else if cond.match_count < cfg.min_matches {
+        RefinementReason::InsufficientMatches
+    } else {
+        // The only remaining way to fail the gate is insufficient spread.
+        RefinementReason::NotEnoughSpread
+    }
+}
+
+/// Build a typed non-result (a rejection) with the baseline `k1`.
+fn rejected(
+    k1: f64,
+    residual: f64,
+    heldout_baseline: f64,
+    heldout_refined: f64,
+    reason: RefinementReason,
+) -> IntrinsicsRefinement {
+    IntrinsicsRefinement {
+        k1,
+        residual,
+        accepted: false,
+        reason,
+        heldout_baseline,
+        heldout_refined,
+    }
+}
+
+/// Split observation indices into a deterministic fit / held-out partition.
+///
+/// The indices are a seeded shuffle of `0..n`; the first
+/// `round(n · heldout_fraction)` (clamped to `[1, n-1]`) become the held-out
+/// guard set and the rest the fit set. Deterministic for a given
+/// `(seed, n)`, so the guard is reproducible. Caller guarantees `n >= 2`.
+fn split_indices(n: usize, cfg: &IntrinsicsConfig) -> (Vec<usize>, Vec<usize>) {
+    use rand::SeedableRng;
+    use rand::seq::SliceRandom;
+
+    let mut order: Vec<usize> = (0..n).collect();
+    let mut rng = rand::rngs::SmallRng::seed_from_u64(cfg.seed);
+    order.shuffle(&mut rng);
+
+    let held = ((n as f64 * cfg.heldout_fraction).round() as usize).clamp(1, n - 1);
+    let (held_idx, fit_idx) = order.split_at(held);
+    (fit_idx.to_vec(), held_idx.to_vec())
+}
+
+/// Partition observations into fit and held-out sets using [`split_indices`].
+fn split_fit_heldout(
+    points: &[RawPixelMatch],
+    cfg: &IntrinsicsConfig,
+) -> (Vec<RawPixelMatch>, Vec<RawPixelMatch>) {
+    let n = points.len();
+    let (fit_idx, held_idx) = split_indices(n, cfg);
+    let fit = fit_idx.into_iter().map(|i| points[i]).collect();
+    let held = held_idx.into_iter().map(|i| points[i]).collect();
+    (fit, held)
+}
+
+/// Map raw observations to optimizer-space plane coordinates at a candidate
+/// `k1` (both cameras sharing `base`'s intrinsics).
+///
+/// Returns `None` if any KB4 inverse diverges at this candidate.
+fn map_matched(
+    points: &[RawPixelMatch],
+    base: &CameraParams,
+    k1: f64,
+    wh: (u32, u32),
+) -> Option<Vec<MatchedPoint>> {
+    let mut params = base.clone();
+    params.d[0] = k1;
+    points
+        .iter()
+        .map(|raw| raw_to_matched_point(raw, &params, wh, wh))
+        .collect()
+}
+
+/// Seam-weighted reprojection error of `points` at `(k1, layout)`.
+///
+/// Uses the untrimmed objective so a held-out regression cannot be hidden by
+/// the trim. A divergent inverse at this candidate `k1` returns
+/// [`f64::INFINITY`], so the guard rejects it.
+fn reprojection_residual(
+    points: &[RawPixelMatch],
+    layout: &PlaneLayout,
+    base: &CameraParams,
+    k1: f64,
+    wh: (u32, u32),
+    sigma: f64,
+) -> f64 {
+    let params = OptParams::from_5param(&[
+        layout.x_ty,
+        layout.intersect,
+        layout.camera_axis_offset,
+        layout.x_rz,
+        layout.z_rx,
+    ]);
+    match map_matched(points, base, k1, wh) {
+        Some(matched) if !matched.is_empty() => {
+            geometry::seam_weighted_reprojection_error(&matched, &params, sigma)
+        }
+        _ => f64::INFINITY,
+    }
+}
+
+/// Cost for the warm-started layout re-solve: the trimmed seam-weighted
+/// reprojection error over `[cam_d, intersect, x_ty, x_rz, z_rx]` plus the
+/// quadratic bounds penalty (mirrors [`crate::optimizer`]).
+#[derive(Clone)]
+struct LayoutCost<'a> {
+    points: &'a [MatchedPoint],
+    sigma: f64,
+    trim_fraction: f64,
+    bounds: [(f64, f64); 5],
+}
+
+impl CostFunction for LayoutCost<'_> {
+    type Param = Vec<f64>;
+    type Output = f64;
+
+    fn cost(&self, p: &Self::Param) -> Result<Self::Output, Error> {
+        let params = OptParams {
+            cam_d: p[0],
+            intersect: p[1],
+            x_ty: p[2],
+            x_rz: p[3],
+            z_rx: p[4],
+            z_rz: None,
+            x_rx: None,
+        };
+        let err = if self.trim_fraction > 0.0 {
+            geometry::trimmed_seam_weighted_reprojection_error(
+                self.points,
+                &params,
+                self.sigma,
+                self.trim_fraction,
+            )
+        } else {
+            geometry::seam_weighted_reprojection_error(self.points, &params, self.sigma)
+        };
+        Ok(err + layout_bounds_penalty(p, &self.bounds))
+    }
+}
+
+/// Quadratic penalty for layout parameters outside `bounds` (Nelder-Mead is
+/// unconstrained).
+fn layout_bounds_penalty(p: &[f64], bounds: &[(f64, f64); 5]) -> f64 {
+    let mut penalty = 0.0;
+    for (i, &val) in p.iter().enumerate().take(bounds.len()) {
+        let (lo, hi) = bounds[i];
+        if val < lo {
+            let d = lo - val;
+            penalty += BOUNDS_PENALTY_SCALE * d * d;
+        } else if val > hi {
+            let d = val - hi;
+            penalty += BOUNDS_PENALTY_SCALE * d * d;
+        }
+    }
+    penalty
+}
+
+/// Build a 6-vertex simplex around `start` (clamped into `bounds`), perturbing
+/// each dimension by [`SIMPLEX_PERTURBATION`] of its range.
+fn build_layout_simplex(start: &[f64], bounds: &[(f64, f64); 5]) -> Vec<Vec<f64>> {
+    let clamped: Vec<f64> = start
+        .iter()
+        .zip(bounds.iter())
+        .map(|(v, (lo, hi))| v.clamp(*lo, *hi))
+        .collect();
+
+    let mut vertices = Vec::with_capacity(6);
+    vertices.push(clamped.clone());
+    for (i, (lo, hi)) in bounds.iter().enumerate() {
+        let mut vertex = clamped.clone();
+        let delta = SIMPLEX_PERTURBATION * (hi - lo);
+        if vertex[i] + delta <= *hi {
+            vertex[i] += delta;
+        } else {
+            vertex[i] -= delta;
+        }
+        vertices.push(vertex);
+    }
+    vertices
+}
+
+/// Re-solve the layout warm-started from `start`, minimizing the trimmed
+/// seam-weighted reprojection error on `points` (already at the current `k1`).
+///
+/// A single-start Nelder-Mead wrapper rather than [`crate::optimizer::optimize`]
+/// because the layout optimizer exposes no starting-point/seed API, so it cannot
+/// warm-start from the previous layout (see `crates/reco-calibrate/FRICTION.md`).
+/// `x_rx`/`z_rz` are carried through unchanged — this driver never solves them.
+fn solve_layout_warm(
+    points: &[MatchedPoint],
+    start: &PlaneLayout,
+    cfg: &IntrinsicsConfig,
+) -> Option<PlaneLayout> {
+    if points.is_empty() {
+        return None;
+    }
+    let start_vec = [
+        start.camera_axis_offset,
+        start.intersect,
+        start.x_ty,
+        start.x_rz,
+        start.z_rx,
+    ];
+    let cost = LayoutCost {
+        points,
+        sigma: cfg.sigma,
+        trim_fraction: cfg.trim_fraction,
+        bounds: crate::optimizer::BOUNDS_5,
+    };
+    let simplex = build_layout_simplex(&start_vec, &crate::optimizer::BOUNDS_5);
+    let solver = NelderMead::new(simplex).with_sd_tolerance(1e-12).ok()?;
+    let res = Executor::new(cost, solver)
+        .configure(|state| state.max_iters(cfg.max_iters as u64))
+        .run()
+        .ok()?;
+    let best = res.state().get_best_param()?;
+
+    Some(PlaneLayout {
+        camera_axis_offset: best[0],
+        intersect: best[1],
+        x_ty: best[2],
+        x_rz: best[3],
+        z_rx: best[4],
+        x_rx: start.x_rx,
+        z_rz: start.z_rz,
+    })
+}
+
+/// Refine `k1` against raw-pixel observations, composed with the layout solve
+/// behind a held-out guard (INTR-02).
+///
+/// This is the phase's safety contract. It:
+///
+/// 1. runs the conditioning gate ([`conditioning`]) before any solve — an
+///    ill-conditioned set returns `accepted == false` with a typed reason and
+///    never reaches the solver;
+/// 2. splits the observations into a deterministic fit/held-out partition
+///    ([`split_fit_heldout`], ~80/20 from [`IntrinsicsConfig::seed`]);
+/// 3. alternates (bounded by [`IntrinsicsConfig::max_rounds`]): a warm-started
+///    layout solve on the fit set → [`optimize_intrinsics`] on the fit set at
+///    that layout → a warm-started layout re-solve — stopping as soon as the
+///    held-out residual stops improving;
+/// 4. accepts the refinement only when the held-out reprojection error improves
+///    by more than [`IntrinsicsConfig::improvement_epsilon`]. Otherwise the
+///    result is `accepted == false` with [`RefinementReason::GuardRejected`] and
+///    [`IntrinsicsRefinement::k1`] equals the baseline `base.d[0]`.
+///
+/// `base` is never mutated: the caller writes the returned `k1` into the
+/// profile only when `accepted` is `true`. The layout is re-solved internally to
+/// keep the `k1` stage coherent; only `k1` crosses back to the caller.
+///
+/// # Errors
+///
+/// * [`CalibrateError::InvalidConfig`] / [`CalibrateError::OptimizerFailed`] if
+///   the reduced `k1` solver cannot be constructed or run. Conditioning
+///   refusals are **not** errors — they are typed `accepted == false` results.
+pub fn refine_intrinsics(
+    points: &[RawPixelMatch],
+    layout: &PlaneLayout,
+    base: &CameraParams,
+    cfg: &IntrinsicsConfig,
+) -> Result<IntrinsicsRefinement, CalibrateError> {
+    // (1) The conditioning gate runs before any solve: an ill-conditioned set
+    //     is refused with a typed reason, never silently fitted.
+    let cond = conditioning(points, layout, base, cfg.min_matches, cfg.min_spread);
+    if !cond.well_conditioned {
+        return Ok(rejected(
+            base.d[0],
+            0.0,
+            0.0,
+            0.0,
+            conditioning_reason(&cond, layout, cfg),
+        ));
+    }
+
+    // A fit/held-out split needs at least one observation on each side.
+    if points.len() < 2 {
+        return Ok(rejected(
+            base.d[0],
+            0.0,
+            0.0,
+            0.0,
+            RefinementReason::InsufficientMatches,
+        ));
+    }
+
+    let (fit, heldout) = split_fit_heldout(points, cfg);
+    if fit.is_empty() || heldout.is_empty() {
+        return Ok(rejected(
+            base.d[0],
+            0.0,
+            0.0,
+            0.0,
+            RefinementReason::InsufficientMatches,
+        ));
+    }
+
+    let wh = (base.width, base.height);
+
+    // Baseline: the profile's k1 at the caller's layout (a coherent pair).
+    let heldout_baseline = reprojection_residual(&heldout, layout, base, base.d[0], wh, cfg.sigma);
+    let baseline_fit = reprojection_residual(&fit, layout, base, base.d[0], wh, cfg.sigma);
+
+    let mut current_layout = layout.clone();
+    let mut current_k1 = base.d[0];
+    // (best k1, held-out residual, fit residual)
+    let mut best: Option<(f64, f64, f64)> = None;
+
+    for _ in 0..cfg.max_rounds.max(1) {
+        // (2) Warm-started layout solve on the fit set at the current k1.
+        let Some(fit_matched) = map_matched(&fit, base, current_k1, wh) else {
+            break;
+        };
+        let Some(solved_layout) = solve_layout_warm(&fit_matched, &current_layout, cfg) else {
+            break;
+        };
+
+        // (3) Refine k1 at that layout on the fit set.
+        let refinement = optimize_intrinsics(&fit, &solved_layout, base, cfg)?;
+        let candidate_k1 = refinement.k1;
+
+        // (4) Re-solve the layout warm-started at the refined k1, so the layout
+        //     never wanders and the held-out evaluation uses a coherent pair.
+        let Some(refined_matched) = map_matched(&fit, base, candidate_k1, wh) else {
+            break;
+        };
+        let final_layout =
+            solve_layout_warm(&refined_matched, &solved_layout, cfg).unwrap_or(solved_layout);
+
+        // (5) Held-out (and fit) residual at the refined k1 and re-solved layout.
+        let heldout_refined =
+            reprojection_residual(&heldout, &final_layout, base, candidate_k1, wh, cfg.sigma);
+        let fit_refined =
+            reprojection_residual(&fit, &final_layout, base, candidate_k1, wh, cfg.sigma);
+
+        // Stop as soon as the held-out fit stops improving.
+        let improves = best
+            .as_ref()
+            .is_none_or(|(_, h, _)| heldout_refined < *h - cfg.improvement_epsilon);
+        if !improves {
+            break;
+        }
+        best = Some((candidate_k1, heldout_refined, fit_refined));
+        current_layout = final_layout;
+        current_k1 = candidate_k1;
+    }
+
+    let Some((best_k1, heldout_refined, fit_residual)) = best else {
+        return Ok(rejected(
+            base.d[0],
+            baseline_fit,
+            heldout_baseline,
+            heldout_baseline,
+            RefinementReason::GuardRejected,
+        ));
+    };
+
+    // Accept iff the held-out reprojection improved beyond epsilon. A tie or an
+    // epsilon-sized improvement is a rejection: the profile's k1 is unchanged.
+    if heldout_refined < heldout_baseline - cfg.improvement_epsilon {
+        Ok(IntrinsicsRefinement {
+            k1: best_k1,
+            residual: fit_residual,
+            accepted: true,
+            reason: RefinementReason::Accepted,
+            heldout_baseline,
+            heldout_refined,
+        })
+    } else {
+        Ok(rejected(
+            base.d[0],
+            baseline_fit,
+            heldout_baseline,
+            heldout_refined,
+            RefinementReason::GuardRejected,
+        ))
     }
 }
 
