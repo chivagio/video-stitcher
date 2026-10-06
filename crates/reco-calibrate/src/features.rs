@@ -42,6 +42,17 @@ pub struct RawMatch {
 /// Number of u64 words in a descriptor (64 bytes / 8 = 8 words).
 const DESC_WORDS: usize = DESC_BYTES / 8;
 
+/// Minimum query descriptors required before the adaptive Lowe ratio is
+/// computed from statistics; below this the fixed `lowe_ratio` is used.
+const ADAPTIVE_RATIO_MIN_SAMPLES: usize = 8;
+
+/// Percentile of the best-neighbour distance distribution used by the
+/// adaptive Lowe ratio (median).
+const ADAPTIVE_RATIO_PERCENTILE: f64 = 0.5;
+
+/// Maximum possible Hamming distance in bits (descriptor width).
+const MAX_HAMMING_BITS: f64 = (DESC_BYTES * 8) as f64;
+
 /// Compute Hamming distance between two binary descriptors.
 ///
 /// Processes 8 bytes at a time as u64 words, reducing iteration count
@@ -425,20 +436,82 @@ pub fn match_descriptors(left: &[Descriptor], right: &[Descriptor], ratio: f64) 
 
 /// Derive a per-frame Lowe ratio from descriptor-distance statistics (CALB-07).
 ///
-/// (RED stub — implementation added in the GREEN step.)
-pub fn adaptive_lowe_ratio(_left: &[Descriptor], _right: &[Descriptor], cfg: &MatchConfig) -> f64 {
-    cfg.ratio_min
+/// Samples each query descriptor's best nearest-neighbour distance to the
+/// other set, normalizes it by the maximum possible Hamming distance, and maps
+/// the selected percentile linearly between [`MatchConfig::ratio_min`]
+/// (ambiguous/noisy) and [`MatchConfig::ratio_max`] (well-separated), clamped
+/// to `[ratio_min, ratio_max]`. Returns the fixed [`MatchConfig::lowe_ratio`]
+/// fallback when either set is too small to give meaningful statistics.
+pub fn adaptive_lowe_ratio(left: &[Descriptor], right: &[Descriptor], cfg: &MatchConfig) -> f64 {
+    if left.len() < ADAPTIVE_RATIO_MIN_SAMPLES || right.len() < ADAPTIVE_RATIO_MIN_SAMPLES {
+        return cfg.lowe_ratio;
+    }
+    let mut best: Vec<f64> = left
+        .iter()
+        .map(|q| {
+            let mut b = u32::MAX;
+            for t in right {
+                let d = hamming_distance(q, t);
+                if d < b {
+                    b = d;
+                }
+            }
+            b as f64 / MAX_HAMMING_BITS
+        })
+        .collect();
+    best.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let idx = (((best.len() - 1) as f64) * ADAPTIVE_RATIO_PERCENTILE).round() as usize;
+    let frac = best[idx].clamp(0.0, 1.0);
+    // Well-separated descriptors have small best distances -> looser ratio;
+    // ambiguous/noisy sets map toward the strict floor.
+    let ratio = cfg.ratio_max - frac * (cfg.ratio_max - cfg.ratio_min);
+    ratio.clamp(cfg.ratio_min, cfg.ratio_max)
 }
 
 /// Match descriptors coarse-to-fine with scale-consistent verification (CALB-07).
 ///
-/// (RED stub — implementation added in the GREEN step.)
+/// Runs the cross-checked matcher at a coarse level (every other descriptor)
+/// and at the full fine level. A fine match is kept unless the coarse pass
+/// matched its representative to a *different* partner — a scale contradiction.
+/// When [`MatchConfig::multi_scale`] is `false`, or the pyramid is degenerate
+/// (fewer than two coarse descriptors per side), this reduces exactly to the
+/// single-scale cross-checked matcher.
 pub fn match_descriptors_multiscale(
-    _left: &[Descriptor],
-    _right: &[Descriptor],
-    _cfg: &MatchConfig,
+    left: &[Descriptor],
+    right: &[Descriptor],
+    cfg: &MatchConfig,
 ) -> Vec<RawMatch> {
-    Vec::new()
+    let ratio = if cfg.adaptive_ratio {
+        adaptive_lowe_ratio(left, right, cfg)
+    } else {
+        cfg.lowe_ratio
+    };
+
+    if !cfg.multi_scale || left.len() < 4 || right.len() < 4 {
+        return match_descriptors(left, right, ratio);
+    }
+
+    let fine = match_descriptors(left, right, ratio);
+    if fine.is_empty() {
+        return fine;
+    }
+
+    let left_coarse: Vec<Descriptor> = left.iter().step_by(2).copied().collect();
+    let right_coarse: Vec<Descriptor> = right.iter().step_by(2).copied().collect();
+    let coarse = match_descriptors(&left_coarse, &right_coarse, ratio);
+
+    // Coarse opinion per coarse left index: the coarse right index it paired with.
+    let mut coarse_l2r: Vec<Option<usize>> = vec![None; left_coarse.len()];
+    for m in &coarse {
+        coarse_l2r[m.left_idx] = Some(m.right_idx);
+    }
+
+    fine.into_iter()
+        .filter(|m| match coarse_l2r.get(m.left_idx / 2).copied().flatten() {
+            Some(coarse_right) => coarse_right == m.right_idx / 2,
+            None => true,
+        })
+        .collect()
 }
 
 #[cfg(test)]

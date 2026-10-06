@@ -293,8 +293,9 @@ fn process_undistorted_pair(
         return None;
     }
 
-    // Match descriptors using the provided matcher
-    let raw_matches = matcher.match_features(&desc_left, &desc_right);
+    // Match descriptors using the provided matcher, config-aware when the
+    // matcher supports it (adaptive ratio + multi-scale, CALB-07).
+    let raw_matches = matcher.match_features_with_config(&desc_left, &desc_right, &config.matching);
     let post_ratio_test = raw_matches.len();
 
     if raw_matches.len() < config.matching.min_matches {

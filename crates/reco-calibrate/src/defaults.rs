@@ -120,6 +120,18 @@ impl FeatureMatcher for HammingMatcher {
     fn match_features(&self, left: &[Descriptor], right: &[Descriptor]) -> Vec<RawMatch> {
         features::match_descriptors(left, right, self.lowe_ratio)
     }
+
+    fn match_features_with_config(
+        &self,
+        left: &[Descriptor],
+        right: &[Descriptor],
+        config: &crate::types::MatchConfig,
+    ) -> Vec<RawMatch> {
+        // Config-aware path: adaptive ratio and coarse-to-fine multi-scale
+        // matching (CALB-07). `match_descriptors_multiscale` falls back to the
+        // fixed ratio internally when `adaptive_ratio` is disabled.
+        features::match_descriptors_multiscale(left, right, config)
+    }
 }
 
 // ---------------------------------------------------------------------------

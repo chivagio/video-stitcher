@@ -58,6 +58,21 @@ pub trait FeatureDetector: Send + Sync {
 pub trait FeatureMatcher: Send + Sync {
     /// Find matches between left and right descriptor sets.
     fn match_features(&self, left: &[Descriptor], right: &[Descriptor]) -> Vec<RawMatch>;
+
+    /// Find matches using the full matching configuration (CALB-07).
+    ///
+    /// The default implementation ignores `config` and delegates to
+    /// [`Self::match_features`], so custom matchers keep their behaviour.
+    /// [`HammingMatcher`](crate::HammingMatcher) overrides this to apply the
+    /// adaptive-ratio and multi-scale matching strategies.
+    fn match_features_with_config(
+        &self,
+        left: &[Descriptor],
+        right: &[Descriptor],
+        _config: &crate::types::MatchConfig,
+    ) -> Vec<RawMatch> {
+        self.match_features(left, right)
+    }
 }
 
 /// Filters matched points to remove outliers.
