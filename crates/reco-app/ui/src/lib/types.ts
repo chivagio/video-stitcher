@@ -240,6 +240,23 @@ export interface DebugReport {
   points_capped: boolean;
 }
 
+/**
+ * One camera's field-ROI polygon vertices, normalized `[0,1]`
+ * (mirror `reco_core::calibration::FieldRoi`'s `Vec<[f64; 2]>`).
+ */
+export type FieldRoiCamera = [number, number][];
+
+/**
+ * The per-camera field ROI polygons for framing (mirror
+ * `reco_core::calibration::FieldRoi`). The engine consumes these to filter
+ * detections outside the playing field; fewer than three vertices means "no
+ * filter" for that camera.
+ */
+export interface FieldRoi {
+  left: FieldRoiCamera;
+  right: FieldRoiCamera;
+}
+
 /** Advanced calibration options (mirror `events::CalibrationOptions`). */
 export interface CalibrationOptions {
   num_frames: number | null;
@@ -276,6 +293,8 @@ export type WorkerEventTyped =
   | { kind: "calibration_result"; data: { scorecard: Scorecard } }
   | { kind: "calibration_failed"; data: { diagnosis: CalibrationDiagnosis } }
   | { kind: "calibration_debug"; data: { report: DebugReport } }
+  | { kind: "field_roi_applied"; data: { field_roi: FieldRoi } }
+  | { kind: "field_roi_cleared"; data: null }
   | { kind: "profile_loaded"; data: { path: string } }
   | { kind: "profile_saved"; data: { path: string } }
   | { kind: "result_invalidated"; data: null }
