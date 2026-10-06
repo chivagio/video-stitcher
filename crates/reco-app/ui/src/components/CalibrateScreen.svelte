@@ -7,13 +7,16 @@
   Ready: title + Start CTA + the seven pending stages + a 0% progress bar.
   Running: the live checklist + progress + heartbeat + Cancel CTA.
   Failed: the typed error + Try again / Back to import (no partial scorecard).
-  Result: the CALB-03 scorecard (Task 2).
+  Result: the CALB-03 scorecard with Save profile… / Re-run calibration.
 -->
 <script lang="ts">
-  import { calibration } from "../lib/calibration.svelte";
+  import type { CalibrationOptions } from "../lib/types";
+  import { calibration, defaultOptions } from "../lib/calibration.svelte";
   import ActionButton from "./ActionButton.svelte";
   import StageChecklist from "./StageChecklist.svelte";
   import CalibrationProgress from "./CalibrationProgress.svelte";
+  import AdvancedDisclosure from "./AdvancedDisclosure.svelte";
+  import Scorecard from "./Scorecard.svelte";
 
   let {
     onRequestCancel,
@@ -23,13 +26,24 @@
     onBackToImport: () => void;
   } = $props();
 
+  // The advanced options are owned here so both the ready-state disclosure and
+  // the result-state "Re-run calibration" use the same values.
+  let options = $state<CalibrationOptions>(defaultOptions());
+  let advancedValid = $state(true);
+
   function handleStart(): void {
-    void calibration.start({
-      num_frames: null,
-      skip_start_secs: null,
-      skip_end_secs: null,
-      use_imu_rotation_seeds: null,
-    });
+    if (!advancedValid) return;
+    void calibration.start(options);
+  }
+
+  function handleRerun(): void {
+    if (!advancedValid) return;
+    void calibration.start(options);
+  }
+
+  function handleOptions(next: CalibrationOptions, valid: boolean): void {
+    options = next;
+    advancedValid = valid;
   }
 </script>
 
@@ -39,8 +53,7 @@
       <header class="screen-header">
         <h2 class="screen-title">Calibration result</h2>
       </header>
-      <!-- Task 2 replaces this with the CALB-03 scorecard. -->
-      <p class="result-placeholder">Calibration complete.</p>
+      <Scorecard scorecard={calibration.result} onRerun={handleRerun} />
     {:else if calibration.status === "failed"}
       <header class="screen-header">
         <h2 class="screen-title">Calibration failed</h2>
@@ -73,11 +86,24 @@
       <StageChecklist />
       <CalibrationProgress />
 
+      {#if calibration.status === "ready"}
+        <AdvancedDisclosure {options} onChange={handleOptions} />
+      {/if}
+
       <div class="actions">
         {#if calibration.status === "ready"}
-          <ActionButton variant="primary" onClick={handleStart}>
+          <ActionButton
+            variant="primary"
+            disabled={!advancedValid}
+            onClick={handleStart}
+          >
             Start calibration
           </ActionButton>
+          {#if !advancedValid}
+            <span class="disabled-hint">
+              Fix the advanced values before starting.
+            </span>
+          {/if}
         {:else}
           <ActionButton
             variant="destructive"
@@ -135,9 +161,9 @@
     max-width: 72ch;
   }
 
-  .result-placeholder {
-    margin: 0;
+  .disabled-hint {
     color: var(--color-log-info);
+    font-size: var(--text-body);
   }
 
   .actions {
