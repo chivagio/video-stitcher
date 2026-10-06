@@ -563,6 +563,11 @@ const READINESS_PROFILE_COLUMNS: usize = 64;
 /// Maximum pixels averaged for the sampled mean luma (T-04-07).
 const READINESS_SAMPLE_MAX_PIXELS: usize = 65_536;
 
+/// Minimum winning normalized cross-correlation for a credible overlap
+/// estimate (WR-04). Below this the alignment is noise, so the estimate is
+/// reported as unknown rather than as a confident-looking percentage.
+const OVERLAP_MIN_CORRELATION: f64 = 0.3;
+
 /// One sampled frame's readiness statistics.
 struct SampledFrame {
     /// Mean luma of the Y plane (0..=255).
@@ -670,7 +675,9 @@ fn estimate_exposure_delta_stops(left_mean: f64, right_mean: f64) -> Option<f64>
 ///
 /// The best integer-shift normalized cross-correlation aligns the profiles; the
 /// aligned fraction of the width is the overlap estimate. A flat profile (no
-/// contrast) yields `None` — an honest unknown rather than a fake number.
+/// contrast), or a best alignment whose correlation is below
+/// [`OVERLAP_MIN_CORRELATION`] (no real scene correspondence), yields `None` —
+/// an honest unknown rather than a fake number (WR-04).
 fn estimate_overlap(left: &[f64], right: &[f64]) -> Option<f64> {
     if left.len() != right.len() || left.len() < 4 {
         return None;
@@ -709,7 +716,21 @@ fn estimate_overlap(left: &[f64], right: &[f64]) -> Option<f64> {
             best_shift = shift;
         }
     }
-    Some(((n - best_shift.abs()) as f64 / n as f64).clamp(0.0, 1.0))
+    overlap_from_alignment(n as usize, best_shift, best_corr)
+}
+
+/// Turn a winning integer-shift alignment into an overlap fraction (CALB-05).
+///
+/// Returns `None` when the winning normalized cross-correlation is below
+/// [`OVERLAP_MIN_CORRELATION`]: a weak alignment is noise, so the estimate is
+/// reported as unknown rather than as a fabricated percentage (WR-04). The
+/// aligned fraction of the width is the overlap otherwise.
+fn overlap_from_alignment(n: usize, best_shift: i64, best_corr: f64) -> Option<f64> {
+    if best_corr < OVERLAP_MIN_CORRELATION {
+        return None;
+    }
+    let aligned = (n as i64 - best_shift.abs()).max(0) as f64;
+    Some((aligned / n as f64).clamp(0.0, 1.0))
 }
 
 /// Subtract the mean and divide by the standard deviation; `None` if flat.
@@ -4702,6 +4723,36 @@ mod tests {
             mismatch,
             "two different resolutions must emit a ResolutionMismatch: {seen:?}"
         );
+    }
+
+    #[test]
+    fn estimate_overlap_is_full_for_an_identical_profile() {
+        let left: Vec<f64> = (0..64).map(|i| i as f64 + 1.0).collect();
+        assert_eq!(estimate_overlap(&left, &left), Some(1.0));
+    }
+
+    #[test]
+    fn overlap_from_alignment_rejects_a_weak_correlation() {
+        // WR-04: a winning correlation below the floor is noise, not overlap.
+        assert_eq!(overlap_from_alignment(64, 8, 0.29), None);
+        assert_eq!(overlap_from_alignment(64, 8, -1.0), None);
+        assert_eq!(
+            overlap_from_alignment(64, 8, OVERLAP_MIN_CORRELATION),
+            Some(0.875)
+        );
+    }
+
+    #[test]
+    fn overlap_from_alignment_reports_the_aligned_fraction() {
+        assert_eq!(overlap_from_alignment(64, 8, 0.9), Some(0.875));
+        assert_eq!(overlap_from_alignment(64, 0, 1.0), Some(1.0));
+    }
+
+    #[test]
+    fn estimate_overlap_is_unknown_for_a_flat_profile() {
+        let flat = vec![128.0; 64];
+        let varied: Vec<f64> = (0..64).map(|i| (i % 7) as f64).collect();
+        assert_eq!(estimate_overlap(&flat, &varied), None);
     }
 
     #[test]
