@@ -55,8 +55,9 @@
     if (trimmed === "") return { value: null, error: null };
     const n = Number(trimmed);
     if (!Number.isFinite(n) || n < min || n > max) {
-      // Locked copy (UI-SPEC Copywriting Contract — Advanced validation error).
-      return { value: null, error: `Enter a value between 0 and ${max}.` };
+      // The bounds are rendered from `min`/`max` (IN-04): frames are 1..max, so
+      // a hardcoded "0" would claim an invalid value is acceptable.
+      return { value: null, error: `Enter a value between ${min} and ${max}.` };
     }
     return { value: n, error: null };
   }
