@@ -6445,6 +6445,245 @@ mod tests {
         );
     }
 
+    /// Build a mock with a current calibration and an open manual session, and
+    /// an event sink the test can ignore. Used by the handle clamp/persistence
+    /// tests so they can inspect the backend's stored state directly.
+    fn mock_with_open_manual_session() -> (MockBackend, EventSink, AtomicBool) {
+        let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut mock = MockBackend::new(ops);
+        mock.current_calibration = Some(sample_mock_calibration());
+        mock.has_result = true;
+        // The receiver is dropped: these tests assert stored state, not events,
+        // and a failed `send` is ignored by the sink (as everywhere else).
+        let (evt_tx, _evt_rx) = std::sync::mpsc::channel();
+        let events = EventSink { tx: evt_tx };
+        let interrupted = AtomicBool::new(false);
+        let _ = handle_command(
+            WorkerCommand::ManualBegin { frame: 0 },
+            &mut mock,
+            &events,
+            &interrupted,
+        );
+        (mock, events, interrupted)
+    }
+
+    #[test]
+    fn manual_set_lens_clamps_to_the_travel_range() {
+        // MANU-05: a lens edit above a clamp sticks at the limit (k1 ±0.3,
+        // fx ±15% of the baseline, cx/cy ±10% of the frame); it is never applied
+        // unbounded (T-04.1-13).
+        let (mut mock, events, interrupted) = mock_with_open_manual_session();
+
+        let _ = handle_command(
+            WorkerCommand::ManualSetLens {
+                side: crate::events::ManualSide::Left,
+                fx: 5000.0,
+                cx: 5000.0,
+                cy: 5000.0,
+                k1: 5.0,
+            },
+            &mut mock,
+            &events,
+            &interrupted,
+        );
+        let p = &mock.manual_left_params;
+        assert!(
+            (p.d[0] - 0.3).abs() < 1e-9,
+            "k1 must clamp to +0.3: {}",
+            p.d[0]
+        );
+        assert!(
+            (p.fx - 1150.0).abs() < 1e-9,
+            "fx must clamp to +15%: {}",
+            p.fx
+        );
+        assert!(
+            (p.cx - 1152.0).abs() < 1e-9,
+            "cx must clamp to +10%: {}",
+            p.cx
+        );
+        assert!(
+            (p.cy - 648.0).abs() < 1e-9,
+            "cy must clamp to +10%: {}",
+            p.cy
+        );
+
+        let _ = handle_command(
+            WorkerCommand::ManualSetLens {
+                side: crate::events::ManualSide::Left,
+                fx: -5000.0,
+                cx: -5000.0,
+                cy: -5000.0,
+                k1: -5.0,
+            },
+            &mut mock,
+            &events,
+            &interrupted,
+        );
+        let p = &mock.manual_left_params;
+        assert!(
+            (p.d[0] + 0.3).abs() < 1e-9,
+            "k1 must clamp to -0.3: {}",
+            p.d[0]
+        );
+        assert!(
+            (p.fx - 850.0).abs() < 1e-9,
+            "fx must clamp to -15%: {}",
+            p.fx
+        );
+        assert!(
+            (p.cx - 768.0).abs() < 1e-9,
+            "cx must clamp to -10%: {}",
+            p.cx
+        );
+        assert!(
+            (p.cy - 432.0).abs() < 1e-9,
+            "cy must clamp to -10%: {}",
+            p.cy
+        );
+    }
+
+    #[test]
+    fn manual_set_lens_forces_fy_equal_to_fx() {
+        // MANU-05: the scale mode drives fx and fy together (square pixels); a
+        // free fy would be a second, near-redundant radial knob.
+        let (mut mock, events, interrupted) = mock_with_open_manual_session();
+        let _ = handle_command(
+            WorkerCommand::ManualSetLens {
+                side: crate::events::ManualSide::Left,
+                fx: 1200.0,
+                cx: 960.0,
+                cy: 540.0,
+                k1: 0.0,
+            },
+            &mut mock,
+            &events,
+            &interrupted,
+        );
+        let p = &mock.manual_left_params;
+        assert_eq!(p.fy, p.fx, "fy must mirror the clamped fx");
+        // 1200 is above the +15% clamp (1150), so both must be the limit.
+        assert!((p.fx - 1150.0).abs() < 1e-9, "fx must clamp: {}", p.fx);
+    }
+
+    #[test]
+    fn manual_set_layout_clamps_to_the_bounds() {
+        // MANU-06: a layout edit outside the range clamps to the bound
+        // (intersect to [0,1], cam_d to [0.1,0.30], x_ty to ±0.1, x_rz to ±0.3).
+        let (mut mock, events, interrupted) = mock_with_open_manual_session();
+
+        let _ = handle_command(
+            WorkerCommand::ManualSetLayout {
+                cam_d: 9.0,
+                intersect: 9.0,
+                x_ty: 9.0,
+                x_rz: 9.0,
+            },
+            &mut mock,
+            &events,
+            &interrupted,
+        );
+        let l = &mock.manual_layout;
+        assert!((l.camera_axis_offset - 0.30).abs() < 1e-9);
+        assert!((l.intersect - 1.0).abs() < 1e-9);
+        assert!((l.x_ty - 0.1).abs() < 1e-9);
+        assert!((l.x_rz - 0.3).abs() < 1e-9);
+
+        let _ = handle_command(
+            WorkerCommand::ManualSetLayout {
+                cam_d: -9.0,
+                intersect: -9.0,
+                x_ty: -9.0,
+                x_rz: -9.0,
+            },
+            &mut mock,
+            &events,
+            &interrupted,
+        );
+        let l = &mock.manual_layout;
+        assert!((l.camera_axis_offset - 0.1).abs() < 1e-9);
+        assert!(l.intersect.abs() < 1e-9);
+        assert!((l.x_ty + 0.1).abs() < 1e-9);
+        assert!((l.x_rz + 0.3).abs() < 1e-9);
+    }
+
+    #[test]
+    fn manual_reset_lens_restores_the_baseline() {
+        // MANU-05: Reset lens restores the profile baseline captured at
+        // `manual_begin`; the earlier edit is fully undone.
+        let (mut mock, events, interrupted) = mock_with_open_manual_session();
+        let _ = handle_command(
+            WorkerCommand::ManualSetLens {
+                side: crate::events::ManualSide::Left,
+                fx: 1100.0,
+                cx: 1000.0,
+                cy: 600.0,
+                k1: 0.2,
+            },
+            &mut mock,
+            &events,
+            &interrupted,
+        );
+        assert!((mock.manual_left_params.fx - 1100.0).abs() < 1e-9);
+        let _ = handle_command(
+            WorkerCommand::ManualResetLens,
+            &mut mock,
+            &events,
+            &interrupted,
+        );
+        let p = &mock.manual_left_params;
+        assert!((p.fx - 1000.0).abs() < 1e-9, "fx must reset: {}", p.fx);
+        assert!((p.cx - 960.0).abs() < 1e-9, "cx must reset: {}", p.cx);
+        assert!((p.cy - 540.0).abs() < 1e-9, "cy must reset: {}", p.cy);
+        assert!(p.d[0].abs() < 1e-9, "k1 must reset: {}", p.d[0]);
+    }
+
+    #[test]
+    fn manual_set_lens_persists_into_current_calibration() {
+        // MANU-05 / MANU-06: an edited intrinsic lands on
+        // `current_calibration.left`/`.right` (so it survives a preview rebuild
+        // and save); the other camera is untouched. A layout edit lands on
+        // `current_calibration.layout`.
+        let (mut mock, events, interrupted) = mock_with_open_manual_session();
+        let _ = handle_command(
+            WorkerCommand::ManualSetLens {
+                side: crate::events::ManualSide::Left,
+                fx: 1100.0,
+                cx: 900.0,
+                cy: 500.0,
+                k1: 0.25,
+            },
+            &mut mock,
+            &events,
+            &interrupted,
+        );
+        let cal = mock
+            .current_calibration
+            .as_ref()
+            .expect("a calibration must be present");
+        assert!((cal.left.fx - 1100.0).abs() < 1e-9, "left fx persisted");
+        assert!((cal.left.cx - 900.0).abs() < 1e-9, "left cx persisted");
+        assert!((cal.left.d[0] - 0.25).abs() < 1e-9, "left k1 persisted");
+        assert!((cal.right.fx - 1000.0).abs() < 1e-9, "right untouched");
+
+        let _ = handle_command(
+            WorkerCommand::ManualSetLayout {
+                cam_d: 0.2,
+                intersect: 0.6,
+                x_ty: 0.05,
+                x_rz: 0.1,
+            },
+            &mut mock,
+            &events,
+            &interrupted,
+        );
+        let cal = mock.current_calibration.as_ref().unwrap();
+        assert!((cal.layout.camera_axis_offset - 0.2).abs() < 1e-9);
+        assert!((cal.layout.intersect - 0.6).abs() < 1e-9);
+        assert!((cal.layout.x_ty - 0.05).abs() < 1e-9);
+        assert!((cal.layout.x_rz - 0.1).abs() < 1e-9);
+    }
+
     #[test]
     fn normalize_field_roi_clears_degenerate_polygons() {
         // CALB-09: fewer than three vertices is not a polygon; it clears.
