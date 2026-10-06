@@ -1966,14 +1966,35 @@ impl EngineBackend for GpuEngineBackend {
         };
         let params =
             reco_calibrate::lens_database::LensDatabase::embedded().load_by_summary(&summary);
-        self.lens_overrides[idx] = params;
-        events.info(format!(
-            "{} lens override: {} {}",
-            role.label(),
-            candidate.camera,
-            candidate.lens
-        ));
-        events.lens_override_applied(role, Some(candidate));
+        match params {
+            Some(p) => {
+                self.lens_overrides[idx] = Some(p);
+                events.info(format!(
+                    "{} lens override: {} {}",
+                    role.label(),
+                    candidate.camera,
+                    candidate.lens
+                ));
+                events.lens_override_applied(role, Some(candidate));
+            }
+            None => {
+                // The summary did not resolve in the embedded database. Leave
+                // the input on auto-detect and do NOT tag the row `overridden`:
+                // the scorecard must never claim a profile the engine did not
+                // use (D3-07/D3-08 provenance honesty, WR-02).
+                self.lens_overrides[idx] = None;
+                events.log(
+                    Level::Warn,
+                    format!(
+                        "{} lens override '{} {}' did not resolve; auto-detect will run",
+                        role.label(),
+                        candidate.camera,
+                        candidate.lens
+                    ),
+                );
+                events.lens_override_applied(role, None);
+            }
+        }
         self.emit_compatibility(events);
         self.invalidate_result(events);
         Ok(())
