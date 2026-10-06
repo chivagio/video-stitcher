@@ -804,6 +804,9 @@ fn calibrate_impl(
         residual_error: best_residual,
         confidence,
         per_frame: successful_frames,
+        // Populated by `CalibrationPipeline::calibrate_with_progress`, which
+        // owns the sampled indices; the free function has no pipeline context.
+        frame_indices: Vec::new(),
         left_lens_profile: None,
         right_lens_profile: None,
         quality: Some(types::CalibrationQuality {

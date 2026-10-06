@@ -775,6 +775,7 @@ mod tests {
             residual_error: 0.25,
             confidence: 0.87,
             per_frame: Vec::new(),
+            frame_indices: Vec::new(),
             left_lens_profile: None,
             right_lens_profile: None,
             quality: None,

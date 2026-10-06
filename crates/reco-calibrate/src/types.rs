@@ -631,6 +631,16 @@ pub struct CalibrationResult {
     pub confidence: f64,
     /// Per-frame matching statistics.
     pub per_frame: Vec<FrameMatches>,
+    /// Left-clip source frame indices sampled for this run, in sample order.
+    ///
+    /// `per_frame` carries only the frames that produced usable matches, so it
+    /// omits any failed sample. The first element is therefore the reference
+    /// frame in the common case (every sample matched) and is used by the app
+    /// to seed the manual pin editor from matches that correspond to a known
+    /// frame (MANU-04 / WR-01). Empty when the run had no pipeline context
+    /// (the free `calibrate` entry point).
+    #[serde(default)]
+    pub frame_indices: Vec<u64>,
     /// Lens profile used for the left camera. `None` if the profile was
     /// set manually via `set_profiles()` rather than auto-detected.
     pub left_lens_profile: Option<LensProfileInfo>,

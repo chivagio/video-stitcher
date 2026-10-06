@@ -2078,6 +2078,56 @@ fn join_with_timeout(handle: JoinHandle<()>, timeout: Duration) -> Result<(), Wo
 // Real engine backend (owns the GPU device, renderer, and pose)
 // ---------------------------------------------------------------------------
 
+/// Choose the manual session's opening frame and whether to seed verified pins
+/// (MANU-04 / WR-01).
+///
+/// Verified matches come from the calibration's first sampled frame — which is
+/// not the UI's default frame 0 (`sampling::select_frame_indices` skips the
+/// first 5%). Seeding them onto a different frame would mark the wrong pixels,
+/// so when a verified seed exists the session opens on the seed's frame and
+/// seeds; otherwise the requested frame is respected and nothing is seeded. The
+/// returned frame is clamped to the clip length.
+fn manual_seed_target(
+    requested: u64,
+    frames_total: u64,
+    seed_frame: Option<u64>,
+    has_seed: bool,
+) -> (u64, bool) {
+    let clamp = |frame: u64| frame.min(frames_total.saturating_sub(1));
+    match seed_frame {
+        Some(seed) if has_seed => (clamp(seed), true),
+        _ => (clamp(requested), false),
+    }
+}
+
+/// The pins to seed for a manual session and the `auto` set to retain
+/// (MANU-04 / WR-03).
+///
+/// Every verified match is promoted to a pin; the retained `auto` set is always
+/// empty so the solve never sees the seeds twice and a deleted pin stops
+/// contributing. `auto_seed` is reserved for fresh matches produced by a
+/// lens-triggered re-detect. An empty verified set (or a frame mismatch) seeds
+/// nothing.
+#[allow(clippy::type_complexity)]
+fn manual_seed_sets(
+    verified: &[reco_calibrate::types::MatchedPoint],
+    seed_matches_frame: bool,
+    left_wh: (u32, u32),
+    right_wh: (u32, u32),
+) -> (
+    Vec<reco_calibrate::manual::ManualPin>,
+    Vec<reco_calibrate::types::MatchedPoint>,
+) {
+    if seed_matches_frame && !verified.is_empty() {
+        (
+            reco_calibrate::manual::seed_pins_from_verified(verified, left_wh, right_wh),
+            Vec::new(),
+        )
+    } else {
+        (Vec::new(), Vec::new())
+    }
+}
+
 /// The retained reference-frame state for an open manual calibration session
 /// (MANU-03 / T-04.1-02).
 ///
@@ -2116,9 +2166,12 @@ struct ManualSession {
     pins: Vec<SessionPin>,
     /// The next pin id to hand out (monotonic; never reused within a session).
     next_pin_id: u32,
-    /// Verified (post-RANSAC) automatic matches retained from the last
-    /// calibration, used as the solve's `auto` set and the seed source
-    /// (MANU-04). Empty when no calibration result exists.
+    /// Fresh automatic matches for the solve's `auto` set (MANU-04 / MANU-05).
+    ///
+    /// Empty when the session opens: the verified seeds are promoted to pins
+    /// instead, so the solve never sees them twice and a deleted pin stops
+    /// contributing (WR-03). Repopulated only by a lens-triggered re-detect,
+    /// whose fresh post-RANSAC matches are not represented as pins.
     auto_seed: Vec<reco_calibrate::types::MatchedPoint>,
     /// The left camera's baseline intrinsics captured at `manual_begin`
     /// (MANU-05). `ManualResetLens` restores these; handle clamps are computed
@@ -2252,6 +2305,13 @@ pub struct GpuEngineBackend {
     /// calibration, used to pre-populate the pin editor (MANU-04). Empty until a
     /// calibration result exists.
     verified_seed: Vec<reco_calibrate::types::MatchedPoint>,
+    /// The left-clip source frame `verified_seed`'s matches were detected on,
+    /// when known (MANU-04 / WR-01).
+    ///
+    /// The manual flow only seeds those matches onto a session whose reference
+    /// frame equals this, so the markers correspond to the displayed content.
+    /// `None` when the run carried no pipeline frame context.
+    verified_seed_frame: Option<u64>,
     /// The instant the armed debounced manual solve should fire, or `None`
     /// (MANU-03). Set by a pin mutation; cleared by [`Self::manual_solve`].
     manual_solve_at: Option<std::time::Instant>,
@@ -2445,6 +2505,7 @@ impl GpuEngineBackend {
             calibration: None,
             manual: None,
             verified_seed: Vec::new(),
+            verified_seed_frame: None,
             manual_solve_at: None,
             manual_relens_pending: false,
             source: None,
@@ -3112,12 +3173,15 @@ impl EngineBackend for GpuEngineBackend {
                 // Retain the reference frame's post-RANSAC matches so a later
                 // manual session can pre-populate its pins from geometrically
                 // verified matches ONLY (MANU-04). Rejected candidates are never
-                // kept. The first frame is the calibration's reference frame.
+                // kept. The first sampled frame is the calibration's reference
+                // frame; retain its source index too so the manual flow seeds
+                // only onto that frame (WR-01).
                 self.verified_seed = calibration_result
                     .per_frame
                     .first()
                     .map(|fm| fm.points.clone())
                     .unwrap_or_default();
+                self.verified_seed_frame = calibration_result.frame_indices.first().copied();
                 // Adopt the result as the preview source too (D3-15 / WR-05),
                 // so the scorecard and the rendered stitch describe one profile.
                 self.adopt_calibration(calibration_result.calibration.clone());
@@ -3257,10 +3321,15 @@ impl EngineBackend for GpuEngineBackend {
                 .map_err(|e| WorkerError::Engine(e.to_string()))?;
         let frames_total = probe.total_frames.max(1);
         let right_frames_total = right_probe.total_frames.max(1);
-        // T-04.1-01: clamp the operator-supplied index against the probed frame
-        // count BEFORE extraction, so an out-of-range index cannot reach the
-        // decoder.
-        let frame = frame.min(frames_total.saturating_sub(1));
+        // T-04.1-01 / WR-01: clamp the operator-supplied index against the
+        // probed frame count BEFORE extraction, so an out-of-range index cannot
+        // reach the decoder. When a verified seed exists the session opens on
+        // the frame its matches came from, so the seeded markers correspond to
+        // the displayed content (the UI default of 0 is not the calibration
+        // frame).
+        let has_seed = !self.verified_seed.is_empty();
+        let (frame, seed_matches_frame) =
+            manual_seed_target(frame, frames_total, self.verified_seed_frame, has_seed);
         // The offset starts at 0, so the right reference frame is the same index.
         let right_index = frame.min(right_frames_total.saturating_sub(1));
         let left_frame = extract_manual_frame(&left_path, frame)?;
@@ -3270,24 +3339,26 @@ impl EngineBackend for GpuEngineBackend {
         // Pre-populate the pin editor from geometrically verified (post-RANSAC)
         // automatic matches only (MANU-04). `verified_seed` holds only matches
         // that survived every filter; raw/rejected candidates are never offered.
+        // The seeds are promoted to pins, and the retained `auto` set is empty,
+        // so the solve never sees them twice (WR-03).
         let (lw, lh) = (left_frame.width, left_frame.height);
         let (rw, rh) = (right_frame.width, right_frame.height);
-        let auto_seed = self.verified_seed.clone();
+        let (seed_pins, auto_seed) =
+            manual_seed_sets(&self.verified_seed, seed_matches_frame, (lw, lh), (rw, rh));
         let mut next_pin_id = 0_u32;
-        let pins: Vec<SessionPin> =
-            reco_calibrate::manual::seed_pins_from_verified(&auto_seed, (lw, lh), (rw, rh))
-                .into_iter()
-                .map(|p| {
-                    let id = next_pin_id;
-                    next_pin_id = next_pin_id.wrapping_add(1);
-                    SessionPin {
-                        id,
-                        left_px: p.left_px,
-                        right_px: p.right_px,
-                        verified: true,
-                    }
-                })
-                .collect();
+        let pins: Vec<SessionPin> = seed_pins
+            .into_iter()
+            .map(|p| {
+                let id = next_pin_id;
+                next_pin_id = next_pin_id.wrapping_add(1);
+                SessionPin {
+                    id,
+                    left_px: p.left_px,
+                    right_px: p.right_px,
+                    verified: true,
+                }
+            })
+            .collect();
         let seeded = !pins.is_empty();
         // The layout baseline the handles reset to and clamp against (MANU-06):
         // the loaded/current profile's layout, else a neutral rig.
@@ -5156,6 +5227,52 @@ mod tests {
                 offset_semantics: crate::events::SYNC_OFFSET_SEMANTICS.to_string(),
             },
         }
+    }
+
+    /// WR-01: when a verified seed exists the session opens on the seed's frame
+    /// and seeds; otherwise the requested frame is respected and nothing is
+    /// seeded. The frame is clamped to the clip length.
+    #[test]
+    fn manual_seed_target_opens_on_the_seed_frame_only() {
+        // A seed opens on its own frame regardless of the requested frame.
+        assert_eq!(manual_seed_target(0, 100, Some(5), true), (5, true));
+        assert_eq!(manual_seed_target(42, 100, Some(5), true), (5, true));
+        // An out-of-range seed frame is clamped.
+        assert_eq!(manual_seed_target(0, 10, Some(999), true), (9, true));
+        // No seed: the requested frame is respected and nothing is seeded.
+        assert_eq!(manual_seed_target(0, 100, None, false), (0, false));
+        assert_eq!(manual_seed_target(7, 100, Some(5), false), (7, false));
+        assert_eq!(manual_seed_target(999, 10, None, false), (9, false));
+    }
+
+    /// WR-03: verified matches are promoted to pins and the retained `auto` set
+    /// is empty, so the solve never double-counts them and a deleted pin stops
+    /// contributing. A frame mismatch or empty seed seeds nothing.
+    #[test]
+    fn manual_seed_sets_promotes_seeds_to_pins_with_no_auto() {
+        use reco_calibrate::types::MatchedPoint;
+        let verified = vec![
+            MatchedPoint::from_planes([-0.2, 0.1], [0.2, -0.1]),
+            MatchedPoint::from_planes([0.0, 0.0], [0.0, 0.0]),
+        ];
+        let (pins, auto) = manual_seed_sets(&verified, true, (1920, 1080), (1920, 1080));
+        assert_eq!(
+            pins.len(),
+            verified.len(),
+            "every verified match becomes a pin"
+        );
+        assert!(
+            auto.is_empty(),
+            "the auto set must be empty after promotion"
+        );
+
+        let (pins, auto) = manual_seed_sets(&verified, false, (1920, 1080), (1920, 1080));
+        assert!(pins.is_empty());
+        assert!(auto.is_empty());
+
+        let (pins, auto) = manual_seed_sets(&[], true, (1920, 1080), (1920, 1080));
+        assert!(pins.is_empty());
+        assert!(auto.is_empty());
     }
 
     /// A fabricated CALB-08 debug report for the mock's calibration result.

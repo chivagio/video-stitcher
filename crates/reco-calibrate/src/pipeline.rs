@@ -564,6 +564,11 @@ impl CalibrationPipeline {
         result.calibration.rig_tilt = self.rig_tilt;
         result.calibration.rig_roll = self.rig_roll;
         result.calibration.sync_offset = self.sync_offset_frames;
+        // Record the left-clip source frames sampled for this run, so the app
+        // can seed the manual pin editor from matches whose reference frame it
+        // knows (MANU-04 / WR-01). The pipeline's own extraction used exactly
+        // these indices.
+        result.frame_indices = self.frame_indices().0;
         result.left_lens_profile = self.left_profile_info.clone();
         result.right_lens_profile = self.right_profile_info.clone();
         result.sync = SyncInfo {
