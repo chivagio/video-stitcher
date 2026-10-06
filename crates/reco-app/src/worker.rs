@@ -2115,6 +2115,15 @@ impl EngineBackend for GpuEngineBackend {
     }
 
     fn save_profile(&mut self, path: String, events: &EventSink) -> Result<(), WorkerError> {
+        // Gate on the live-result flag, not merely on a stored calibration:
+        // `invalidate_result` clears `current_calibration`, and checking the
+        // flag as well keeps a stale profile from ever being written if a
+        // future producer leaves a value behind (WR-01 / D3-08).
+        if !self.has_result {
+            return Err(WorkerError::ProfileSave(
+                "no calibration result to save".to_string(),
+            ));
+        }
         let calibration = self
             .current_calibration
             .as_ref()
@@ -2884,9 +2893,14 @@ impl GpuEngineBackend {
     }
 
     /// Invalidate a live result if inputs/profile changed (D3-08).
+    ///
+    /// The stored `current_calibration` is cleared alongside the flag: once the
+    /// inputs or a lens override change, the saved profile would no longer
+    /// describe the clips, so `save_profile` must not offer it (WR-01).
     fn invalidate_result(&mut self, events: &EventSink) {
         if self.has_result {
             self.has_result = false;
+            self.current_calibration = None;
             events.result_invalidated();
         }
     }
@@ -3231,9 +3245,14 @@ mod tests {
         }
 
         /// Invalidate a live result if one exists (D3-08).
+        ///
+        /// Mirrors the real backend: the stale calibration is cleared too, so a
+        /// save after an input change cannot write a profile that no longer
+        /// matches the clips (WR-01).
         fn invalidate_mock_result(&mut self, events: &EventSink) {
             if self.has_result {
                 self.has_result = false;
+                self.current_calibration = None;
                 events.result_invalidated();
             }
         }
@@ -3393,7 +3412,8 @@ mod tests {
 
         fn save_profile(&mut self, path: String, events: &EventSink) -> Result<(), WorkerError> {
             self.record("save_profile");
-            if self.current_calibration.is_none() {
+            // Mirror the real backend: gate on the live-result flag (WR-01).
+            if !self.has_result || self.current_calibration.is_none() {
                 return Err(WorkerError::ProfileSave(
                     "no calibration result to save".to_string(),
                 ));
