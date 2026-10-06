@@ -76,7 +76,7 @@
 
         <MatchOverlay {report} />
         <ResidualMap {report} />
-        <MatchCountTable rows={report.per_frame} />
+        <MatchCountTable rows={report.per_frame} selected={selectedFrame} />
       {:else if ran}
         <p class="empty">No match data for this run.</p>
       {:else}

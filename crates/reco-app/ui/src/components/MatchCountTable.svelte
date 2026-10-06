@@ -7,7 +7,14 @@
 <script lang="ts">
   import type { FrameMatchRow } from "../lib/types";
 
-  let { rows }: { rows: FrameMatchRow[] } = $props();
+  let {
+    rows,
+    selected = null,
+  }: {
+    rows: FrameMatchRow[];
+    /** The frame index the Debug section's selector highlights, if any. */
+    selected?: number | null;
+  } = $props();
 </script>
 
 {#if rows.length === 0}
@@ -26,7 +33,7 @@
       </thead>
       <tbody>
         {#each rows as row (row.frame)}
-          <tr>
+          <tr class:selected={selected === row.frame}>
             <td>{row.frame + 1}</td>
             <td>{row.keypoints_left}/{row.keypoints_right}</td>
             <td>{row.post_ratio_test}</td>
@@ -76,6 +83,11 @@
 
   tbody tr:nth-child(even) {
     background: var(--color-secondary);
+  }
+
+  tbody tr.selected {
+    outline: 1px solid var(--color-accent);
+    outline-offset: -1px;
   }
 
   td {
