@@ -687,9 +687,12 @@ fn calibrate_impl(
     }
 
     if successful_frames.is_empty() {
+        // Every frame was undistorted and matched before this point; the last
+        // active stage is FeatureMatching, so attribute the empty result there
+        // rather than to Undistorting (WR-03).
         return Err(CalibrationFailure::new(
             CalibrateError::NoUsableFrames,
-            CalibrationStep::Undistorting,
+            CalibrationStep::FeatureMatching,
             successful_frames,
         ));
     }
@@ -732,12 +735,14 @@ fn calibrate_impl(
     }
 
     if total_matches < config.matching.min_matches {
+        // Matching produced too few points — a FeatureMatching failure, not an
+        // Undistorting one (WR-03).
         return Err(CalibrationFailure::new(
             CalibrateError::InsufficientMatches {
                 got: total_matches,
                 min: config.matching.min_matches,
             },
-            CalibrationStep::Undistorting,
+            CalibrationStep::FeatureMatching,
             successful_frames,
         ));
     }
