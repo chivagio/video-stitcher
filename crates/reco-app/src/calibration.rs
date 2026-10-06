@@ -10,16 +10,18 @@
 //! Typed `thiserror` errors only; this module deliberately imports no `anyhow`.
 
 use reco_calibrate::error::CalibrateError;
+use reco_calibrate::geometry::{OptParams, per_point_reprojection_error};
 use reco_calibrate::types::{
     CalibrationConfig, CalibrationResult, CalibrationStep, FrameMatches, LensProfileInfo,
-    ProfileSource, SyncMethod as EngineSyncMethod,
+    MatchedPoint, ProfileSource, SyncMethod as EngineSyncMethod,
 };
-use reco_core::calibration::CameraParams;
+use reco_core::calibration::{CameraParams, PlaneLayout};
 
 use crate::events::{
-    CalibrationDiagnosis, CalibrationOptions, CalibrationStage, ConfidenceBand, DiagnosisMetrics,
-    InputMetadata, LensProfileView, ReadinessCode, ReadinessFinding, ReadinessReport,
-    ReadinessSeverity, SYNC_OFFSET_SEMANTICS, Scorecard, SyncMethod, SyncProvenance, SyncView,
+    CalibrationDiagnosis, CalibrationOptions, CalibrationStage, ConfidenceBand, DebugPoint,
+    DebugReport, DiagnosisMetrics, FrameMatchRow, InputMetadata, LensProfileView, ReadinessCode,
+    ReadinessFinding, ReadinessReport, ReadinessSeverity, SYNC_OFFSET_SEMANTICS, Scorecard,
+    SyncMethod, SyncProvenance, SyncView,
 };
 
 /// Sampled statistics feeding the readiness estimate (CALB-05).
@@ -372,6 +374,193 @@ pub fn project_scorecard(result: &CalibrationResult) -> Scorecard {
             }
         },
     }
+}
+
+/// Maximum edge (px) of a debug thumbnail crossing the event channel (T-04-10).
+///
+/// The retained undistorted frame pair can be full-resolution; only the
+/// downscaled thumbnail crosses to the webview, so the event payload stays
+/// bounded regardless of the source resolution.
+pub const DEBUG_THUMB_MAX_EDGE: u32 = 960;
+
+/// Maximum number of verified + rejected points in one debug report (T-04-10).
+///
+/// Caps the overlay's per-frame marker count so a pathological match set cannot
+/// freeze the canvas; the report records the truncation in `points_capped`.
+pub const DEBUG_POINT_CAP: usize = 2000;
+
+/// Build the bounded debug inspector report for a completed run (CALB-08).
+///
+/// Pure (no device/file/channel): the worker passes the run's per-frame
+/// `FrameMatches` (from a successful `CalibrationResult` or the partial
+/// `CalibrationFailure`) and, on success, the fitted [`PlaneLayout`] so each
+/// verified point gets a real per-point reprojection residual. Rejected points
+/// carry the run's `residual_error` (their own residual is undefined once they
+/// are excluded from the fit). The chosen frame is the one that retained an
+/// undistorted pair; its thumbnails are box-downsampled to
+/// [`DEBUG_THUMB_MAX_EDGE`] and the point lists are capped at
+/// [`DEBUG_POINT_CAP`]. An empty input yields an empty, fail-closed report.
+pub fn build_debug_report(
+    frames: &[FrameMatches],
+    layout: Option<&PlaneLayout>,
+    residual_error: f64,
+) -> DebugReport {
+    let frames_total = frames.len() as u64;
+    let per_frame: Vec<FrameMatchRow> = frames
+        .iter()
+        .enumerate()
+        .map(|(i, fm)| FrameMatchRow {
+            frame: i as u64,
+            keypoints_left: fm.keypoints_left,
+            keypoints_right: fm.keypoints_right,
+            post_ratio_test: fm.post_ratio_test,
+            post_spatial_filter: fm.post_spatial_filter,
+            post_ransac: fm.post_ransac,
+        })
+        .collect();
+
+    // Prefer the frame that retained an undistorted pair; else the first frame.
+    let chosen = frames
+        .iter()
+        .position(|fm| fm.debug_frame.is_some())
+        .unwrap_or(0);
+    let frame = frames.get(chosen);
+
+    let debug_frame = frame.and_then(|fm| fm.debug_frame.as_ref());
+    let (left_thumb, left_w, left_h) = match debug_frame {
+        Some(df) => downsample_rgba(
+            &df.left,
+            df.left_width,
+            df.left_height,
+            DEBUG_THUMB_MAX_EDGE,
+        ),
+        None => (Vec::new(), 0, 0),
+    };
+    let (right_thumb, right_w, right_h) = match debug_frame {
+        Some(df) => downsample_rgba(
+            &df.right,
+            df.right_width,
+            df.right_height,
+            DEBUG_THUMB_MAX_EDGE,
+        ),
+        None => (Vec::new(), 0, 0),
+    };
+
+    let mut verified: Vec<DebugPoint> = Vec::new();
+    let mut rejected: Vec<DebugPoint> = Vec::new();
+    let mut points_capped = false;
+
+    if let Some(fm) = frame {
+        // Use the ORIGINAL undistorted frame's aspect for the y normalization
+        // (the thumbnail preserves it only approximately under integer rounding).
+        let (coord_w, coord_h) = debug_frame
+            .map(|df| (df.left_width, df.left_height))
+            .unwrap_or((left_w, left_h));
+        let (cw, ch) = (coord_w.max(1) as f64, coord_h.max(1) as f64);
+        let aspect = cw / ch;
+
+        // Per-point residual when the fit is available (success path).
+        let per_point = layout.map(|l| {
+            let params = OptParams {
+                x_ty: l.x_ty,
+                intersect: l.intersect,
+                cam_d: l.camera_axis_offset,
+                x_rz: l.x_rz,
+                z_rx: l.z_rx,
+                z_rz: None,
+                x_rx: None,
+            };
+            per_point_reprojection_error(&fm.points, &params)
+        });
+        let to_point = |p: &MatchedPoint, error: f64| DebugPoint {
+            // `right_pixel_nx` is the LEFT camera keypoint's normalized x (the
+            // engine's historical swap convention); `right` is its plane y.
+            x_nx: p.right_pixel_nx.clamp(0.0, 1.0),
+            y_nx: (p.right[1] * aspect + 0.5).clamp(0.0, 1.0),
+            error,
+        };
+
+        for (i, p) in fm.points.iter().enumerate() {
+            if verified.len() + rejected.len() >= DEBUG_POINT_CAP {
+                points_capped = true;
+                break;
+            }
+            let error = per_point
+                .as_ref()
+                .and_then(|v| v.get(i).copied())
+                .unwrap_or(residual_error);
+            verified.push(to_point(p, error));
+        }
+        for p in &fm.rejected {
+            if verified.len() + rejected.len() >= DEBUG_POINT_CAP {
+                points_capped = true;
+                break;
+            }
+            rejected.push(to_point(p, residual_error));
+        }
+    }
+
+    DebugReport {
+        frame_index: chosen as u64,
+        frames_total,
+        left_width: left_w,
+        left_height: left_h,
+        right_width: right_w,
+        right_height: right_h,
+        left_thumb,
+        right_thumb,
+        verified,
+        rejected,
+        residual_error,
+        per_frame,
+        points_capped,
+    }
+}
+
+/// Box-downsample an RGBA buffer so its longest edge is at most `max_edge`.
+///
+/// Returns `(rgba, width, height)`; a zero-sized or short buffer yields an
+/// empty fail-closed result. A buffer already within the bound is copied
+/// unchanged (still bounded by `max_edge`).
+fn downsample_rgba(src: &[u8], w: u32, h: u32, max_edge: u32) -> (Vec<u8>, u32, u32) {
+    let (w, h) = (w as usize, h as usize);
+    if w == 0 || h == 0 || src.len() < w * h * 4 || max_edge == 0 {
+        return (Vec::new(), 0, 0);
+    }
+    let longest = w.max(h);
+    if longest as u32 <= max_edge {
+        return (src[..w * h * 4].to_vec(), w as u32, h as u32);
+    }
+    let scale = max_edge as f64 / longest as f64;
+    let nw = ((w as f64 * scale).round() as usize).max(1);
+    let nh = ((h as f64 * scale).round() as usize).max(1);
+    let mut out = vec![0u8; nw * nh * 4];
+    for oy in 0..nh {
+        let sy0 = oy * h / nh;
+        let sy1 = ((oy + 1) * h / nh).max(sy0 + 1).min(h);
+        for ox in 0..nw {
+            let sx0 = ox * w / nw;
+            let sx1 = ((ox + 1) * w / nw).max(sx0 + 1).min(w);
+            let (mut r, mut g, mut b, mut a, mut n) = (0u32, 0u32, 0u32, 0u32, 0u32);
+            for sy in sy0..sy1 {
+                for sx in sx0..sx1 {
+                    let idx = (sy * w + sx) * 4;
+                    r += src[idx] as u32;
+                    g += src[idx + 1] as u32;
+                    b += src[idx + 2] as u32;
+                    a += src[idx + 3] as u32;
+                    n += 1;
+                }
+            }
+            let n = n.max(1);
+            let oidx = (oy * nw + ox) * 4;
+            out[oidx] = (r / n) as u8;
+            out[oidx + 1] = (g / n) as u8;
+            out[oidx + 2] = (b / n) as u8;
+            out[oidx + 3] = (a / n) as u8;
+        }
+    }
+    (out, nw as u32, nh as u32)
 }
 
 /// Build the engine [`CalibrateVideosOptions`](reco_calibrate::video::CalibrateVideosOptions)
@@ -962,12 +1151,14 @@ mod tests {
             points: (0..points)
                 .map(|_| MatchedPoint::from_planes([0.0, 0.0], [0.0, 0.0]))
                 .collect(),
+            rejected: Vec::new(),
             keypoints_left,
             keypoints_right,
             min_descriptors: 0,
             post_ratio_test,
             post_spatial_filter,
             post_ransac,
+            debug_frame: None,
         }
     }
 

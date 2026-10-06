@@ -90,8 +90,8 @@ pub use error::{CalibrateError, CalibrationFailure};
 pub use traits::{CostFunction, FeatureDetector, FeatureMatcher, PointFilter};
 pub use types::{
     AkazeConfig, CalibrationConfig, CalibrationProgress, CalibrationQuality, CalibrationResult,
-    CalibrationStep, GrayFrame, LensProfileInfo, LensProfileSummary, MatchConfig, OptimizerConfig,
-    ProfileSource, YuvFrame,
+    CalibrationStep, DebugFrame, GrayFrame, LensProfileInfo, LensProfileSummary, MatchConfig,
+    OptimizerConfig, ProfileSource, YuvFrame,
 };
 
 use reco_core::calibration::{CameraParams, MatchCalibration};
@@ -361,35 +361,60 @@ fn process_undistorted_pair(
     // CRITICAL: Apply the left/right swap from v1 (processing.py:693).
     // Right camera points -> left plane (x-plane) in optimizer space.
     // Left camera points -> right plane (z-plane) in optimizer space.
+    //
+    // `matched_point` is shared with the rejected-point collection below so the
+    // two classes use one coordinate convention (CALB-08).
+    let matched_point = |m: &features::RawMatch| -> MatchedPoint {
+        let lp = &kp_left[m.left_idx];
+        let rp = &kp_right[m.right_idx];
+        MatchedPoint {
+            left: geometry::normalize_to_plane(rp.x as f64, rp.y as f64, rw, rh),
+            right: geometry::normalize_to_plane(lp.x as f64, lp.y as f64, lw, lh),
+            // Store normalized pixel x for seam-proximity weighting
+            left_pixel_nx: rp.x as f64 / rw as f64,
+            right_pixel_nx: lp.x as f64 / lw as f64,
+        }
+    };
+
     let points: Vec<MatchedPoint> = inlier_indices
         .iter()
-        .map(|&i| {
-            let m = &spatial_matches[i];
-            let lp = &kp_left[m.left_idx];
-            let rp = &kp_right[m.right_idx];
-
-            // Swap: right pixel -> left plane (x-plane), left pixel -> right plane (z-plane)
-            MatchedPoint {
-                left: geometry::normalize_to_plane(rp.x as f64, rp.y as f64, rw, rh),
-                right: geometry::normalize_to_plane(lp.x as f64, lp.y as f64, lw, lh),
-                // Store normalized pixel x for seam-proximity weighting
-                left_pixel_nx: rp.x as f64 / rw as f64,
-                right_pixel_nx: lp.x as f64 / lw as f64,
-            }
-        })
+        .map(|&i| matched_point(&spatial_matches[i]))
         .collect();
+
+    // Retain the rejected candidates for the debug inspector (CALB-08): the
+    // ratio-test survivors the spatial filter dropped, plus the spatial
+    // survivors RANSAC rejected. Diagnostic only — never fed to the optimizer.
+    let inlier_set: std::collections::HashSet<usize> = inlier_indices.iter().copied().collect();
+    let spatial_keys: std::collections::HashSet<(usize, usize)> = spatial_matches
+        .iter()
+        .map(|m| (m.left_idx, m.right_idx))
+        .collect();
+    let mut rejected: Vec<MatchedPoint> = raw_matches
+        .iter()
+        .filter(|m| !spatial_keys.contains(&(m.left_idx, m.right_idx)))
+        .map(&matched_point)
+        .collect();
+    rejected.extend(
+        spatial_matches
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !inlier_set.contains(i))
+            .map(|(_, m)| matched_point(m)),
+    );
 
     // Apply the user-provided point filter (e.g. y-disparity rejection)
     let points = point_filter.filter(&points);
 
     Some(FrameMatches {
         points,
+        rejected,
         keypoints_left: kp_left.len(),
         keypoints_right: kp_right.len(),
         min_descriptors: desc_left.len().min(desc_right.len()),
         post_ratio_test,
         post_spatial_filter,
         post_ransac,
+        debug_frame: None,
     })
 }
 
@@ -622,7 +647,7 @@ fn calibrate_impl(
                 &config.matching,
             );
         }
-        let result = {
+        let mut result = {
             profile_scope!("akaze_detect_match");
             process_undistorted_pair(
                 &left_rgba,
@@ -639,6 +664,23 @@ fn calibrate_impl(
                 point_filter,
             )
         };
+        // Retain the undistorted RGBA pair of the FIRST frame that produced
+        // matches, for the debug inspector (CALB-08). Only one pair is kept so
+        // peak memory stays bounded (T-04-10). The borrow of `left_rgba`/
+        // `right_rgba` by `process_undistorted_pair` has ended, so they can be
+        // moved into the retained frame.
+        if let Some(fm) = result.as_mut()
+            && successful_frames.is_empty()
+        {
+            fm.debug_frame = Some(types::DebugFrame {
+                left: std::mem::take(&mut left_rgba),
+                left_width: lw,
+                left_height: lh,
+                right: std::mem::take(&mut right_rgba),
+                right_width: rw,
+                right_height: rh,
+            });
+        }
         if let Some(fm) = result {
             successful_frames.push(fm);
         }

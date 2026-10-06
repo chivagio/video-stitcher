@@ -438,6 +438,79 @@ pub struct CalibrationOptions {
     pub use_imu_rotation_seeds: Option<bool>,
 }
 
+/// One feature-match point for the debug inspector (CALB-08).
+///
+/// `x_nx` / `y_nx` are normalized to `0.0..=1.0` on the paired undistorted
+/// frame (the left camera's coordinate space), so the overlay canvas scales
+/// them by its own width/height and never needs the pixel geometry. `error` is
+/// the per-point reprojection residual feeding the residual map's colour ramp
+/// (the run's residual when no per-point estimate is available).
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct DebugPoint {
+    /// Normalized x in the paired frame (`0.0..=1.0`).
+    pub x_nx: f64,
+    /// Normalized y in the paired frame (`0.0..=1.0`).
+    pub y_nx: f64,
+    /// Reprojection-error proxy for this point (residual map colour).
+    pub error: f64,
+}
+
+/// One row of the debug inspector's per-frame match-count table (CALB-08).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FrameMatchRow {
+    /// 0-based frame index within the run.
+    pub frame: u64,
+    /// Keypoints detected in the left image.
+    pub keypoints_left: usize,
+    /// Keypoints detected in the right image.
+    pub keypoints_right: usize,
+    /// Matches surviving the ratio test.
+    pub post_ratio_test: usize,
+    /// Matches surviving the spatial overlap filter.
+    pub post_spatial_filter: usize,
+    /// Matches surviving RANSAC.
+    pub post_ransac: usize,
+}
+
+/// The bounded debug inspector payload for one sampled frame pair (CALB-08).
+///
+/// Carries the downscaled undistorted thumbnails (max edge
+/// [`crate::calibration::DEBUG_THUMB_MAX_EDGE`]), the verified and rejected
+/// match points, the run's residual, and the per-frame count rows. The point
+/// lists are capped at [`crate::calibration::DEBUG_POINT_CAP`]; `points_capped`
+/// records that truncation so the UI can say so rather than silently dropping
+/// points (T-04-10). `left_thumb`/`right_thumb` are empty and the dimensions
+/// zero when no frame pair was retained (the canvas fails closed).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct DebugReport {
+    /// 0-based index of the sampled frame within the run.
+    pub frame_index: u64,
+    /// Total frames that produced matches in the run.
+    pub frames_total: u64,
+    /// Downscaled left thumbnail width in pixels (0 when absent).
+    pub left_width: u32,
+    /// Downscaled left thumbnail height in pixels (0 when absent).
+    pub left_height: u32,
+    /// Downscaled right thumbnail width in pixels (0 when absent).
+    pub right_width: u32,
+    /// Downscaled right thumbnail height in pixels (0 when absent).
+    pub right_height: u32,
+    /// Downscaled left thumbnail RGBA (`left_width * left_height * 4` bytes).
+    pub left_thumb: Vec<u8>,
+    /// Downscaled right thumbnail RGBA (`right_width * right_height * 4` bytes).
+    pub right_thumb: Vec<u8>,
+    /// Match points that survived every filter (accent markers).
+    pub verified: Vec<DebugPoint>,
+    /// Candidate matches the filters rejected (warn markers).
+    pub rejected: Vec<DebugPoint>,
+    /// Residual seam-weighted reprojection error at the optimum (0 when unknown).
+    pub residual_error: f64,
+    /// One row per frame that produced matches.
+    pub per_frame: Vec<FrameMatchRow>,
+    /// Whether the point lists were truncated to the cap.
+    pub points_capped: bool,
+}
+
 /// An event emitted by the engine worker and rendered in the webview log pane.
 ///
 /// `Clone + Send + 'static` so it can cross the worker→UI channel; the
@@ -614,6 +687,17 @@ pub enum WorkerEvent {
     CalibrationFailed {
         /// The plain-language cause/fix plus the raw error and metrics.
         diagnosis: CalibrationDiagnosis,
+    },
+
+    /// The bounded debug inspector payload after a calibration run (CALB-08).
+    ///
+    /// Emitted once per completed run (pass or fail) when any frame produced
+    /// matches, so the Calibrate screen can render the feature-match overlay,
+    /// the residual map, and the per-frame count table. The payload is bounded
+    /// (downscaled thumbnails, capped points) — never a CLI PNG export.
+    CalibrationDebug {
+        /// The sampled frame pair's points, thumbnails, and per-frame counts.
+        report: DebugReport,
     },
 
     /// A profile was loaded from disk (IMPT-05).
@@ -818,6 +902,18 @@ impl WorkerEvent {
                 // The cause is already user-facing (authored in Rust on the
                 // diagnosis) — the frontend renders it verbatim (CALB-04).
                 message: diagnosis.cause.clone(),
+            },
+            // Debug data published is an INFO line (UI-SPEC Event Log Contract);
+            // the structured report rides the typed channel.
+            WorkerEvent::CalibrationDebug { report } => LogLine {
+                level: Level::Info,
+                message: format!(
+                    "debug data published: frame {} of {}, {} verified / {} rejected matches",
+                    report.frame_index + 1,
+                    report.frames_total,
+                    report.verified.len(),
+                    report.rejected.len(),
+                ),
             },
             WorkerEvent::ProfileLoaded { path } => LogLine {
                 level: Level::Info,
@@ -1462,5 +1558,64 @@ mod tests {
         let line = event.to_log_line();
         assert_eq!(line.level, Level::Error);
         assert_eq!(line.message, "No frame pair produced usable matches.");
+    }
+
+    #[test]
+    fn calibration_debug_roundtrips_and_projects_to_an_info_line() {
+        // CALB-08: the bounded debug payload crosses as a typed report and
+        // projects to an INFO line (UI-SPEC Event Log Contract).
+        let report = DebugReport {
+            frame_index: 1,
+            frames_total: 3,
+            left_width: 2,
+            left_height: 1,
+            right_width: 2,
+            right_height: 1,
+            left_thumb: vec![0, 0, 0, 255, 255, 255, 255, 255],
+            right_thumb: vec![0, 0, 0, 255, 255, 255, 255, 255],
+            verified: vec![DebugPoint {
+                x_nx: 0.25,
+                y_nx: 0.5,
+                error: 0.01,
+            }],
+            rejected: vec![DebugPoint {
+                x_nx: 0.75,
+                y_nx: 0.5,
+                error: 0.2,
+            }],
+            residual_error: 0.01,
+            per_frame: vec![FrameMatchRow {
+                frame: 0,
+                keypoints_left: 100,
+                keypoints_right: 90,
+                post_ratio_test: 40,
+                post_spatial_filter: 30,
+                post_ransac: 25,
+            }],
+            points_capped: false,
+        };
+        let event = WorkerEvent::CalibrationDebug {
+            report: report.clone(),
+        };
+
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(
+            json.contains("\"kind\":\"calibration_debug\""),
+            "unexpected json: {json}"
+        );
+        assert!(
+            json.contains("\"report\""),
+            "the report must ride under `data.report`: {json}"
+        );
+        let back: WorkerEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(event, back);
+        assert_eq!(back, WorkerEvent::CalibrationDebug { report });
+
+        let line = event.to_log_line();
+        assert_eq!(line.level, Level::Info);
+        assert_eq!(
+            line.message,
+            "debug data published: frame 2 of 3, 1 verified / 1 rejected matches"
+        );
     }
 }

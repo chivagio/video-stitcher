@@ -72,6 +72,15 @@ impl MatchedPoint {
 pub struct FrameMatches {
     /// Matched point pairs surviving all filters.
     pub points: Vec<MatchedPoint>,
+    /// Candidate matches the filters rejected (CALB-08).
+    ///
+    /// Holds the ratio-test survivors that failed the spatial overlap filter
+    /// plus the spatial survivors that RANSAC rejected, in the same plane/pixel
+    /// coordinate convention as [`Self::points`]. The debug inspector renders
+    /// them as the "rejected" class of the feature-match overlay; they are
+    /// diagnostic only and never feed the optimizer.
+    #[serde(default)]
+    pub rejected: Vec<MatchedPoint>,
     /// Number of keypoints detected in the left image.
     pub keypoints_left: usize,
     /// Number of keypoints detected in the right image.
@@ -85,6 +94,37 @@ pub struct FrameMatches {
     pub post_spatial_filter: usize,
     /// Matches surviving RANSAC outlier rejection.
     pub post_ransac: usize,
+    /// The undistorted RGBA frame pair for the debug inspector (CALB-08).
+    ///
+    /// Populated on **one** sampled frame (the first that produced matches) so
+    /// the host can build a bounded, downscaled thumbnail pair for the
+    /// feature-match overlay without a CLI PNG export. `None` on every other
+    /// frame and when no undistorted pair was retained. Skipped when absent so
+    /// it never bloats a serialized result (T-04-10).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub debug_frame: Option<DebugFrame>,
+}
+
+/// One undistorted RGBA frame pair retained for the debug inspector (CALB-08).
+///
+/// `left`/`right` are tightly packed RGBA buffers of `left_width × left_height`
+/// and `right_width × right_height` respectively, exactly as produced by the
+/// GPU undistort stage (before feature extraction). The host downsamples this to
+/// a bounded thumbnail (<= 960 px max edge) before it crosses the event channel.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DebugFrame {
+    /// Undistorted RGBA pixels for the left camera (`w * h * 4` bytes).
+    pub left: Vec<u8>,
+    /// Width of [`Self::left`] in pixels.
+    pub left_width: u32,
+    /// Height of [`Self::left`] in pixels.
+    pub left_height: u32,
+    /// Undistorted RGBA pixels for the right camera (`w * h * 4` bytes).
+    pub right: Vec<u8>,
+    /// Width of [`Self::right`] in pixels.
+    pub right_width: u32,
+    /// Height of [`Self::right`] in pixels.
+    pub right_height: u32,
 }
 
 /// AKAZE feature detection settings.
@@ -656,5 +696,53 @@ mod serde_defaults_tests {
         assert!(cfg.matching.multi_scale);
         assert!(!cfg.matching.rolling_shutter);
         assert_eq!(cfg.matching.rolling_shutter_slope, 0.5);
+    }
+
+    /// A `FrameMatches` JSON without the CALB-08 fields must still load, with
+    /// `rejected` defaulting empty and `debug_frame` absent (CALB-08). The
+    /// retained debug frame is skipped when absent so it never bloats a result.
+    #[test]
+    fn frame_matches_without_calb08_fields_loads_and_skips_debug_frame() {
+        let json = r#"{
+            "points": [],
+            "keypoints_left": 10,
+            "keypoints_right": 12,
+            "min_descriptors": 8,
+            "post_ratio_test": 6,
+            "post_spatial_filter": 5,
+            "post_ransac": 4
+        }"#;
+        let fm: FrameMatches = serde_json::from_str(json).expect("legacy FrameMatches must load");
+        assert!(fm.rejected.is_empty());
+        assert!(fm.debug_frame.is_none());
+
+        // An absent debug frame is skipped entirely (never bloats a result).
+        let bare = serde_json::to_string(&fm).unwrap();
+        assert!(
+            !bare.contains("debug_frame"),
+            "an absent debug frame must be skipped: {bare}"
+        );
+
+        // A populated rejected set + debug frame round-trips through serde.
+        let with_debug = FrameMatches {
+            rejected: vec![MatchedPoint::from_planes([0.1, 0.2], [0.3, 0.4])],
+            debug_frame: Some(DebugFrame {
+                left: vec![0, 0, 0, 255],
+                left_width: 1,
+                left_height: 1,
+                right: vec![0, 0, 0, 255],
+                right_width: 1,
+                right_height: 1,
+            }),
+            ..fm
+        };
+        let encoded = serde_json::to_string(&with_debug).unwrap();
+        assert!(
+            encoded.contains("\"debug_frame\""),
+            "debug frame must encode"
+        );
+        let back: FrameMatches = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(back.rejected.len(), 1);
+        assert_eq!(back.debug_frame.unwrap().left_width, 1);
     }
 }

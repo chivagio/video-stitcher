@@ -275,6 +275,22 @@ impl EventSink {
         let _ = self.tx.send(WorkerEvent::CalibrationFailed { diagnosis });
     }
 
+    /// Emit the bounded debug inspector payload (CALB-08).
+    ///
+    /// Mirrored to the process log at INFO (UI-SPEC Event Log Contract); the
+    /// structured report rides the typed channel. The report is already bounded
+    /// (downscaled thumbnails, capped points), so this is a cheap send.
+    fn calibration_debug(&self, report: crate::events::DebugReport) {
+        log::info!(
+            "debug data published: frame {} of {}, {} verified / {} rejected matches",
+            report.frame_index + 1,
+            report.frames_total,
+            report.verified.len(),
+            report.rejected.len(),
+        );
+        let _ = self.tx.send(WorkerEvent::CalibrationDebug { report });
+    }
+
     /// Emit that a profile was loaded (IMPT-05).
     fn profile_loaded(&self, path: impl Into<String>) {
         let _ = self
@@ -2292,6 +2308,14 @@ impl EngineBackend for GpuEngineBackend {
                 );
                 events.progress(1.0);
                 events.result(scorecard);
+                // Publish the bounded debug inspector payload (CALB-08): the
+                // fitted layout gives each verified point a real per-point
+                // residual; the retained undistorted pair supplies the thumbs.
+                events.calibration_debug(crate::calibration::build_debug_report(
+                    &calibration_result.per_frame,
+                    Some(&calibration_result.calibration.layout),
+                    calibration_result.residual_error,
+                ));
                 Ok(())
             }
             Err(reco_calibrate::video::CalibrateVideosError::Cancelled) => {
@@ -2345,6 +2369,19 @@ impl EngineBackend for GpuEngineBackend {
                     diagnosis.cause.clone(),
                 );
                 events.failed_diagnosis(diagnosis);
+
+                // Publish the debug inspector payload even on failure (CALB-08),
+                // from the partial per-frame matches the engine retained. No
+                // fitted layout exists, so points carry the run's (zero) residual.
+                let debug_frames: &[reco_calibrate::types::FrameMatches] = match &e {
+                    CalibrateVideosError::Diagnostic(failure) => &failure.frames,
+                    _ => &[],
+                };
+                events.calibration_debug(crate::calibration::build_debug_report(
+                    debug_frames,
+                    None,
+                    0.0,
+                ));
                 Ok(())
             }
         }
@@ -3350,6 +3387,44 @@ mod tests {
         }
     }
 
+    /// A fabricated CALB-08 debug report for the mock's calibration result.
+    ///
+    /// Small but structurally complete (a 1x1 thumbnail pair, one verified and
+    /// one rejected point, one per-frame row) so the worker protocol test can
+    /// assert the typed payload crosses without a GPU or a decoder.
+    fn mock_debug_report() -> crate::events::DebugReport {
+        crate::events::DebugReport {
+            frame_index: 0,
+            frames_total: 1,
+            left_width: 1,
+            left_height: 1,
+            right_width: 1,
+            right_height: 1,
+            left_thumb: vec![0, 0, 0, 255],
+            right_thumb: vec![0, 0, 0, 255],
+            verified: vec![crate::events::DebugPoint {
+                x_nx: 0.25,
+                y_nx: 0.5,
+                error: 0.01,
+            }],
+            rejected: vec![crate::events::DebugPoint {
+                x_nx: 0.75,
+                y_nx: 0.5,
+                error: 0.25,
+            }],
+            residual_error: 0.25,
+            per_frame: vec![crate::events::FrameMatchRow {
+                frame: 0,
+                keypoints_left: 100,
+                keypoints_right: 90,
+                post_ratio_test: 40,
+                post_spatial_filter: 30,
+                post_ransac: 25,
+            }],
+            points_capped: false,
+        }
+    }
+
     /// A minimal valid calibration for the mock's load/save round-trip.
     fn sample_mock_calibration() -> reco_core::calibration::MatchCalibration {
         use reco_core::calibration::{CameraParams, MatchCalibration, PlaneLayout};
@@ -3718,6 +3793,9 @@ mod tests {
             }
             events.progress(1.0);
             events.result(mock_scorecard());
+            // Mirror the real backend: publish the bounded debug payload too
+            // (CALB-08), so the protocol test can assert it without a GPU.
+            events.calibration_debug(mock_debug_report());
             self.has_result = true;
             Ok(())
         }
@@ -4194,6 +4272,44 @@ mod tests {
             seen.iter()
                 .any(|e| matches!(e, WorkerEvent::CalibrationResult { .. })),
             "calibration must emit a scorecard result"
+        );
+    }
+
+    #[test]
+    fn a_completed_calibration_emits_a_bounded_debug_report() {
+        // CALB-08: after a run finishes, the typed debug payload must cross the
+        // channel — carrying both point classes and a bounded thumbnail pair,
+        // never a CLI PNG export.
+        let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (worker, events) = EngineWorker::spawn(MockBackend::new(Arc::clone(&ops)));
+        let handle = worker.handle();
+        handle
+            .send(WorkerCommand::StartCalibration {
+                options: crate::events::CalibrationOptions::default(),
+            })
+            .unwrap();
+        handle.send(WorkerCommand::Shutdown).unwrap();
+
+        let seen = drain_until_shutdown(&events);
+        let report = seen
+            .iter()
+            .find_map(|e| match e {
+                WorkerEvent::CalibrationDebug { report } => Some(report.clone()),
+                _ => None,
+            })
+            .expect("calibration must emit a CalibrationDebug event");
+
+        assert!(!report.verified.is_empty(), "verified points must cross");
+        assert!(!report.rejected.is_empty(), "rejected points must cross");
+        assert_eq!(report.per_frame.len(), 1, "one per-frame row must cross");
+        assert_eq!(
+            report.left_thumb.len() as u32,
+            report.left_width * report.left_height * 4,
+            "the thumbnail length must match its geometry"
+        );
+        assert!(
+            !report.points_capped,
+            "a small report must not be marked capped"
         );
     }
 
