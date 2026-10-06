@@ -2225,6 +2225,20 @@ fn clamp_pin_px(px: [f64; 2], w: u32, h: u32) -> [f64; 2] {
     [px[0].clamp(0.0, max_x), px[1].clamp(0.0, max_y)]
 }
 
+/// Decide the session offset to apply from an audio-sync estimate (MANU-02).
+///
+/// A sub-floor estimate is surfaced for display but never applied: the flow
+/// defaults the offset to 0 and requires an explicit manual confirmation
+/// (WR-02). A confident estimate is applied with Audio provenance. Returns
+/// `(applied_offset_frames, sync_method)`.
+fn applied_audio_offset(offset_frames: i64, confidence: f64) -> (i64, crate::events::SyncMethod) {
+    if confidence >= crate::events::AUDIO_SYNC_CONFIDENCE_FLOOR {
+        (offset_frames, crate::events::SyncMethod::Audio)
+    } else {
+        (0, crate::events::SyncMethod::None)
+    }
+}
+
 /// The engine objects exclusively owned by the worker thread (FOUND-03).
 ///
 /// Field order is the drop order and is load-bearing (see the module header):
@@ -3458,22 +3472,46 @@ impl EngineBackend for GpuEngineBackend {
             SAMPLE_RATE,
         ) {
             Ok(estimate) => {
-                // Carry the accepted estimate on the session with Audio
-                // provenance, so proceeding without a nudge still uses the
-                // engine's offset (must-have: the chosen offset feeds the later
-                // solves). A nudge overrides this with Manual provenance.
+                // MANU-02 / WR-02: a sub-floor estimate is surfaced for display
+                // but never applied as the offset — the flow defaults to 0 and
+                // requires an explicit manual confirmation. A confident estimate
+                // is applied with Audio provenance.
+                let (applied, method) =
+                    applied_audio_offset(estimate.offset_frames, estimate.confidence);
+                let changed = self
+                    .manual
+                    .as_ref()
+                    .is_some_and(|session| session.sync_offset != applied);
                 if let Some(session) = self.manual.as_mut() {
-                    session.sync_offset = estimate.offset_frames;
-                    session.sync_method = crate::events::SyncMethod::Audio;
+                    session.sync_offset = applied;
+                    session.sync_method = method;
+                }
+                // The applied offset selects which right frame pairs with the
+                // retained left reference frame, so re-extract and re-render
+                // when it changes (mirrors `manual_set_sync`); otherwise the pins
+                // would pair mismatched instants (CR-01).
+                if changed {
+                    self.reextract_right_reference()?;
+                    self.render_manual_preview(events)?;
                 }
                 events.audio_sync_result(estimate.offset_frames, Some(estimate.confidence));
             }
             Err(e) => {
                 // "Unavailable": reset the session offset to 0 and record no
-                // provenance; the UI requires an explicit manual offset.
+                // provenance; the UI requires an explicit manual offset. When
+                // this changes a previously applied offset, re-extract so the
+                // retained right frame matches 0 (CR-01).
+                let changed = self
+                    .manual
+                    .as_ref()
+                    .is_some_and(|session| session.sync_offset != 0);
                 if let Some(session) = self.manual.as_mut() {
                     session.sync_offset = 0;
                     session.sync_method = crate::events::SyncMethod::None;
+                }
+                if changed {
+                    self.reextract_right_reference()?;
+                    self.render_manual_preview(events)?;
                 }
                 log::warn!("manual audio sync unavailable: {e}");
                 events.audio_sync_result(0, None);
@@ -5194,6 +5232,30 @@ mod tests {
     const VIEWPORT_WIDTH: u32 = 1000;
     use super::*;
     use std::sync::mpsc::RecvTimeoutError;
+
+    /// WR-02: a sub-floor audio estimate is surfaced but never applied; the
+    /// applied offset defaults to 0 with no provenance. At/above the floor the
+    /// estimate is applied with Audio provenance.
+    #[test]
+    fn applied_audio_offset_defaults_a_low_confidence_estimate_to_zero() {
+        let floor = crate::events::AUDIO_SYNC_CONFIDENCE_FLOOR;
+        assert_eq!(
+            applied_audio_offset(7, floor - 0.01),
+            (0, crate::events::SyncMethod::None)
+        );
+        assert_eq!(
+            applied_audio_offset(-3, floor - 0.01),
+            (0, crate::events::SyncMethod::None)
+        );
+        assert_eq!(
+            applied_audio_offset(7, floor),
+            (7, crate::events::SyncMethod::Audio)
+        );
+        assert_eq!(
+            applied_audio_offset(-3, 0.99),
+            (-3, crate::events::SyncMethod::Audio)
+        );
+    }
 
     /// The metadata the mock's `set_input` reports when a test does not
     /// preload `mock_metadata` for that role.

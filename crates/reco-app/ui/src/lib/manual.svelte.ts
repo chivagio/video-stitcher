@@ -274,11 +274,17 @@ class ManualStore {
       }
       case "audio_sync_result": {
         const { offset_frames, confidence, offset_semantics } = event.data;
+        // The confidence is always surfaced for display, but a sub-floor
+        // estimate is never applied as the offset: the flow defaults to 0 and
+        // requires an explicit confirmation (MANU-02 / WR-02). This mirrors the
+        // worker's `applied_audio_offset`, so the readout and the session agree.
+        const confident =
+          confidence !== null && confidence >= AUDIO_CONFIDENCE_FLOOR;
         this.audioConfidence = confidence;
-        this.syncOffset = offset_frames;
-        // A confident estimate is the audio path; an absent one is "none". A
-        // manual nudge later overrides this with "manual".
-        this.syncMethod = confidence === null ? "none" : "audio";
+        this.syncOffset = confident ? offset_frames : 0;
+        // A confident estimate is the audio path; an absent or low one is
+        // "none". A manual nudge later overrides this with "manual".
+        this.syncMethod = confident ? "audio" : "none";
         this.offsetSemantics = offset_semantics;
         // A fresh estimate invalidates any prior confirmation.
         this.syncConfirmed = false;
