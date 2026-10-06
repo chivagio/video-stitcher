@@ -317,7 +317,7 @@
   });
 
   const ariaLabel = $derived(
-    `Pin canvas, ${manual.pins.length} pin/ pins. ` +
+    `Pin canvas, ${manual.pins.length} pin${manual.pins.length === 1 ? "" : "s"}. ` +
       (pairing
         ? "Now click the matching point on the right frame."
         : "Click a point on the left frame, then its match on the right."),
