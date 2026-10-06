@@ -72,6 +72,7 @@ pub mod lens_database;
 /// not require the `io` feature — the source is a trait object supplied
 /// by the consumer, not a file.
 pub mod live;
+pub mod manual;
 pub mod optimizer;
 pub mod pipeline;
 mod ransac;
@@ -87,6 +88,7 @@ pub use defaults::{
     YDisparityFilter,
 };
 pub use error::{CalibrateError, CalibrationFailure};
+pub use manual::{ManualPin, ManualSolveResult, pin_to_matched_point, solve_manual_calibration};
 pub use traits::{CostFunction, FeatureDetector, FeatureMatcher, PointFilter};
 pub use types::{
     AkazeConfig, CalibrationConfig, CalibrationProgress, CalibrationQuality, CalibrationResult,
