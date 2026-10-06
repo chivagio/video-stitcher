@@ -168,6 +168,64 @@ fn try_audio_sync(
     }
 }
 
+/// An audio-sync estimate from [`detect_audio_sync`] (MANU-02).
+///
+/// Carries the rounded offset in frames and the cross-correlation confidence,
+/// so the manual flow can show a confidence readout and fall back to a manual
+/// nudge when the estimate is absent or low. A genuine zero offset is a real
+/// estimate with a confidence — never confused with "unavailable".
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AudioSyncEstimate {
+    /// Rounded sync offset in frames (positive advances the right stream; see
+    /// `events::SYNC_OFFSET_SEMANTICS`).
+    pub offset_frames: i64,
+    /// Peak cross-correlation confidence (higher = more confident).
+    pub confidence: f64,
+}
+
+/// Estimate the temporal sync offset between two clips from their audio
+/// (MANU-02).
+///
+/// This is the manual flow's audio auto-sync. It reuses the *same* engine path
+/// as auto-calibration — [`calibration_io::extract_audio_pcm`] for both clips
+/// and [`CalibrationPipeline::audio_sync`] for the cross-correlation — so the
+/// operator sees the engine's estimate, never a second implementation.
+///
+/// # Errors
+///
+/// Returns a typed [`CalibrateVideosError`] when either clip's metadata cannot
+/// be probed, either clip's audio cannot be extracted, or the correlation
+/// fails. The caller **must** be able to distinguish "unavailable" from a
+/// genuine zero offset, so this never silently returns `0`.
+pub fn detect_audio_sync(
+    left_video: &Path,
+    right_video: &Path,
+    sample_rate: u32,
+) -> Result<AudioSyncEstimate, CalibrateVideosError> {
+    reco_io::init();
+
+    // The frame rate is needed to round the sub-frame offset to whole frames;
+    // probe the left clip (the correlation is frame-rate agnostic).
+    let probe = calibration_io::probe_video(left_video)?;
+    let left_audio = calibration_io::extract_audio_pcm(left_video, sample_rate)?;
+    let right_audio = calibration_io::extract_audio_pcm(right_video, sample_rate)?;
+
+    let info = VideoInfo {
+        path: left_video.into(),
+        width: probe.width,
+        height: probe.height,
+        fps: probe.fps,
+        total_frames: probe.total_frames,
+    };
+    let mut pipeline = CalibrationPipeline::new(info.clone(), info, CalibrationConfig::default());
+    let offset_frames = pipeline.audio_sync(&left_audio, &right_audio, sample_rate)?;
+    let confidence = pipeline.sync_confidence().unwrap_or(0.0);
+    Ok(AudioSyncEstimate {
+        offset_frames,
+        confidence,
+    })
+}
+
 /// Emit a progress update for the given step.
 fn emit_progress(
     on_progress: &mut dyn FnMut(&CalibrationProgress),

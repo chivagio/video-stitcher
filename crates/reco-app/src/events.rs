@@ -381,6 +381,16 @@ pub struct LensProfileView {
 pub const SYNC_OFFSET_SEMANTICS: &str =
     "positive offset skips right frames, negative skips left frames";
 
+/// The audio-sync confidence below which an estimate is treated as low
+/// (MANU-02).
+///
+/// Mirrors the scorecard's `Low` band boundary (`calibration::confidence_band`,
+/// CALB-03): a confidence below this reads the same as "unavailable" to the
+/// operator — the offset defaults to 0 and must be confirmed. Used only to
+/// decide the log severity here; the webview applies the same boundary to gate
+/// the step.
+pub const AUDIO_SYNC_CONFIDENCE_FLOOR: f64 = 0.5;
+
 /// Which path produced a calibration's temporal offset, as a provenance mark
 /// over the `IMU → Audio → Manual` chain (CALB-06).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -790,6 +800,37 @@ pub enum WorkerEvent {
         stale: bool,
     },
 
+    /// The manual flow's audio auto-sync estimate (MANU-02).
+    ///
+    /// Emitted on entry to the Time-align step and whenever the operator asks
+    /// for a re-detect. `confidence: None` is the "unavailable" signal (the
+    /// engine could not extract audio or correlate it) — never a fabricated
+    /// number. `offset_semantics` carries the single [`SYNC_OFFSET_SEMANTICS`]
+    /// constant so the frontend binds the wording rather than re-typing it
+    /// (T-04.1-07).
+    AudioSyncResult {
+        /// Rounded offset in frames (0 when the estimate is unavailable).
+        offset_frames: i64,
+        /// Cross-correlation confidence, or `None` when unavailable.
+        confidence: Option<f64>,
+        /// The fixed offset-semantics sentence ([`SYNC_OFFSET_SEMANTICS`]).
+        offset_semantics: String,
+    },
+
+    /// The operator set the manual sync offset (MANU-02).
+    ///
+    /// Records [`SyncMethod::Manual`] provenance, preserving the CALB-06 chain
+    /// (IMU → audio → manual). The offset is carried on the manual session and
+    /// is what the later pin/bend solves use.
+    ManualSyncSet {
+        /// The offset in frames the operator chose (signed).
+        offset_frames: i64,
+        /// The provenance mark — always [`SyncMethod::Manual`] on this path.
+        method: SyncMethod,
+        /// The fixed offset-semantics sentence ([`SYNC_OFFSET_SEMANTICS`]).
+        offset_semantics: String,
+    },
+
     /// The current result no longer matches the inputs or profile (D3-08).
     ///
     /// Emitted when an input or lens override changes after a run/load, so the
@@ -1047,6 +1088,40 @@ impl WorkerEvent {
                     } else {
                         "solved"
                     }
+                ),
+            },
+            // Audio sync is INFO when a confident estimate exists and WARN when
+            // it is low or absent (UI-SPEC Event Log Contract). The offset is
+            // rendered WITH its fixed semantics sentence so a log reader cannot
+            // mistake the sign's meaning (T-04.1-07).
+            WorkerEvent::AudioSyncResult {
+                offset_frames,
+                confidence,
+                offset_semantics,
+            } => LogLine {
+                level: if confidence.is_some_and(|c| c >= AUDIO_SYNC_CONFIDENCE_FLOOR) {
+                    Level::Info
+                } else {
+                    Level::Warn
+                },
+                message: match confidence {
+                    Some(confidence) => format!(
+                        "audio sync: offset {offset_frames:+} frames (confidence {:.0}%) — {offset_semantics}",
+                        confidence * 100.0,
+                    ),
+                    None => format!(
+                        "audio sync unavailable or low confidence — set the offset manually ({offset_semantics})"
+                    ),
+                },
+            },
+            WorkerEvent::ManualSyncSet {
+                offset_frames,
+                method,
+                offset_semantics,
+            } => LogLine {
+                level: Level::Info,
+                message: format!(
+                    "manual sync: offset {offset_frames:+} frames ({method:?}) — {offset_semantics}"
                 ),
             },
             WorkerEvent::ResultInvalidated => LogLine {
@@ -1848,5 +1923,74 @@ mod tests {
             stale: false,
         };
         assert_eq!(fresh.to_log_line().message, "manual solve: solved");
+    }
+
+    #[test]
+    fn audio_sync_result_roundtrips_and_warns_when_absent_or_low() {
+        // MANU-02: a confident estimate is INFO and carries the fixed semantics;
+        // a low or absent confidence is WARN so the operator is told to set the
+        // offset manually. The semantics sentence is the single constant.
+        let confident = WorkerEvent::AudioSyncResult {
+            offset_frames: 5,
+            confidence: Some(0.92),
+            offset_semantics: SYNC_OFFSET_SEMANTICS.to_string(),
+        };
+        let json = serde_json::to_string(&confident).unwrap();
+        assert!(
+            json.contains("\"kind\":\"audio_sync_result\""),
+            "unexpected json: {json}"
+        );
+        assert_eq!(
+            serde_json::from_str::<WorkerEvent>(&json).unwrap(),
+            confident
+        );
+        let line = confident.to_log_line();
+        assert_eq!(line.level, Level::Info);
+        assert!(line.message.contains(SYNC_OFFSET_SEMANTICS), "{line:?}");
+
+        let low = WorkerEvent::AudioSyncResult {
+            offset_frames: 0,
+            confidence: Some(AUDIO_SYNC_CONFIDENCE_FLOOR - 0.01),
+            offset_semantics: SYNC_OFFSET_SEMANTICS.to_string(),
+        };
+        assert_eq!(low.to_log_line().level, Level::Warn);
+
+        let unavailable = WorkerEvent::AudioSyncResult {
+            offset_frames: 0,
+            confidence: None,
+            offset_semantics: SYNC_OFFSET_SEMANTICS.to_string(),
+        };
+        assert_eq!(unavailable.to_log_line().level, Level::Warn);
+        assert!(
+            unavailable
+                .to_log_line()
+                .message
+                .contains("set the offset manually"),
+            "the unavailable line must direct a manual offset"
+        );
+    }
+
+    #[test]
+    fn manual_sync_set_roundtrips_and_projects_to_info() {
+        // MANU-02: a manual nudge carries Manual provenance (T-04.1-08) and the
+        // fixed semantics sentence.
+        let event = WorkerEvent::ManualSyncSet {
+            offset_frames: -7,
+            method: SyncMethod::Manual,
+            offset_semantics: SYNC_OFFSET_SEMANTICS.to_string(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(
+            json.contains("\"kind\":\"manual_sync_set\""),
+            "unexpected json: {json}"
+        );
+        assert!(
+            json.contains("\"method\":\"manual\""),
+            "the manual provenance must ride the payload: {json}"
+        );
+        assert_eq!(serde_json::from_str::<WorkerEvent>(&json).unwrap(), event);
+        let line = event.to_log_line();
+        assert_eq!(line.level, Level::Info);
+        assert!(line.message.contains(SYNC_OFFSET_SEMANTICS), "{line:?}");
     }
 }

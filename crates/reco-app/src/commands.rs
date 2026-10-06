@@ -621,6 +621,45 @@ pub async fn manual_exit(state: tauri::State<'_, WorkerHandle>) -> Result<(), Wo
     state.send(WorkerCommand::ManualExit)
 }
 
+/// Run the manual flow's audio auto-sync on the worker (MANU-02).
+///
+/// Thin, same contract as [`manual_begin`]: post `ManualDetectSync`; the worker
+/// extracts each clip's PCM, cross-correlates via the engine, and emits a typed
+/// `AudioSyncResult` (or an "unavailable" result with `confidence: None`). The
+/// command returns before the estimate lands — the webview mirrors the event,
+/// never the invocation.
+///
+/// # Errors
+///
+/// Returns [`WorkerError::ChannelClosed`] if the worker has already exited.
+#[tauri::command]
+pub async fn manual_detect_sync(state: tauri::State<'_, WorkerHandle>) -> Result<(), WorkerError> {
+    state.send(WorkerCommand::ManualDetectSync)
+}
+
+/// Set the manual sync offset in frames (MANU-02).
+///
+/// Thin, same contract as [`manual_begin`]: post `ManualSetSync`; the worker
+/// records the offset on the manual session with `SyncMethod::Manual`
+/// provenance and emits a typed `ManualSyncSet`. The offset feeds the later
+/// pin/bend solves.
+///
+/// # Why `rename_all = "snake_case"`
+///
+/// `offset_frames` is multi-word; the IPC key must stay snake_case to match the
+/// crate's protocol, or the handler silently never fires (`FRICTION.md` A7).
+///
+/// # Errors
+///
+/// Returns [`WorkerError::ChannelClosed`] if the worker has already exited.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn manual_set_sync(
+    state: tauri::State<'_, WorkerHandle>,
+    offset_frames: i64,
+) -> Result<(), WorkerError> {
+    state.send(WorkerCommand::ManualSetSync { offset_frames })
+}
+
 /// Cancel a running calibration (CALB-02 / D3-11).
 ///
 /// # The documented control-plane bypass
@@ -915,6 +954,24 @@ pub enum WorkerCommand {
     /// emits the session-ended state. It never touches an existing calibration
     /// profile, so exiting the flow is never a dead end.
     ManualExit,
+
+    /// Run the manual flow's audio auto-sync (MANU-02).
+    ///
+    /// The worker extracts each clip's PCM and cross-correlates via the engine,
+    /// then emits a typed `AudioSyncResult`. On failure it emits an
+    /// "unavailable" result (`confidence: None`, offset 0) rather than a
+    /// fabricated zero, so the UI can require an explicit manual offset.
+    ManualDetectSync,
+
+    /// Set the manual sync offset in frames (MANU-02).
+    ///
+    /// The worker records the offset on the open manual session with
+    /// `SyncMethod::Manual` provenance and emits a typed `ManualSyncSet`. That
+    /// offset is what the later pin/bend solves use.
+    ManualSetSync {
+        /// The operator-chosen offset in frames (signed).
+        offset_frames: i64,
+    },
 
     /// Stop the worker loop and return.
     Shutdown,
@@ -1390,11 +1447,20 @@ mod tests {
             .send(WorkerCommand::ManualSetFrame { frame: 34 })
             .unwrap();
         handle.send(WorkerCommand::ManualExit).unwrap();
+        handle.send(WorkerCommand::ManualDetectSync).unwrap();
+        handle
+            .send(WorkerCommand::ManualSetSync { offset_frames: -7 })
+            .unwrap();
         assert_eq!(rx.recv().unwrap(), WorkerCommand::ManualBegin { frame: 12 });
         assert_eq!(
             rx.recv().unwrap(),
             WorkerCommand::ManualSetFrame { frame: 34 }
         );
         assert_eq!(rx.recv().unwrap(), WorkerCommand::ManualExit);
+        assert_eq!(rx.recv().unwrap(), WorkerCommand::ManualDetectSync);
+        assert_eq!(
+            rx.recv().unwrap(),
+            WorkerCommand::ManualSetSync { offset_frames: -7 }
+        );
     }
 }

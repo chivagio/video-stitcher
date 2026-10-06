@@ -309,6 +309,24 @@ export type WorkerEventTyped =
       data: { side: ManualSide; rgba: number[]; width: number; height: number };
     }
   | { kind: "manual_solve_state"; data: { busy: boolean; stale: boolean } }
+  | {
+      kind: "audio_sync_result";
+      data: {
+        offset_frames: number;
+        confidence: number | null;
+        /** The fixed offset-semantics sentence (authored once in Rust). */
+        offset_semantics: string;
+      };
+    }
+  | {
+      kind: "manual_sync_set";
+      data: {
+        offset_frames: number;
+        method: SyncMethod;
+        /** The fixed offset-semantics sentence (authored once in Rust). */
+        offset_semantics: string;
+      };
+    }
   | { kind: "result_invalidated"; data: null }
   | { kind: "log"; data: LogLine }
   | { kind: "failed"; data: unknown };

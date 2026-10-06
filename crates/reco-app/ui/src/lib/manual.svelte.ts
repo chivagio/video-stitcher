@@ -17,12 +17,21 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import type { WorkerEventTyped } from "./types";
+import type { SyncMethod, WorkerEventTyped } from "./types";
 import { WORKER_EVENT_TYPED } from "./types";
 import { formatWorkerError } from "./errors";
 
 /** The locked 5-step flow order (UI-SPEC Copywriting Contract). */
 export type ManualStep = "time-align" | "frame" | "pin" | "bend" | "validate";
+
+/**
+ * The audio-sync confidence below which the estimate is treated as low
+ * (MANU-02). Mirrors the backend's `events::AUDIO_SYNC_CONFIDENCE_FLOOR`
+ * (itself the scorecard's Low band boundary, CALB-03): a low estimate renders
+ * the same "set the offset manually" gate as an absent one, with the numeric
+ * confidence still shown.
+ */
+export const AUDIO_CONFIDENCE_FLOOR = 0.5;
 
 /** The step order, single source for the nav and index math. */
 export const MANUAL_STEPS: ManualStep[] = [
@@ -66,6 +75,20 @@ class ManualStore {
   stale = $state(false);
   /** The last typed rejection, or null. */
   error = $state<string | null>(null);
+
+  /** The audio auto-sync confidence, or null when unavailable (MANU-02). */
+  audioConfidence = $state<number | null>(null);
+  /** The chosen temporal sync offset in frames (signed; 0 by default). */
+  syncOffset = $state(0);
+  /** Which sync path produced `syncOffset` (mirror `events::SyncMethod`). */
+  syncMethod = $state<SyncMethod>("none");
+  /** Whether the operator has confirmed the offset for this session. */
+  syncConfirmed = $state(false);
+  /**
+   * The fixed offset-semantics sentence, bound from the worker's typed event
+   * (`SYNC_OFFSET_SEMANTICS`). Never re-typed in a component (T-04.1-07).
+   */
+  offsetSemantics = $state("");
 
   /** Unlisten function for the typed worker-event listener. */
   #unlisten: (() => void) | null = null;
@@ -114,6 +137,25 @@ class ManualStore {
         this.stale = event.data.stale;
         break;
       }
+      case "audio_sync_result": {
+        const { offset_frames, confidence, offset_semantics } = event.data;
+        this.audioConfidence = confidence;
+        this.syncOffset = offset_frames;
+        // A confident estimate is the audio path; an absent one is "none". A
+        // manual nudge later overrides this with "manual".
+        this.syncMethod = confidence === null ? "none" : "audio";
+        this.offsetSemantics = offset_semantics;
+        // A fresh estimate invalidates any prior confirmation.
+        this.syncConfirmed = false;
+        break;
+      }
+      case "manual_sync_set": {
+        const { offset_frames, method, offset_semantics } = event.data;
+        this.syncOffset = offset_frames;
+        this.syncMethod = method;
+        this.offsetSemantics = offset_semantics;
+        break;
+      }
       case "failed": {
         if (this.open) {
           this.error = formatWorkerError(event.data);
@@ -138,11 +180,56 @@ class ManualStore {
     this.error = null;
     this.previewLeft = null;
     this.previewRight = null;
+    this.audioConfidence = null;
+    this.syncOffset = 0;
+    this.syncMethod = "none";
+    this.syncConfirmed = false;
     try {
       await invoke("manual_begin", { frame });
     } catch (e) {
       this.error = formatWorkerError(e);
     }
+  }
+
+  /**
+   * Run the audio auto-sync on entry to the Time-align step (MANU-02).
+   *
+   * Subscribes first (idempotent) so the typed `audio_sync_result` is never
+   * dropped, then posts `manual_detect_sync`. The worker mirrors the estimate
+   * back; this store never derives a confidence locally.
+   */
+  async detectSync(): Promise<void> {
+    await this.init();
+    this.audioConfidence = null;
+    this.syncConfirmed = false;
+    this.error = null;
+    try {
+      await invoke("manual_detect_sync");
+    } catch (e) {
+      this.error = formatWorkerError(e);
+    }
+  }
+
+  /**
+   * Record the operator's manual sync offset (MANU-02).
+   *
+   * Resets confirmation: a nudge is a new choice that must be re-confirmed
+   * before proceeding when the audio estimate is low or absent. The worker
+   * records `SyncMethod::Manual` provenance.
+   */
+  async setSync(offset: number): Promise<void> {
+    this.syncOffset = offset;
+    this.syncConfirmed = false;
+    try {
+      await invoke("manual_set_sync", { offset_frames: offset });
+    } catch (e) {
+      this.error = formatWorkerError(e);
+    }
+  }
+
+  /** Confirm the current offset, satisfying the low/no-confidence gate. */
+  confirmSync(): void {
+    this.syncConfirmed = true;
   }
 
   /** Change the reference frame (debounced by the caller if scrubbing). */
@@ -168,6 +255,11 @@ class ManualStore {
     this.solving = false;
     this.stale = false;
     this.error = null;
+    this.audioConfidence = null;
+    this.syncOffset = 0;
+    this.syncMethod = "none";
+    this.syncConfirmed = false;
+    this.offsetSemantics = "";
     try {
       await invoke("manual_exit");
     } catch {
@@ -196,6 +288,20 @@ class ManualStore {
   get stepIndex(): number {
     const idx = MANUAL_STEPS.indexOf(this.step);
     return idx < 0 ? 0 : idx;
+  }
+
+  /**
+   * Whether the offset must be explicitly confirmed before proceeding.
+   *
+   * True when the audio estimate is absent OR low — both render the same
+   * "set the offset manually" gate (MANU-02), with the numeric confidence
+   * still shown when present.
+   */
+  get syncGateRequired(): boolean {
+    return (
+      this.audioConfidence === null ||
+      this.audioConfidence < AUDIO_CONFIDENCE_FLOOR
+    );
   }
 }
 

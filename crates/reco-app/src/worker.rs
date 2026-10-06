@@ -367,6 +367,28 @@ impl EventSink {
     fn manual_solve_state(&self, busy: bool, stale: bool) {
         let _ = self.tx.send(WorkerEvent::ManualSolveState { busy, stale });
     }
+
+    /// Emit the manual flow's audio auto-sync estimate (MANU-02).
+    ///
+    /// `confidence: None` is the "unavailable" signal. The fixed semantics
+    /// sentence is attached from the single `SYNC_OFFSET_SEMANTICS` constant so
+    /// the webview binds the wording rather than re-typing it (T-04.1-07).
+    fn audio_sync_result(&self, offset_frames: i64, confidence: Option<f64>) {
+        let _ = self.tx.send(WorkerEvent::AudioSyncResult {
+            offset_frames,
+            confidence,
+            offset_semantics: crate::events::SYNC_OFFSET_SEMANTICS.to_string(),
+        });
+    }
+
+    /// Emit that the operator set the manual sync offset (MANU-02).
+    fn manual_sync_set(&self, offset_frames: i64, method: crate::events::SyncMethod) {
+        let _ = self.tx.send(WorkerEvent::ManualSyncSet {
+            offset_frames,
+            method,
+            offset_semantics: crate::events::SYNC_OFFSET_SEMANTICS.to_string(),
+        });
+    }
 }
 
 /// The array index for a camera role (`Left` = 0, `Right` = 1).
@@ -936,6 +958,27 @@ pub trait EngineBackend: Send {
     /// Close the manual session, dropping the retained planes (MANU-01).
     fn manual_exit(&mut self, events: &EventSink) -> Result<(), WorkerError>;
 
+    /// Run the manual flow's audio auto-sync and emit the estimate (MANU-02).
+    ///
+    /// Extracts each clip's PCM and cross-correlates via the engine
+    /// ([`reco_calibrate::video::detect_audio_sync`]); on failure emits an
+    /// "unavailable" `AudioSyncResult` (`confidence: None`, offset 0) rather
+    /// than a fabricated zero. Runs inline on the worker thread with an error
+    /// path, so the webview stays responsive (T-04.1-09).
+    fn manual_detect_sync(&mut self, events: &EventSink) -> Result<(), WorkerError>;
+
+    /// Record the operator's manual sync offset and emit `ManualSyncSet`
+    /// (MANU-02).
+    ///
+    /// The offset is carried on the manual session with
+    /// `SyncMethod::Manual` provenance; it is what the later pin/bend solves
+    /// use.
+    fn manual_set_sync(
+        &mut self,
+        offset_frames: i64,
+        events: &EventSink,
+    ) -> Result<(), WorkerError>;
+
     /// Begin a preview **session**: build/ensure the renderer, paint the idle
     /// frame, and start the transport, but do NOT run a frame loop.
     ///
@@ -1359,6 +1402,16 @@ fn handle_command<B: EngineBackend>(
                 events.failed(e);
             }
         }
+        WorkerCommand::ManualDetectSync => {
+            if let Err(e) = backend.manual_detect_sync(events) {
+                events.failed(e);
+            }
+        }
+        WorkerCommand::ManualSetSync { offset_frames } => {
+            if let Err(e) = backend.manual_set_sync(offset_frames, events) {
+                events.failed(e);
+            }
+        }
         WorkerCommand::Export => {
             interrupted.store(false, Ordering::SeqCst);
             match backend.export(events, interrupted) {
@@ -1628,6 +1681,16 @@ struct ManualSession {
     left_params: reco_core::calibration::CameraParams,
     /// Right camera intrinsics used for the preview.
     right_params: reco_core::calibration::CameraParams,
+    /// The chosen temporal sync offset in frames (MANU-02).
+    ///
+    /// Set by the manual nudge and carried on the session so the later pin/bend
+    /// solves pair frames on the operator's chosen offset.
+    sync_offset: i64,
+    /// Which sync path produced [`Self::sync_offset`] (MANU-02).
+    ///
+    /// `None` until the operator nudges; `Manual` afterwards — preserving the
+    /// CALB-06 provenance chain (IMU → audio → manual).
+    sync_method: crate::events::SyncMethod,
 }
 
 /// The engine objects exclusively owned by the worker thread (FOUND-03).
@@ -2698,6 +2761,10 @@ impl EngineBackend for GpuEngineBackend {
             right_frame,
             left_params,
             right_params,
+            // The offset starts at 0 with no provenance until the operator
+            // confirms a nudge (MANU-02).
+            sync_offset: 0,
+            sync_method: crate::events::SyncMethod::None,
         });
         events.manual_session_started(frame, probe.fps, frames_total);
         self.render_manual_preview(events)?;
@@ -2742,6 +2809,66 @@ impl EngineBackend for GpuEngineBackend {
         self.manual = None;
         events.info("manual calibration session ended");
         events.manual_solve_state(false, false);
+        Ok(())
+    }
+
+    fn manual_detect_sync(&mut self, events: &EventSink) -> Result<(), WorkerError> {
+        // The flow is always reachable: detect from the operator's clips when
+        // both are set, else the startup clips (MANU-01).
+        let (left_path, right_path) = self.manual_frame_paths()?;
+        const SAMPLE_RATE: u32 = 44100;
+        // Runs inline on the worker thread (T-04.1-09); the webview never
+        // blocks on it. The engine distinguishes "unavailable" with a typed
+        // error, which becomes a `confidence: None` result — never a fabricated
+        // zero (MANU-02).
+        match reco_calibrate::video::detect_audio_sync(
+            std::path::Path::new(&left_path),
+            std::path::Path::new(&right_path),
+            SAMPLE_RATE,
+        ) {
+            Ok(estimate) => {
+                // Carry the accepted estimate on the session with Audio
+                // provenance, so proceeding without a nudge still uses the
+                // engine's offset (must-have: the chosen offset feeds the later
+                // solves). A nudge overrides this with Manual provenance.
+                if let Some(session) = self.manual.as_mut() {
+                    session.sync_offset = estimate.offset_frames;
+                    session.sync_method = crate::events::SyncMethod::Audio;
+                }
+                events.audio_sync_result(estimate.offset_frames, Some(estimate.confidence));
+            }
+            Err(e) => {
+                // "Unavailable": reset the session offset to 0 and record no
+                // provenance; the UI requires an explicit manual offset.
+                if let Some(session) = self.manual.as_mut() {
+                    session.sync_offset = 0;
+                    session.sync_method = crate::events::SyncMethod::None;
+                }
+                log::warn!("manual audio sync unavailable: {e}");
+                events.audio_sync_result(0, None);
+            }
+        }
+        Ok(())
+    }
+
+    fn manual_set_sync(
+        &mut self,
+        offset_frames: i64,
+        events: &EventSink,
+    ) -> Result<(), WorkerError> {
+        // Record Manual provenance on the session so the later pin/bend solves
+        // use the operator's offset (MANU-02). A missing session is not fatal:
+        // the offset still crosses to the UI, and beginning a session resets it.
+        if let Some(session) = self.manual.as_mut() {
+            session.sync_offset = offset_frames;
+            session.sync_method = crate::events::SyncMethod::Manual;
+            log::info!(
+                "manual sync offset {} frames recorded on the session ({:?})",
+                session.sync_offset,
+                session.sync_method,
+            );
+        }
+        events.manual_sync_set(offset_frames, crate::events::SyncMethod::Manual);
         Ok(())
     }
 
@@ -4318,6 +4445,24 @@ mod tests {
             Ok(())
         }
 
+        fn manual_detect_sync(&mut self, events: &EventSink) -> Result<(), WorkerError> {
+            self.record("manual_detect_sync");
+            // Mirror the real backend's protocol without a GPU or a file: a
+            // confident estimate crosses as a typed result.
+            events.audio_sync_result(3, Some(0.9));
+            Ok(())
+        }
+
+        fn manual_set_sync(
+            &mut self,
+            offset_frames: i64,
+            events: &EventSink,
+        ) -> Result<(), WorkerError> {
+            self.record("manual_set_sync");
+            events.manual_sync_set(offset_frames, crate::events::SyncMethod::Manual);
+            Ok(())
+        }
+
         fn begin_preview(&mut self, events: &EventSink) -> Result<(), WorkerError> {
             self.record("begin_preview");
             // Mirror the real backend exactly: the session transport is built
@@ -4884,6 +5029,50 @@ mod tests {
             )),
             "manual_exit must emit the reset solve state"
         );
+    }
+
+    #[test]
+    fn manual_sync_commands_emit_typed_results_and_provenance() {
+        // MANU-02: the audio detect crosses as a typed estimate carrying the
+        // fixed semantics, and a manual nudge crosses with Manual provenance.
+        let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (worker, events) = EngineWorker::spawn(MockBackend::new(Arc::clone(&ops)));
+        let handle = worker.handle();
+        handle.send(WorkerCommand::ManualDetectSync).unwrap();
+        handle
+            .send(WorkerCommand::ManualSetSync { offset_frames: -4 })
+            .unwrap();
+        handle.send(WorkerCommand::Shutdown).unwrap();
+
+        let seen = drain_until_shutdown(&events);
+        let estimate = seen
+            .iter()
+            .find_map(|e| match e {
+                WorkerEvent::AudioSyncResult {
+                    offset_frames,
+                    confidence,
+                    offset_semantics,
+                } => Some((*offset_frames, *confidence, offset_semantics.clone())),
+                _ => None,
+            })
+            .expect("ManualDetectSync must emit an AudioSyncResult");
+        assert_eq!(estimate.0, 3);
+        assert_eq!(estimate.1, Some(0.9));
+        assert_eq!(estimate.2, crate::events::SYNC_OFFSET_SEMANTICS);
+
+        let set = seen
+            .iter()
+            .find_map(|e| match e {
+                WorkerEvent::ManualSyncSet {
+                    offset_frames,
+                    method,
+                    ..
+                } => Some((*offset_frames, *method)),
+                _ => None,
+            })
+            .expect("ManualSetSync must emit a ManualSyncSet");
+        assert_eq!(set.0, -4);
+        assert_eq!(set.1, crate::events::SyncMethod::Manual);
     }
 
     #[test]

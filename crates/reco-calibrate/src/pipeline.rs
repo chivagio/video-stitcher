@@ -301,6 +301,21 @@ impl CalibrationPipeline {
         self.sync_offset_frames
     }
 
+    /// The confidence reported by the sync path, when it reports one (CALB-03).
+    ///
+    /// `None` for IMU and manual paths — never a fabricated number. The manual
+    /// flow's audio-sync estimate ([`crate::video::detect_audio_sync`]) reads
+    /// this after [`Self::audio_sync`] so the confidence crosses as a typed
+    /// value rather than being recomputed by a second correlation.
+    pub fn sync_confidence(&self) -> Option<f64> {
+        self.sync_confidence
+    }
+
+    /// Which sync path produced the current offset (CALB-03).
+    pub fn sync_method(&self) -> SyncMethod {
+        self.sync_method
+    }
+
     /// Estimate sync offset and rotation seeds from IMU telemetry.
     ///
     /// Reads gyroscope data from both video files and cross-correlates

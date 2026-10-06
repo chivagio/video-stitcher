@@ -89,6 +89,8 @@ fn main() -> anyhow::Result<()> {
             commands::manual_begin,
             commands::manual_set_frame,
             commands::manual_exit,
+            commands::manual_detect_sync,
+            commands::manual_set_sync,
             commands::cancel_calibration
         ])
         .setup(|app| {
