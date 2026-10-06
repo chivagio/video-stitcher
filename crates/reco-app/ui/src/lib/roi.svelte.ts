@@ -179,12 +179,32 @@ class FieldRoiStore {
     this.#edited();
   }
 
-  /** Translate the whole active polygon by a normalized delta. */
+  /**
+   * Translate the whole active polygon by a normalized delta.
+   *
+   * The delta is clamped to the largest translation that keeps every vertex in
+   * `[0,1]`, and that same delta is applied to all vertices. Clamping each
+   * vertex independently would squash and skew the polygon at a frame edge
+   * instead of moving it rigidly (WR-05).
+   */
   movePolygon(dx: number, dy: number): void {
-    const verts = this.active.map(
-      ([x, y]) => [clamp01(x + dx), clamp01(y + dy)] as Vertex,
+    const verts = this.active;
+    if (verts.length === 0) return;
+    let minDx = -Infinity;
+    let maxDx = Infinity;
+    let minDy = -Infinity;
+    let maxDy = Infinity;
+    for (const [x, y] of verts) {
+      minDx = Math.max(minDx, -x);
+      maxDx = Math.min(maxDx, 1 - x);
+      minDy = Math.max(minDy, -y);
+      maxDy = Math.min(maxDy, 1 - y);
+    }
+    const stepX = Number.isFinite(dx) ? Math.min(maxDx, Math.max(minDx, dx)) : 0;
+    const stepY = Number.isFinite(dy) ? Math.min(maxDy, Math.max(minDy, dy)) : 0;
+    this.#setActive(
+      verts.map(([x, y]) => [clamp01(x + stepX), clamp01(y + stepY)] as Vertex),
     );
-    this.#setActive(verts);
     this.#edited();
   }
 
