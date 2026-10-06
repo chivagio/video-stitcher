@@ -79,15 +79,109 @@ export interface InputMetadata {
   codec: MetadataField;
 }
 
+/** Which advisory compatibility check failed (mirror `events::CompatibilityCode`). */
+export type CompatibilityCode =
+  | "resolution_mismatch"
+  | "aspect_mismatch"
+  | "fps_mismatch"
+  | "codec_mismatch"
+  | "lens_resolution_mismatch"
+  | "same_file";
+
+/** One advisory compatibility finding (mirror `events::CompatibilityIssue`). */
+export interface CompatibilityIssue {
+  code: CompatibilityCode;
+  message: string;
+}
+
+/** One lens-profile candidate for the override dropdown (mirror `events::LensCandidate`). */
+export interface LensCandidate {
+  camera: string;
+  lens: string;
+  width: number;
+  height: number;
+}
+
+/** Host mirror of the engine's seven calibration steps (mirror `events::CalibrationStage`). */
+export type CalibrationStage =
+  | "probing"
+  | "detecting_profiles"
+  | "audio_sync"
+  | "extracting_frames"
+  | "undistorting"
+  | "feature_matching"
+  | "optimizing";
+
+/** Status of one row in the stage checklist (mirror `events::StageStatus`). */
+export type StageStatus = "pending" | "active" | "done" | "failed" | "skipped";
+
+/** Which path produced a calibration's temporal offset (mirror `events::SyncMethod`). */
+export type SyncMethod = "imu" | "audio" | "manual" | "none";
+
+/** Confidence band word for the scorecard (mirror `events::ConfidenceBand`). */
+export type ConfidenceBand = "high" | "medium" | "low";
+
+/** The resolved lens profile and its source (mirror `events::LensProfileView`). */
+export interface LensProfileView {
+  name: string;
+  source: string;
+}
+
+/** The sync method and its confidence, if any (mirror `events::SyncView`). */
+export interface SyncView {
+  method: SyncMethod;
+  confidence: number | null;
+}
+
+/** The CALB-03 scorecard (mirror `events::Scorecard`). */
+export interface Scorecard {
+  confidence: number;
+  confidence_band: ConfidenceBand;
+  residual_error: number;
+  total_matches: number;
+  per_frame_matches: number;
+  frames_used: number;
+  lens_profile: LensProfileView | null;
+  sync: SyncView;
+}
+
+/** Advanced calibration options (mirror `events::CalibrationOptions`). */
+export interface CalibrationOptions {
+  num_frames: number | null;
+  skip_start_secs: number | null;
+  skip_end_secs: number | null;
+  use_imu_rotation_seeds: boolean | null;
+}
+
 /**
  * The subset of the typed `WorkerEvent` union this phase consumes.
  *
  * Serde shape is internally tagged: `{ kind, data }`. The import store reads
- * `import_metadata`; the union stays open so later calibration variants can be
- * added without a parallel vocabulary.
+ * `import_metadata`; the calibration store reads the calibration/profile
+ * variants. The union stays open so later variants can be added without a
+ * parallel vocabulary.
  */
 export type WorkerEventTyped =
   | { kind: "import_metadata"; data: { role: InputRole; metadata: InputMetadata } }
+  | { kind: "compatibility"; data: { issues: CompatibilityIssue[] } }
+  | { kind: "lens_candidates"; data: { role: InputRole; candidates: LensCandidate[] } }
+  | {
+      kind: "lens_override_applied";
+      data: { role: InputRole; candidate: LensCandidate | null };
+    }
+  | {
+      kind: "calibration_stage";
+      data: { step: CalibrationStage; status: StageStatus; detail: string };
+    }
+  | { kind: "calibration_progress"; data: { fraction: number } }
+  | {
+      kind: "calibration_heartbeat";
+      data: { elapsed_ms: number; step: CalibrationStage; last_detail: string };
+    }
+  | { kind: "calibration_result"; data: { scorecard: Scorecard } }
+  | { kind: "profile_loaded"; data: { path: string } }
+  | { kind: "profile_saved"; data: { path: string } }
+  | { kind: "result_invalidated"; data: null }
   | { kind: "log"; data: LogLine }
   | { kind: "failed"; data: unknown };
 

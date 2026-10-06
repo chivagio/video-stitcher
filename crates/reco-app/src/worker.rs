@@ -86,6 +86,14 @@ pub use crate::events::{Level, WorkerError, WorkerEvent};
 /// `Channel<Response>` to the worker.
 pub struct ReadbackSender(pub Sender<tauri::ipc::Channel<tauri::ipc::Response>>);
 
+/// The shared calibration-cancel flag, managed as Tauri app state (CALB-02).
+///
+/// `cancel_calibration` writes `true` into this flag directly (the documented
+/// control-plane bypass of the blocked command channel); `GpuEngineBackend`
+/// holds a clone and passes it to `calibrate_videos_with_gpu`, which polls it
+/// between steps. Reset to `false` at the start of every calibration run.
+pub struct CalibrationCancel(pub Arc<AtomicBool>);
+
 /// The webview readback channel type (raw frame bytes as an `ArrayBuffer`).
 pub type ReadbackChannel = tauri::ipc::Channel<tauri::ipc::Response>;
 
@@ -183,6 +191,16 @@ impl EventSink {
     /// `worker-event-typed` and never regex-parses a log line (FRICTION A3/A12).
     fn metadata(&self, role: crate::events::InputRole, metadata: crate::events::InputMetadata) {
         let _ = self.tx.send(WorkerEvent::ImportMetadata { role, metadata });
+    }
+
+    /// Clone the underlying event sender.
+    ///
+    /// Used by the calibration heartbeat monitor thread, which must emit
+    /// `CalibrationHeartbeat` ticks while the worker thread is blocked inside
+    /// `calibrate_videos_with_gpu` (D3-10). `Sender` is `Clone + Send`, so the
+    /// thread can own one independently of the worker.
+    fn sender_clone(&self) -> Sender<WorkerEvent> {
+        self.tx.clone()
     }
 }
 
@@ -760,6 +778,21 @@ fn handle_command<B: EngineBackend>(
                 events.failed(e);
             }
         }
+        // The calibration vocabulary lands in Task 3 of this plan; until the
+        // backend methods exist these commands are rejected with a typed error
+        // rather than silently dropped (they are never reachable from the UI
+        // before the wizard ships). Task 3 replaces each arm with the real call.
+        WorkerCommand::ClearInput { .. }
+        | WorkerCommand::LensCandidates { .. }
+        | WorkerCommand::SetLensOverride { .. }
+        | WorkerCommand::ClearLensOverride { .. }
+        | WorkerCommand::StartCalibration { .. }
+        | WorkerCommand::LoadProfile { .. }
+        | WorkerCommand::SaveProfile { .. } => {
+            events.failed(WorkerError::Unsupported {
+                operation: "calibration commands are not wired yet".to_string(),
+            });
+        }
         WorkerCommand::Export => {
             interrupted.store(false, Ordering::SeqCst);
             match backend.export(events, interrupted) {
@@ -1120,6 +1153,10 @@ pub struct GpuEngineBackend {
     /// retries `MAX_RECOVERY_ATTEMPTS` times internally). Diagnostic only — the
     /// flag is cleared on give-up so the loop cannot spin.
     recovery_attempts: u32,
+    /// The shared calibration-cancel flag (CALB-02 / D3-11). A clone of the
+    /// [`CalibrationCancel`] managed in Tauri state; `calibrate` passes it to
+    /// `calibrate_videos_with_gpu`, which polls it between steps.
+    calibration_cancel: Arc<AtomicBool>,
     /// The single GPU device owner (FOUND-03). Declared **last** so it drops
     /// after the decode source, renderer, and presenter surface — the documented
     /// teardown order (FOUND-06 / RESEARCH Pattern 6). Actually field 1 held the
@@ -1145,6 +1182,7 @@ impl GpuEngineBackend {
         presenters: PresenterChain,
         viewport: crate::presenter::ViewportRect,
         startup_fallback: Option<String>,
+        calibration_cancel: Arc<AtomicBool>,
     ) -> Result<Self, WorkerError> {
         // The presenter chain (PREV-05), strongest-first, pre-built on the setup
         // thread. Index each presenter into its fixed chain slot; the first entry
@@ -1243,6 +1281,7 @@ impl GpuEngineBackend {
             adapter,
             device_lost,
             recovery_attempts: 0,
+            calibration_cancel,
             renderer: None,
             renderer_input: None,
         })
@@ -2356,8 +2395,10 @@ pub fn spawn_gpu_worker(
     presenters: PresenterChain,
     viewport: crate::presenter::ViewportRect,
     startup_fallback: Option<String>,
+    calibration_cancel: Arc<AtomicBool>,
 ) -> Result<SpawnedWorker, WorkerError> {
-    let backend = GpuEngineBackend::new(instance, presenters, viewport, startup_fallback)?;
+    let backend =
+        GpuEngineBackend::new(instance, presenters, viewport, startup_fallback, calibration_cancel)?;
     let readback_tx = backend.readback_sender();
     let (worker, events) = EngineWorker::spawn(backend);
     Ok((worker, events, readback_tx))

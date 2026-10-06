@@ -142,6 +142,183 @@ pub struct InputMetadata {
     pub codec: MetadataField,
 }
 
+/// Which advisory compatibility check failed (IMPT-03 / D3-06).
+///
+/// The checks are deliberately **advisory**: the operator may know the clips
+/// better than the heuristic, so a finding is reported as a non-blocking warning,
+/// never a hard block (D3-05).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompatibilityCode {
+    /// The two clips have different frame resolutions.
+    ResolutionMismatch,
+    /// The two clips have different aspect ratios (tolerance ~1%).
+    AspectMismatch,
+    /// The two clips' frame rates differ by more than 0.5 fps.
+    FpsMismatch,
+    /// The two clips use different codecs.
+    CodecMismatch,
+    /// A lens override's resolution does not match the input's.
+    LensResolutionMismatch,
+    /// Both slots point at the same file.
+    SameFile,
+}
+
+/// One advisory compatibility finding (IMPT-03).
+///
+/// `message` is already user-facing: the webview renders it verbatim and never
+/// invents a cause.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CompatibilityIssue {
+    /// Which check failed.
+    pub code: CompatibilityCode,
+    /// Human-readable reason.
+    pub message: String,
+}
+
+/// One lens-profile candidate for the override dropdown (IMPT-04 / D3-07).
+///
+/// Mirrors `reco_calibrate::types::LensProfileSummary` so the frontend never
+/// depends on an engine type directly.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct LensCandidate {
+    /// Camera brand/model, e.g. "GoPro HERO10".
+    pub camera: String,
+    /// Lens mode, e.g. "Wide".
+    pub lens: String,
+    /// Profile calibration width in pixels.
+    pub width: u32,
+    /// Profile calibration height in pixels.
+    pub height: u32,
+}
+
+/// Host mirror of the engine's seven calibration steps (CALB-01 / D3-09).
+///
+/// The wizard's stage checklist is driven directly by these — the UI never
+/// derives stage state locally (UI-SPEC Interaction rule 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CalibrationStage {
+    /// Probing video metadata.
+    Probing,
+    /// Detecting lens profiles (telemetry parse + database lookup).
+    DetectingProfiles,
+    /// Detecting the temporal sync offset.
+    AudioSync,
+    /// Extracting video frames.
+    ExtractingFrames,
+    /// Correcting lens distortion.
+    Undistorting,
+    /// Matching features between cameras.
+    FeatureMatching,
+    /// Optimizing camera parameters.
+    Optimizing,
+}
+
+/// Status of one row in the stage checklist (CALB-01).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StageStatus {
+    /// Not started yet.
+    Pending,
+    /// Currently running.
+    Active,
+    /// Finished successfully.
+    Done,
+    /// Failed.
+    Failed,
+    /// Skipped.
+    Skipped,
+}
+
+/// Which path produced a calibration's temporal offset (CALB-03 / D3-14).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncMethod {
+    /// IMU/gyroscope telemetry.
+    Imu,
+    /// Audio cross-correlation.
+    Audio,
+    /// Operator-set manual offset.
+    Manual,
+    /// No sync ran.
+    None,
+}
+
+/// Confidence band word for the scorecard (CALB-03).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfidenceBand {
+    /// Confidence >= 0.8.
+    High,
+    /// Confidence >= 0.5.
+    Medium,
+    /// Confidence < 0.5.
+    Low,
+}
+
+/// The resolved lens profile and its source (CALB-03 / D3-13).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct LensProfileView {
+    /// Human-readable profile name, e.g. "GoPro HERO10 Wide".
+    pub name: String,
+    /// Human-readable source, e.g. "database" / "auto-detected".
+    pub source: String,
+}
+
+/// The sync method and its confidence, if any (CALB-03).
+///
+/// IMU/manual paths report `confidence: None` — never a fabricated number.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SyncView {
+    /// Which sync path ran.
+    pub method: SyncMethod,
+    /// Confidence of the estimate, when the path reports one.
+    pub confidence: Option<f64>,
+}
+
+/// The CALB-03 scorecard — exactly the locked field set, no invented metrics.
+///
+/// Projected from a `CalibrationResult` by `calibration::project_scorecard`;
+/// every field maps to a real engine value. A missing value is `None`, never a
+/// fabricated zero (UI-SPEC Result Scorecard Contract).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Scorecard {
+    /// Calibration confidence (0.0-1.0).
+    pub confidence: f64,
+    /// Confidence band word.
+    pub confidence_band: ConfidenceBand,
+    /// Residual seam-weighted reprojection error.
+    pub residual_error: f64,
+    /// Total matched point pairs across all frames.
+    pub total_matches: u64,
+    /// Average matches per frame used (0 when no frames were used).
+    pub per_frame_matches: f64,
+    /// Number of frame pairs that produced usable matches.
+    pub frames_used: u64,
+    /// Resolved lens profile and source, if any.
+    pub lens_profile: Option<LensProfileView>,
+    /// Sync method and confidence.
+    pub sync: SyncView,
+}
+
+/// Advanced calibration options exposed by the wizard (D3-12).
+///
+/// Every field is optional: `None` means "use the engine default". Only the
+/// four locked advanced fields are exposed; raw AKAZE/match/optimizer
+/// thresholds stay hidden.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CalibrationOptions {
+    /// Number of frame pairs to sample.
+    pub num_frames: Option<usize>,
+    /// Seconds to skip from the start.
+    pub skip_start_secs: Option<f64>,
+    /// Seconds to skip from the end.
+    pub skip_end_secs: Option<f64>,
+    /// Whether to seed the optimizer from IMU differential rotation.
+    pub use_imu_rotation_seeds: Option<bool>,
+}
+
 /// An event emitted by the engine worker and rendered in the webview log pane.
 ///
 /// `Clone + Send + 'static` so it can cross the worker→UI channel; the
@@ -246,6 +423,86 @@ pub enum WorkerEvent {
         /// The per-field metadata with provenance.
         metadata: InputMetadata,
     },
+
+    /// Advisory compatibility findings for the two selected inputs (IMPT-03).
+    ///
+    /// Emitted after every input change; an empty list means all checks passed.
+    /// Non-blocking by design (D3-05).
+    Compatibility {
+        /// The findings; empty when every check passed.
+        issues: Vec<CompatibilityIssue>,
+    },
+
+    /// Lens-profile candidates for one input's override dropdown (IMPT-04).
+    LensCandidates {
+        /// Which input the candidates are for.
+        role: InputRole,
+        /// The plausible profiles for that input's resolution.
+        candidates: Vec<LensCandidate>,
+    },
+
+    /// The lens override now applied to one input (IMPT-04 / D3-08).
+    ///
+    /// `candidate: None` means the override was cleared back to auto-detect.
+    LensOverrideApplied {
+        /// Which input the override applies to.
+        role: InputRole,
+        /// The applied override, or `None` when cleared.
+        candidate: Option<LensCandidate>,
+    },
+
+    /// One row of the stage checklist changed state (CALB-01).
+    CalibrationStage {
+        /// Which stage changed.
+        step: CalibrationStage,
+        /// Its new status.
+        status: StageStatus,
+        /// Human-readable detail for the row.
+        detail: String,
+    },
+
+    /// Overall calibration progress, 0.0-1.0 (CALB-01).
+    CalibrationProgress {
+        /// Fraction complete.
+        fraction: f64,
+    },
+
+    /// A heartbeat tick so a silent stage never looks stuck (CALB-01 / D3-10).
+    ///
+    /// Emitted on a monitor thread every ~500 ms, even while the engine is
+    /// silent inside a stage.
+    CalibrationHeartbeat {
+        /// Milliseconds since calibration started.
+        elapsed_ms: u64,
+        /// The stage that was active when the tick fired.
+        step: CalibrationStage,
+        /// The last detail string the engine reported.
+        last_detail: String,
+    },
+
+    /// The completed calibration's scorecard (CALB-03).
+    CalibrationResult {
+        /// The projected CALB-03 field set.
+        scorecard: Scorecard,
+    },
+
+    /// A profile was loaded from disk (IMPT-05).
+    ProfileLoaded {
+        /// The path that was loaded.
+        path: String,
+    },
+
+    /// A profile was saved to disk (IMPT-06).
+    ProfileSaved {
+        /// The path that was written.
+        path: String,
+    },
+
+    /// The current result no longer matches the inputs or profile (D3-08).
+    ///
+    /// Emitted when an input or lens override changes after a run/load, so the
+    /// scorecard never claims to reflect a profile it did not use.
+    ResultInvalidated,
 }
 
 /// The UI-facing shape of an event-log line (UI-SPEC Event Log Contract).
@@ -362,6 +619,77 @@ impl WorkerEvent {
                     metadata.resolution.value.as_deref().unwrap_or("—"),
                 ),
             },
+            // Compatibility findings are a WARN narrative (UI-SPEC Event Log
+            // Contract); the structured list rides the typed channel.
+            WorkerEvent::Compatibility { issues } => LogLine {
+                level: Level::Warn,
+                message: match issues.first() {
+                    Some(first) => format!(
+                        "compatibility: {} issue(s) found — {}",
+                        issues.len(),
+                        first.message
+                    ),
+                    None => "compatibility: all checks passed".to_string(),
+                },
+            },
+            WorkerEvent::LensCandidates { role, candidates } => LogLine {
+                level: Level::Info,
+                message: format!(
+                    "lens candidates: {} for {}",
+                    candidates.len(),
+                    role.name()
+                ),
+            },
+            WorkerEvent::LensOverrideApplied { role, candidate } => LogLine {
+                level: Level::Info,
+                message: match candidate {
+                    Some(c) => {
+                        format!("lens override: {} -> {} {}", role.name(), c.camera, c.lens)
+                    }
+                    None => format!("lens override cleared: {}", role.name()),
+                },
+            },
+            WorkerEvent::CalibrationStage {
+                step,
+                status,
+                detail,
+            } => LogLine {
+                level: Level::Info,
+                message: format!("calibration stage: {step:?} {status:?} — {detail}"),
+            },
+            WorkerEvent::CalibrationProgress { fraction } => LogLine {
+                level: Level::Info,
+                message: format!("calibration progress: {:.0}%", fraction * 100.0),
+            },
+            WorkerEvent::CalibrationHeartbeat {
+                elapsed_ms,
+                step,
+                last_detail,
+            } => LogLine {
+                level: Level::Info,
+                message: format!(
+                    "calibration heartbeat: {elapsed_ms} ms in {step:?} — {last_detail}"
+                ),
+            },
+            WorkerEvent::CalibrationResult { scorecard } => LogLine {
+                level: Level::Info,
+                message: format!(
+                    "calibration result: confidence {:.0}%",
+                    scorecard.confidence * 100.0
+                ),
+            },
+            WorkerEvent::ProfileLoaded { path } => LogLine {
+                level: Level::Info,
+                message: format!("profile loaded: {path}"),
+            },
+            WorkerEvent::ProfileSaved { path } => LogLine {
+                level: Level::Info,
+                message: format!("profile saved: {path}"),
+            },
+            WorkerEvent::ResultInvalidated => LogLine {
+                level: Level::Warn,
+                message: "result invalidated — inputs changed; re-run calibration".to_string(),
+            },
         }
     }
 }
@@ -406,6 +734,17 @@ pub enum WorkerError {
     /// The worker was already shutting down and refuses new work.
     #[error("the engine worker is shutting down")]
     ShuttingDown,
+
+    /// Loading a calibration profile failed (IMPT-05).
+    ///
+    /// The inner message is the typed load error's `Display` text (size cap,
+    /// parse, or validation failure) — never a fabricated cause.
+    #[error("cannot load profile: {0}")]
+    ProfileLoad(String),
+
+    /// Saving a calibration profile failed (IMPT-06).
+    #[error("cannot save profile: {0}")]
+    ProfileSave(String),
 
     /// The worker thread's command channel is closed (the worker has exited).
     #[error("the engine worker is no longer running")]
@@ -794,5 +1133,91 @@ mod tests {
             "an unknown value must render as an em-dash, never 0"
         );
         assert!(!event.to_log_line().message.contains('0'));
+    }
+
+    #[test]
+    fn scorecard_roundtrips_through_serde() {
+        let scorecard = Scorecard {
+            confidence: 0.87,
+            confidence_band: ConfidenceBand::High,
+            residual_error: 0.42,
+            total_matches: 1234,
+            per_frame_matches: 411.33,
+            frames_used: 3,
+            lens_profile: Some(LensProfileView {
+                name: "GoPro HERO10 Wide".to_string(),
+                source: "database".to_string(),
+            }),
+            sync: SyncView {
+                method: SyncMethod::Imu,
+                confidence: None,
+            },
+        };
+        let json = serde_json::to_string(&scorecard).unwrap();
+        assert!(
+            json.contains("\"confidence_band\":\"high\""),
+            "unexpected json: {json}"
+        );
+        assert!(
+            json.contains("\"method\":\"imu\""),
+            "unexpected json: {json}"
+        );
+        assert!(
+            json.contains("\"confidence\":null"),
+            "an absent sync confidence must serialize as null, not a fabricated number: {json}"
+        );
+        let back: Scorecard = serde_json::from_str(&json).unwrap();
+        assert_eq!(scorecard, back);
+    }
+
+    #[test]
+    fn compatibility_issue_roundtrips_through_serde() {
+        let issue = CompatibilityIssue {
+            code: CompatibilityCode::ResolutionMismatch,
+            message: "Camera A is 1920×1080 but Camera B is 3840×2160".to_string(),
+        };
+        let json = serde_json::to_string(&issue).unwrap();
+        assert!(
+            json.contains("\"code\":\"resolution_mismatch\""),
+            "unexpected json: {json}"
+        );
+        let back: CompatibilityIssue = serde_json::from_str(&json).unwrap();
+        assert_eq!(issue, back);
+    }
+
+    #[test]
+    fn calibration_event_variants_roundtrip_and_project() {
+        let stage = WorkerEvent::CalibrationStage {
+            step: CalibrationStage::DetectingProfiles,
+            status: StageStatus::Active,
+            detail: "Detecting lens profiles".to_string(),
+        };
+        let json = serde_json::to_string(&stage).unwrap();
+        assert!(
+            json.contains("\"kind\":\"calibration_stage\""),
+            "unexpected json: {json}"
+        );
+        assert!(
+            json.contains("\"step\":\"detecting_profiles\""),
+            "unexpected json: {json}"
+        );
+        let back: WorkerEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(stage, back);
+        assert_eq!(stage.to_log_line().level, Level::Info);
+
+        // Compatibility findings are a WARN narrative.
+        let compat = WorkerEvent::Compatibility {
+            issues: vec![CompatibilityIssue {
+                code: CompatibilityCode::FpsMismatch,
+                message: "fps differ".to_string(),
+            }],
+        };
+        assert_eq!(compat.to_log_line().level, Level::Warn);
+
+        // Result invalidation is a WARN.
+        assert_eq!(
+            WorkerEvent::ResultInvalidated.to_log_line().level,
+            Level::Warn
+        );
     }
 }

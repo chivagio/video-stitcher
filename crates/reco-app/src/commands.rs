@@ -314,6 +314,212 @@ pub async fn set_input(
     state.send(WorkerCommand::SetInput { role, path })
 }
 
+/// Clear one camera input slot (IMPT-01).
+///
+/// Thin: post `ClearInput`; the worker clears the slot, recomputes
+/// compatibility, and invalidates any existing result.
+///
+/// # Errors
+///
+/// Returns [`WorkerError::ChannelClosed`] if the worker has already exited.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn clear_input(
+    state: tauri::State<'_, WorkerHandle>,
+    role: crate::events::InputRole,
+) -> Result<(), WorkerError> {
+    state.send(WorkerCommand::ClearInput { role })
+}
+
+/// Request the lens-profile candidates for one input (IMPT-04 / D3-07).
+///
+/// Thin: post `LensCandidates`; the worker queries the embedded `LensDatabase`
+/// and emits a typed `LensCandidates` event.
+///
+/// # Errors
+///
+/// Returns [`WorkerError::ChannelClosed`] if the worker has already exited.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn lens_candidates(
+    state: tauri::State<'_, WorkerHandle>,
+    role: crate::events::InputRole,
+) -> Result<(), WorkerError> {
+    state.send(WorkerCommand::LensCandidates { role })
+}
+
+/// Apply a lens-profile override to one input (IMPT-04 / D3-08).
+///
+/// Thin: post `SetLensOverride`; the worker resolves the candidate to
+/// `CameraParams`, stores it, and invalidates any existing result.
+///
+/// # Errors
+///
+/// Returns [`WorkerError::ChannelClosed`] if the worker has already exited.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn set_lens_override(
+    state: tauri::State<'_, WorkerHandle>,
+    role: crate::events::InputRole,
+    candidate: crate::events::LensCandidate,
+) -> Result<(), WorkerError> {
+    state.send(WorkerCommand::SetLensOverride { role, candidate })
+}
+
+/// Clear a lens-profile override, returning the input to auto-detect (IMPT-04).
+///
+/// Thin: post `ClearLensOverride`.
+///
+/// # Errors
+///
+/// Returns [`WorkerError::ChannelClosed`] if the worker has already exited.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn clear_lens_override(
+    state: tauri::State<'_, WorkerHandle>,
+    role: crate::events::InputRole,
+) -> Result<(), WorkerError> {
+    state.send(WorkerCommand::ClearLensOverride { role })
+}
+
+/// Validate the advanced calibration options at the command boundary (T-03-07).
+///
+/// Only the four locked advanced fields are accepted; `num_frames` is capped
+/// and the skip seconds must be finite and non-negative. Extracted as a pure
+/// function so the boundary check is unit-testable without a Tauri `State`.
+fn validate_options(options: &crate::events::CalibrationOptions) -> Result<(), WorkerError> {
+    /// Upper bound on sampled frame pairs. Calibration beyond this is a
+    /// pathological request, not an operator choice.
+    const MAX_NUM_FRAMES: usize = 200;
+
+    if let Some(n) = options.num_frames
+        && (n < 1 || n > MAX_NUM_FRAMES)
+    {
+        return Err(WorkerError::InvalidInput {
+            field: "num_frames".to_string(),
+            reason: format!("must be between 1 and {MAX_NUM_FRAMES}"),
+        });
+    }
+    for (field, value) in [
+        ("skip_start_secs", options.skip_start_secs),
+        ("skip_end_secs", options.skip_end_secs),
+    ] {
+        if let Some(v) = value
+            && (!v.is_finite() || v < 0.0)
+        {
+            return Err(WorkerError::InvalidInput {
+                field: field.to_string(),
+                reason: "must be a finite value >= 0".to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Start a guided calibration run on the worker (CALB-01).
+///
+/// Thin: validate the advanced options, post `StartCalibration`. The worker
+/// runs calibration on its own GPU device and emits stage/progress/heartbeat/
+/// result events. Names no engine type.
+///
+/// # Errors
+///
+/// Returns [`WorkerError::InvalidInput`] for out-of-range options, or
+/// [`WorkerError::ChannelClosed`] if the worker has already exited.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn start_calibration(
+    state: tauri::State<'_, WorkerHandle>,
+    options: crate::events::CalibrationOptions,
+) -> Result<(), WorkerError> {
+    validate_options(&options)?;
+    state.send(WorkerCommand::StartCalibration { options })
+}
+
+/// Validate an operator-supplied profile path at the command boundary (T-03-07).
+///
+/// Mirrors `reco-io`'s forbidden-prefix guard: a profile is a **local file**
+/// chosen by the native dialog, never an FFmpeg protocol/URL. Rejecting here
+/// means the worker never opens a non-local path. Extracted as a pure function
+/// so the boundary check is unit-testable without a Tauri `State`.
+fn validate_profile_path(path: &str) -> Result<(), WorkerError> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err(WorkerError::InvalidInput {
+            field: "path".to_string(),
+            reason: "path must not be empty".to_string(),
+        });
+    }
+    // The same prefix set `reco_io::ffmpeg::calibration_io` rejects before an
+    // FFmpeg open (the path-safety precedent for any FFmpeg invocation).
+    const FORBIDDEN_PREFIXES: &[&str] = &["http://", "https://", "concat:", "pipe:", "data:"];
+    let lower = trimmed.to_ascii_lowercase();
+    if FORBIDDEN_PREFIXES.iter().any(|p| lower.starts_with(p)) {
+        return Err(WorkerError::InvalidInput {
+            field: "path".to_string(),
+            reason: "path must be a local file, not a URL or ffmpeg protocol".to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Load a calibration profile from a local `.json` file (IMPT-05 / D3-15).
+///
+/// Thin: validate the path, post `LoadProfile`. The worker validates by
+/// deserializing into `MatchCalibration` (size cap + `validate()`) and emits a
+/// typed `ProfileLoaded` or a `Failed(ProfileLoad)`.
+///
+/// # Errors
+///
+/// Returns [`WorkerError::InvalidInput`] for an empty/non-local path, or
+/// [`WorkerError::ChannelClosed`] if the worker has already exited.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn load_profile(
+    state: tauri::State<'_, WorkerHandle>,
+    path: String,
+) -> Result<(), WorkerError> {
+    validate_profile_path(&path)?;
+    state.send(WorkerCommand::LoadProfile { path })
+}
+
+/// Save the current calibration profile to a local `.json` file (IMPT-06 / D3-16).
+///
+/// Thin: validate the path, post `SaveProfile`. The worker writes
+/// `MatchCalibration::to_json_pretty()` and emits `ProfileSaved` or a
+/// `Failed(ProfileSave)`.
+///
+/// # Errors
+///
+/// Returns [`WorkerError::InvalidInput`] for an empty/non-local path, or
+/// [`WorkerError::ChannelClosed`] if the worker has already exited.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn save_profile(
+    state: tauri::State<'_, WorkerHandle>,
+    path: String,
+) -> Result<(), WorkerError> {
+    validate_profile_path(&path)?;
+    state.send(WorkerCommand::SaveProfile { path })
+}
+
+/// Cancel a running calibration (CALB-02 / D3-11).
+///
+/// # The documented control-plane bypass
+///
+/// Calibration runs synchronously on the worker thread, so a command posted to
+/// the worker's channel would not be observed until calibration already
+/// returned (RESEARCH Pitfall 3). This handler therefore sets the shared
+/// [`Arc<AtomicBool>`](std::sync::atomic::AtomicBool) that
+/// `calibrate_videos_with_gpu` polls **directly** — it deliberately posts
+/// nothing to the blocked channel. This is the single sanctioned exception to
+/// the "every UI→engine action is a `WorkerCommand`" rule (D-06 / T-03-10).
+///
+/// # Errors
+///
+/// Never fails; returns `Ok(())` so the frontend can always clear its
+/// "Cancelling…" state.
+#[tauri::command]
+pub async fn cancel_calibration(
+    state: tauri::State<'_, crate::worker::CalibrationCancel>,
+) -> Result<(), WorkerError> {
+    state.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    Ok(())
+}
+
 /// Forward a transport-agnostic input intent to the worker (PREV-04).
 ///
 /// Thin, same contract as [`play`]: post `Intent` and return. The typed
@@ -470,6 +676,68 @@ pub enum WorkerCommand {
         /// Which camera input the path belongs to.
         role: crate::events::InputRole,
         /// The local file path to probe.
+        path: String,
+    },
+
+    /// Clear one camera input slot (IMPT-01).
+    ///
+    /// The worker clears the slot, recomputes compatibility from the remaining
+    /// inputs, and invalidates any existing result (D3-08).
+    ClearInput {
+        /// Which camera input to clear.
+        role: crate::events::InputRole,
+    },
+
+    /// Request the lens-profile candidates for one input (IMPT-04 / D3-07).
+    ///
+    /// The worker queries the embedded `LensDatabase` for the input's
+    /// resolution and emits a typed `LensCandidates` event.
+    LensCandidates {
+        /// Which camera input to list candidates for.
+        role: crate::events::InputRole,
+    },
+
+    /// Apply a lens-profile override to one input (IMPT-04 / D3-08).
+    ///
+    /// The worker resolves the candidate to `CameraParams` via
+    /// `LensDatabase::load_by_summary`, stores it, and invalidates any existing
+    /// result.
+    SetLensOverride {
+        /// Which camera input the override applies to.
+        role: crate::events::InputRole,
+        /// The chosen profile.
+        candidate: crate::events::LensCandidate,
+    },
+
+    /// Clear a lens-profile override, returning the input to auto-detect
+    /// (IMPT-04).
+    ClearLensOverride {
+        /// Which camera input to reset.
+        role: crate::events::InputRole,
+    },
+
+    /// Start a guided calibration run (CALB-01 / D3-09).
+    ///
+    /// A job: calibration blocks the worker thread until it finishes or is
+    /// cancelled via the shared flag.
+    StartCalibration {
+        /// The advanced options (all optional).
+        options: crate::events::CalibrationOptions,
+    },
+
+    /// Load a calibration profile from a local `.json` file (IMPT-05).
+    ///
+    /// A job: the worker reads and validates the file.
+    LoadProfile {
+        /// The local file path to load.
+        path: String,
+    },
+
+    /// Save the current calibration profile to a local `.json` file (IMPT-06).
+    ///
+    /// A job: the worker writes the pretty-printed JSON.
+    SaveProfile {
+        /// The local file path to write.
         path: String,
     },
 
@@ -678,6 +946,153 @@ mod tests {
             WorkerCommand::SetInput {
                 role: crate::events::InputRole::Left,
                 path: "/media/a.mp4".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn validate_options_rejects_zero_frames_and_negative_skip_secs() {
+        use crate::events::CalibrationOptions;
+
+        // None for every field is valid (engine defaults).
+        assert!(validate_options(&CalibrationOptions::default()).is_ok());
+        assert!(
+            validate_options(&CalibrationOptions {
+                num_frames: Some(50),
+                skip_start_secs: Some(1.5),
+                skip_end_secs: Some(0.0),
+                use_imu_rotation_seeds: Some(true),
+            })
+            .is_ok()
+        );
+
+        // Zero frames is rejected.
+        match validate_options(&CalibrationOptions {
+            num_frames: Some(0),
+            ..Default::default()
+        }) {
+            Err(WorkerError::InvalidInput { field, reason }) => {
+                assert_eq!(field, "num_frames");
+                assert!(reason.contains("between 1 and 200"), "reason: {reason}");
+            }
+            other => panic!("expected InvalidInput for 0 frames, got {other:?}"),
+        }
+
+        // A negative skip is rejected.
+        match validate_options(&CalibrationOptions {
+            skip_start_secs: Some(-1.0),
+            ..Default::default()
+        }) {
+            Err(WorkerError::InvalidInput { field, .. }) => assert_eq!(field, "skip_start_secs"),
+            other => panic!("expected InvalidInput for negative skip, got {other:?}"),
+        }
+
+        // A non-finite skip is rejected.
+        assert!(matches!(
+            validate_options(&CalibrationOptions {
+                skip_end_secs: Some(f64::NAN),
+                ..Default::default()
+            }),
+            Err(WorkerError::InvalidInput { .. })
+        ));
+    }
+
+    #[test]
+    fn validate_profile_path_rejects_empty_and_non_local() {
+        assert!(validate_profile_path("/home/op/match.json").is_ok());
+        for bad in ["", "   ", "https://example.com/match.json", "pipe:0", "data:abc"] {
+            assert!(
+                matches!(
+                    validate_profile_path(bad),
+                    Err(WorkerError::InvalidInput { .. })
+                ),
+                "expected {bad:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn calibration_commands_round_trip_through_the_channel() {
+        let (tx, rx) = mpsc::channel();
+        let handle = WorkerHandle::new(tx);
+        handle
+            .send(WorkerCommand::ClearInput {
+                role: crate::events::InputRole::Left,
+            })
+            .unwrap();
+        handle
+            .send(WorkerCommand::LensCandidates {
+                role: crate::events::InputRole::Right,
+            })
+            .unwrap();
+        handle
+            .send(WorkerCommand::SetLensOverride {
+                role: crate::events::InputRole::Left,
+                candidate: crate::events::LensCandidate {
+                    camera: "GoPro HERO10".to_string(),
+                    lens: "Wide".to_string(),
+                    width: 3840,
+                    height: 2160,
+                },
+            })
+            .unwrap();
+        handle
+            .send(WorkerCommand::ClearLensOverride {
+                role: crate::events::InputRole::Left,
+            })
+            .unwrap();
+        handle
+            .send(WorkerCommand::StartCalibration {
+                options: crate::events::CalibrationOptions::default(),
+            })
+            .unwrap();
+        handle
+            .send(WorkerCommand::LoadProfile {
+                path: "/media/match.json".to_string(),
+            })
+            .unwrap();
+        handle
+            .send(WorkerCommand::SaveProfile {
+                path: "/media/out.json".to_string(),
+            })
+            .unwrap();
+
+        assert_eq!(
+            rx.recv().unwrap(),
+            WorkerCommand::ClearInput {
+                role: crate::events::InputRole::Left
+            }
+        );
+        assert_eq!(
+            rx.recv().unwrap(),
+            WorkerCommand::LensCandidates {
+                role: crate::events::InputRole::Right
+            }
+        );
+        assert!(matches!(
+            rx.recv().unwrap(),
+            WorkerCommand::SetLensOverride { .. }
+        ));
+        assert_eq!(
+            rx.recv().unwrap(),
+            WorkerCommand::ClearLensOverride {
+                role: crate::events::InputRole::Left
+            }
+        );
+        assert!(matches!(
+            rx.recv().unwrap(),
+            WorkerCommand::StartCalibration { .. }
+        ));
+        assert_eq!(
+            rx.recv().unwrap(),
+            WorkerCommand::LoadProfile {
+                path: "/media/match.json".to_string()
+            }
+        );
+        assert_eq!(
+            rx.recv().unwrap(),
+            WorkerCommand::SaveProfile {
+                path: "/media/out.json".to_string()
             }
         );
     }

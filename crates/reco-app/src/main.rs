@@ -76,7 +76,15 @@ fn main() -> anyhow::Result<()> {
             commands::set_view,
             commands::intent,
             commands::republish_projection,
-            commands::set_input
+            commands::set_input,
+            commands::clear_input,
+            commands::lens_candidates,
+            commands::set_lens_override,
+            commands::clear_lens_override,
+            commands::start_calibration,
+            commands::load_profile,
+            commands::save_profile,
+            commands::cancel_calibration
         ])
         .setup(|app| {
             if let Err(e) = run_skeleton(app) {
@@ -194,9 +202,21 @@ fn run_skeleton(app: &mut tauri::App) -> Result<(), SkeletonError> {
     // Nothing on this (the setup) thread holds a device handle or renders
     // directly. The readback sender is the worker's channel path for
     // `preview_attach_readback` (PREV-05).
-    let (worker, events, readback_tx) =
-        worker::spawn_gpu_worker(instance, presenter_chain, rect, startup_fallback)?;
-
+    //
+    // The calibration-cancel flag (CALB-02) is created here and shared: a clone
+    // goes to the worker (which polls it during calibration), and the original
+    // is managed as Tauri state so `cancel_calibration` can set it directly —
+    // the documented bypass of the command channel the blocked worker cannot
+    // drain (RESEARCH E8 / Pitfall 3).
+    let calibration_cancel =
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (worker, events, readback_tx) = worker::spawn_gpu_worker(
+        instance,
+        presenter_chain,
+        rect,
+        startup_fallback,
+        std::sync::Arc::clone(&calibration_cancel),
+    )?;
     // The webview bridge: drain typed worker events on an async Tauri task and
     // forward each one to the frontend. The JS `listen("worker-event")` side
     // renders them (Plan 04).
@@ -242,6 +262,7 @@ fn run_skeleton(app: &mut tauri::App) -> Result<(), SkeletonError> {
     // lifetime; the webview owns the lifetime from here.
     app.manage(handle);
     app.manage(worker::ReadbackSender(readback_tx));
+    app.manage(worker::CalibrationCancel(calibration_cancel));
     app.manage(window);
 
     Ok(())
