@@ -15,13 +15,13 @@ use reco_calibrate::types::{
     CalibrationConfig, CalibrationResult, CalibrationStep, FrameMatches, LensProfileInfo,
     MatchedPoint, ProfileSource, SyncMethod as EngineSyncMethod,
 };
-use reco_core::calibration::{CameraParams, PlaneLayout};
+use reco_core::calibration::{CameraParams, MatchCalibration, PlaneLayout};
 
 use crate::events::{
     CalibrationDiagnosis, CalibrationOptions, CalibrationStage, ConfidenceBand, DebugPoint,
     DebugReport, DiagnosisMetrics, FrameMatchRow, InputMetadata, LensProfileView, ReadinessCode,
     ReadinessFinding, ReadinessReport, ReadinessSeverity, SYNC_OFFSET_SEMANTICS, Scorecard,
-    SyncMethod, SyncProvenance, SyncView,
+    SyncMethod, SyncProvenance, SyncView, ValidationVerdict,
 };
 
 /// Sampled statistics feeding the readiness estimate (CALB-05).
@@ -600,6 +600,82 @@ pub fn build_video_options(
         left_params,
         right_params,
         ..Default::default()
+    }
+}
+
+/// Per-frame residual (px) at or below which a validation frame's advisory
+/// verdict can pass (MANU-07).
+///
+/// Advisory only: the residual is the engine's seam-weighted reprojection error
+/// on the validation frame. `0.5 px` is a generous pass band — a well-aligned
+/// rig sits near `0.25 px` — chosen so the verdict flags a visibly off result
+/// without failing a merely-good one. Agent discretion (04.1-CONTEXT).
+pub const VALIDATION_RESIDUAL_THRESHOLD: f64 = 0.5;
+
+/// Absolute layout agreement tolerance for the advisory verdict (MANU-07).
+///
+/// The engine's independent solve on the validation frame and the operator's
+/// manual layout should agree; any of the seven fields differing by more than
+/// this flags `CheckSeam`. A single absolute tolerance across the fields is
+/// deliberately simple and advisory (agent discretion).
+pub const VALIDATION_LAYOUT_TOLERANCE: f64 = 0.05;
+
+/// Compute the advisory validation verdict for one additional frame (MANU-07).
+///
+/// `LooksGood` when every layout field of the manual layout agrees with the
+/// engine's independent solve on the validation frame within
+/// [`VALIDATION_LAYOUT_TOLERANCE`] **and** the per-frame residual is finite and
+/// at or below [`VALIDATION_RESIDUAL_THRESHOLD`]; `CheckSeam` otherwise. Purely
+/// advisory — it never blocks saving (MANU-07 prohibition). Pure: no device,
+/// file, or channel.
+pub fn validation_verdict(
+    cal_layout: &PlaneLayout,
+    val_layout: &PlaneLayout,
+    residual: f64,
+) -> ValidationVerdict {
+    let agrees = [
+        (cal_layout.camera_axis_offset, val_layout.camera_axis_offset),
+        (cal_layout.intersect, val_layout.intersect),
+        (cal_layout.x_ty, val_layout.x_ty),
+        (cal_layout.x_rz, val_layout.x_rz),
+        (cal_layout.z_rx, val_layout.z_rx),
+        (cal_layout.x_rx, val_layout.x_rx),
+        (cal_layout.z_rz, val_layout.z_rz),
+    ]
+    .iter()
+    .all(|(a, b)| (a - b).abs() <= VALIDATION_LAYOUT_TOLERANCE);
+    if agrees && residual.is_finite() && residual <= VALIDATION_RESIDUAL_THRESHOLD {
+        ValidationVerdict::LooksGood
+    } else {
+        ValidationVerdict::CheckSeam
+    }
+}
+
+/// Assemble the manual result as a normal calibration profile (MANU-07).
+///
+/// Copies every carried profile field from `base` — `field_roi`,
+/// `lens_correction_amount`, `blend_width`, `rig_tilt`, `rig_roll` — verbatim,
+/// and sets the operator's edited `left`/`right` intrinsics, the layout in
+/// effect, and the chosen `sync_offset`. Manual and auto profiles are therefore
+/// identical in shape and round-trip through Calibrate/Preview/Export unchanged
+/// (T-04.1-18). Pure: no device, file, or channel.
+pub fn build_manual_match_calibration(
+    base: &MatchCalibration,
+    left: CameraParams,
+    right: CameraParams,
+    layout: PlaneLayout,
+    sync_offset: i64,
+) -> MatchCalibration {
+    MatchCalibration {
+        left,
+        right,
+        layout,
+        rig_tilt: base.rig_tilt,
+        rig_roll: base.rig_roll,
+        sync_offset,
+        field_roi: base.field_roi.clone(),
+        lens_correction_amount: base.lens_correction_amount,
+        blend_width: base.blend_width,
     }
 }
 

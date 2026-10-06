@@ -94,6 +94,12 @@ export interface CameraParamsView {
   k1: number;
 }
 
+/**
+ * The advisory validation verdict for one manual validation frame (mirror
+ * `events::ValidationVerdict`, MANU-07). Advisory only — never a hard gate.
+ */
+export type ValidationVerdict = "looks_good" | "check_seam";
+
 /** The solved plane layout view (mirror `events::PlaneLayoutView`, MANU-03). */
 export interface PlaneLayoutView {
   camera_axis_offset: number;
@@ -397,6 +403,24 @@ export type WorkerEventTyped =
         offset_semantics: string;
       };
     }
+  | {
+      kind: "manual_validation_frame";
+      data: {
+        frame: number;
+        /** The validation frame's stitched RGBA (`width * height * 4`). */
+        rgba: number[];
+        width: number;
+        height: number;
+        /** Per-frame residual (px). */
+        residual: number;
+        verdict: ValidationVerdict;
+        /** The calibration frame's stitched RGBA for the blink comparison. */
+        reference_rgba: number[];
+        reference_width: number;
+        reference_height: number;
+      };
+    }
+  | { kind: "manual_saved"; data: { path: string } }
   | { kind: "result_invalidated"; data: null }
   | { kind: "log"; data: LogLine }
   | { kind: "failed"; data: unknown };

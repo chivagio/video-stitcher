@@ -846,6 +846,54 @@ pub async fn manual_reset_rig(state: tauri::State<'_, WorkerHandle>) -> Result<(
     state.send(WorkerCommand::ManualResetRig)
 }
 
+/// Validate the manual result on one additional frame (MANU-07).
+///
+/// Thin, same contract as [`manual_begin`]: post `ManualValidate`. The worker
+/// extracts the validation frame pair (applying the session's sync offset to
+/// the right index), renders the stitched comparison under the current manual
+/// parameters/layout, runs the engine on the frame to obtain a per-frame
+/// residual, and emits a typed `ManualValidationFrame` with an advisory
+/// verdict. The index is typed `u32` (no negative/string) and is clamped inside
+/// the worker against the probed frame count, mirroring `seek` (T-04.1-16).
+///
+/// # Why `rename_all = "snake_case"`
+///
+/// Pins the command to the crate's snake_case IPC protocol so a future argument
+/// rename cannot reintroduce the silent-never-fires bug (`FRICTION.md` A7).
+///
+/// # Errors
+///
+/// Returns [`WorkerError::ChannelClosed`] if the worker has already exited.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn manual_validate(
+    state: tauri::State<'_, WorkerHandle>,
+    frame: u32,
+) -> Result<(), WorkerError> {
+    state.send(WorkerCommand::ManualValidate { frame })
+}
+
+/// Save the manual result as a normal calibration profile (MANU-07).
+///
+/// Thin, same contract as [`save_profile`]: validate the path, post
+/// `ManualSave`. The worker assembles a `MatchCalibration` from the session's
+/// parameters, layout, sync offset, and the carried profile fields, gates the
+/// write on `MatchCalibration::validate`, writes it through the existing
+/// `.json` path, and emits a typed `ManualSaved`. An invalid profile is never
+/// written (T-04.1-16); a repeated save overwrites the target.
+///
+/// # Errors
+///
+/// Returns [`WorkerError::InvalidInput`] for an empty/non-local path, or
+/// [`WorkerError::ChannelClosed`] if the worker has already exited.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn manual_save(
+    state: tauri::State<'_, WorkerHandle>,
+    path: String,
+) -> Result<(), WorkerError> {
+    validate_profile_path(&path)?;
+    state.send(WorkerCommand::ManualSave { path })
+}
+
 /// Cancel a running calibration (CALB-02 / D3-11).
 ///
 /// # The documented control-plane bypass
@@ -1239,6 +1287,32 @@ pub enum WorkerCommand {
 
     /// Restore the rig layout captured at `manual_begin` (MANU-06).
     ManualResetRig,
+
+    /// Validate the manual result on one additional frame (MANU-07).
+    ///
+    /// The worker extracts the validation frame pair (the right index carries
+    /// the session's sync offset), renders the stitched comparison under the
+    /// current manual parameters/layout, runs the engine on the frame for a
+    /// per-frame residual, computes the advisory verdict, and emits a typed
+    /// `ManualValidationFrame`. The index is clamped against the probed frame
+    /// count. Validation is advisory, never a gate.
+    ManualValidate {
+        /// The validation frame index (0-based; clamped by the worker).
+        frame: u32,
+    },
+
+    /// Save the manual result as a normal calibration profile (MANU-07).
+    ///
+    /// The worker assembles a `MatchCalibration` from the session's parameters,
+    /// layout, sync offset, and the carried profile fields (`field_roi`,
+    /// `lens_correction_amount`, `blend_width`), validates it with
+    /// `MatchCalibration::validate`, and writes it through the existing `.json`
+    /// path. Manual and auto profiles are identical in shape; a repeated save
+    /// overwrites the target, never appends.
+    ManualSave {
+        /// The local file path to write.
+        path: String,
+    },
 
     /// Stop the worker loop and return.
     Shutdown,
@@ -1763,6 +1837,32 @@ mod tests {
         );
         assert_eq!(rx.recv().unwrap(), WorkerCommand::ManualRemovePin { id: 2 });
         assert_eq!(rx.recv().unwrap(), WorkerCommand::ManualClearPins);
+    }
+
+    #[test]
+    fn manual_validate_and_save_round_trip_through_the_channel() {
+        // MANU-07: the validation frame index and the save path cross as typed
+        // values.
+        let (tx, rx) = mpsc::channel();
+        let handle = WorkerHandle::new(tx);
+        handle
+            .send(WorkerCommand::ManualValidate { frame: 42 })
+            .unwrap();
+        handle
+            .send(WorkerCommand::ManualSave {
+                path: "/media/manual.json".to_string(),
+            })
+            .unwrap();
+        assert_eq!(
+            rx.recv().unwrap(),
+            WorkerCommand::ManualValidate { frame: 42 }
+        );
+        assert_eq!(
+            rx.recv().unwrap(),
+            WorkerCommand::ManualSave {
+                path: "/media/manual.json".to_string()
+            }
+        );
     }
 
     #[test]

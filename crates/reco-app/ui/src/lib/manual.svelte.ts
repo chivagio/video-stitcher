@@ -23,6 +23,7 @@ import type {
   ManualSide,
   PlaneLayoutView,
   SyncMethod,
+  ValidationVerdict,
   WorkerEventTyped,
 } from "./types";
 import { WORKER_EVENT_TYPED } from "./types";
@@ -74,6 +75,28 @@ export interface ManualPreview {
   rgba: number[];
   width: number;
   height: number;
+}
+
+/**
+ * One stitched validation comparison (mirror `events::ManualValidationFrame`,
+ * MANU-07). Carries the validation frame's stitched RGBA plus the calibration
+ * frame's reference for the blink/blend comparison.
+ */
+export interface ValidationFrame {
+  /** The validated frame index (0-based). */
+  frame: number;
+  /** The validation frame's stitched RGBA (`width * height * 4`). */
+  rgba: number[];
+  width: number;
+  height: number;
+  /** Per-frame residual (px). */
+  residual: number;
+  /** The advisory verdict (never a gate). */
+  verdict: ValidationVerdict;
+  /** The calibration frame's stitched RGBA for the blink comparison. */
+  referenceRgba: number[];
+  referenceWidth: number;
+  referenceHeight: number;
 }
 
 /**
@@ -142,6 +165,15 @@ class ManualStore {
   } | null>(null);
   /** The number of handle edits on the undo stack (drives the Undo control). */
   undoDepth = $state(0);
+
+  /**
+   * The validation frames received this session, keyed by frame index (MANU-07).
+   * The worker is authoritative: this store mirrors the typed
+   * `manual_validation_frame` payloads and never derives a residual locally.
+   */
+  validationFrames = $state<Record<number, ValidationFrame>>({});
+  /** The last saved profile path, or null before a save (MANU-07). */
+  savedPath = $state<string | null>(null);
 
   /**
    * The handle-edit undo stack (MANU-05). One entry per committed handle edit,
@@ -259,6 +291,38 @@ class ManualStore {
         this.offsetSemantics = offset_semantics;
         break;
       }
+      case "manual_validation_frame": {
+        const {
+          frame,
+          rgba,
+          width,
+          height,
+          residual,
+          verdict,
+          reference_rgba,
+          reference_width,
+          reference_height,
+        } = event.data;
+        this.validationFrames = {
+          ...this.validationFrames,
+          [frame]: {
+            frame,
+            rgba,
+            width,
+            height,
+            residual,
+            verdict,
+            referenceRgba: reference_rgba,
+            referenceWidth: reference_width,
+            referenceHeight: reference_height,
+          },
+        };
+        break;
+      }
+      case "manual_saved": {
+        this.savedPath = event.data.path;
+        break;
+      }
       case "failed": {
         if (this.open) {
           this.error = formatWorkerError(event.data);
@@ -294,6 +358,8 @@ class ManualStore {
     this.baselineParams = null;
     this.layout = null;
     this.layoutDelta = null;
+    this.validationFrames = {};
+    this.savedPath = null;
     this.#undoStack = [];
     this.undoDepth = 0;
     try {
@@ -391,6 +457,39 @@ class ManualStore {
   async clearPins(): Promise<void> {
     try {
       await invoke("manual_clear_pins");
+    } catch (e) {
+      this.error = formatWorkerError(e);
+    }
+  }
+
+  /**
+   * Validate the manual result on one additional frame (MANU-07).
+   *
+   * Posts `manual_validate`; the worker extracts the frame, renders the stitched
+   * comparison under the current parameters, runs the engine for a per-frame
+   * residual, and emits a typed `manual_validation_frame`. The store never
+   * derives a residual locally, and validation is advisory (never a gate).
+   */
+  async validate(frame: number): Promise<void> {
+    this.error = null;
+    try {
+      await invoke("manual_validate", { frame });
+    } catch (e) {
+      this.error = formatWorkerError(e);
+    }
+  }
+
+  /**
+   * Save the manual result as a normal calibration profile (MANU-07).
+   *
+   * Posts `manual_save`; the worker assembles the profile, validates it, writes
+   * it through the existing `.json` path, and emits `manual_saved`. A repeated
+   * save overwrites the target.
+   */
+  async save(path: string): Promise<void> {
+    this.error = null;
+    try {
+      await invoke("manual_save", { path });
     } catch (e) {
       this.error = formatWorkerError(e);
     }
@@ -559,6 +658,8 @@ class ManualStore {
     this.baselineParams = null;
     this.layout = null;
     this.layoutDelta = null;
+    this.validationFrames = {};
+    this.savedPath = null;
     this.#undoStack = [];
     this.undoDepth = 0;
     try {

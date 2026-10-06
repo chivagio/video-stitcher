@@ -631,6 +631,22 @@ pub struct ManualPinView {
     pub verified: bool,
 }
 
+/// The advisory verdict for one manual validation frame (MANU-07).
+///
+/// Validation is **advisory, never a gate**: the operator decides whether to
+/// accept. `LooksGood` means the manual layout agrees with the engine's
+/// independent solve on this frame (within tolerance) and the per-frame
+/// residual is low; `CheckSeam` means it does not. Serializes snake_case and
+/// mirrors into `ui/src/lib/types.ts`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidationVerdict {
+    /// The layouts agree and the residual is below threshold — advisory pass.
+    LooksGood,
+    /// The layouts disagree or the residual is high — advisory "check the seam".
+    CheckSeam,
+}
+
 /// An event emitted by the engine worker and rendered in the webview log pane.
 ///
 /// `Clone + Send + 'static` so it can cross the worker→UI channel; the
@@ -990,6 +1006,48 @@ pub enum WorkerEvent {
         offset_semantics: String,
     },
 
+    /// A manual validation frame's stitched comparison + advisory residual
+    /// (MANU-07).
+    ///
+    /// Carries the validation frame's stitched RGBA (`rgba`, `width`,
+    /// `height`), the engine's per-frame residual under the current manual
+    /// parameters, and the advisory [`ValidationVerdict`]. `reference_rgba` /
+    /// `reference_width` / `reference_height` are the *calibration frame's*
+    /// stitched output under the same parameters/layout, so the webview can
+    /// blink/blend between the two (MANU-07). Validation is advisory only —
+    /// never a hard gate; the operator decides whether to save.
+    ManualValidationFrame {
+        /// The validated frame index (0-based).
+        frame: u32,
+        /// The validation frame's stitched RGBA (`width * height * 4`).
+        rgba: Vec<u8>,
+        /// Stitched width in pixels.
+        width: u32,
+        /// Stitched height in pixels.
+        height: u32,
+        /// Per-frame residual (seam-weighted reprojection error, px).
+        residual: f64,
+        /// The advisory verdict (never a gate).
+        verdict: ValidationVerdict,
+        /// The calibration frame's stitched RGBA (`reference_width * reference_height * 4`).
+        reference_rgba: Vec<u8>,
+        /// Reference (calibration frame) stitched width in pixels.
+        reference_width: u32,
+        /// Reference (calibration frame) stitched height in pixels.
+        reference_height: u32,
+    },
+
+    /// The manual calibration was saved as a normal profile (MANU-07).
+    ///
+    /// Emitted after the assembled [`MatchCalibration`](reco_core::calibration::MatchCalibration)
+    /// passed `validate()` and was written through the existing `.json` path.
+    /// Manual and auto profiles are identical in shape; the save overwrites the
+    /// target (never appends).
+    ManualSaved {
+        /// The path that was written.
+        path: String,
+    },
+
     /// The current result no longer matches the inputs or profile (D3-08).
     ///
     /// Emitted when an input or lens override changes after a run/load, so the
@@ -1345,6 +1403,31 @@ impl WorkerEvent {
                 message: format!(
                     "manual sync: offset {offset_frames:+} frames ({method:?}) — {offset_semantics}"
                 ),
+            },
+            // A validation frame is INFO when the advisory verdict is
+            // `LooksGood` and WARN when it is `CheckSeam` (UI-SPEC Event Log
+            // Contract). The RGBA payload is deliberately NOT logged.
+            WorkerEvent::ManualValidationFrame {
+                frame,
+                residual,
+                verdict,
+                ..
+            } => LogLine {
+                level: match verdict {
+                    ValidationVerdict::LooksGood => Level::Info,
+                    ValidationVerdict::CheckSeam => Level::Warn,
+                },
+                message: format!(
+                    "manual validation frame {frame}: residual {residual:.6} — {}",
+                    match verdict {
+                        ValidationVerdict::LooksGood => "looks good",
+                        ValidationVerdict::CheckSeam => "check the seam",
+                    }
+                ),
+            },
+            WorkerEvent::ManualSaved { path } => LogLine {
+                level: Level::Info,
+                message: format!("manual calibration saved: {path}"),
             },
             WorkerEvent::ResultInvalidated => LogLine {
                 level: Level::Warn,
@@ -2323,5 +2406,62 @@ mod tests {
         let line = delta.to_log_line();
         assert_eq!(line.level, Level::Info);
         assert!(line.message.contains("cam_d +0.0100"), "{line:?}");
+    }
+
+    #[test]
+    fn manual_validation_frame_and_saved_roundtrip_and_project() {
+        // MANU-07: the validation frame carries the stitched comparison plus an
+        // advisory residual/verdict; the save event carries the written path.
+        // A `CheckSeam` verdict projects to WARN, never a hard gate.
+        let frame = WorkerEvent::ManualValidationFrame {
+            frame: 42,
+            rgba: vec![0u8; 8],
+            width: 2,
+            height: 1,
+            residual: 0.4,
+            verdict: ValidationVerdict::LooksGood,
+            reference_rgba: vec![0u8; 8],
+            reference_width: 2,
+            reference_height: 1,
+        };
+        let json = serde_json::to_string(&frame).unwrap();
+        assert!(
+            json.contains("\"kind\":\"manual_validation_frame\""),
+            "unexpected json: {json}"
+        );
+        assert!(
+            json.contains("\"verdict\":\"looks_good\""),
+            "the verdict must ride the payload: {json}"
+        );
+        assert_eq!(serde_json::from_str::<WorkerEvent>(&json).unwrap(), frame);
+        assert_eq!(frame.to_log_line().level, Level::Info);
+
+        let check_seam = WorkerEvent::ManualValidationFrame {
+            frame: 42,
+            rgba: vec![0u8; 8],
+            width: 2,
+            height: 1,
+            residual: 0.4,
+            verdict: ValidationVerdict::CheckSeam,
+            reference_rgba: vec![0u8; 8],
+            reference_width: 2,
+            reference_height: 1,
+        };
+        let line = check_seam.to_log_line();
+        assert_eq!(line.level, Level::Warn, "CheckSeam is advisory WARN");
+        assert!(line.message.contains("check the seam"), "{line:?}");
+
+        let saved = WorkerEvent::ManualSaved {
+            path: "/media/manual.json".to_string(),
+        };
+        let json = serde_json::to_string(&saved).unwrap();
+        assert!(
+            json.contains("\"kind\":\"manual_saved\""),
+            "unexpected json: {json}"
+        );
+        assert_eq!(serde_json::from_str::<WorkerEvent>(&json).unwrap(), saved);
+        let line = saved.to_log_line();
+        assert_eq!(line.level, Level::Info);
+        assert!(line.message.contains("/media/manual.json"), "{line:?}");
     }
 }

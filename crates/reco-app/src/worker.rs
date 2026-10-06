@@ -440,6 +440,51 @@ impl EventSink {
             offset_semantics: crate::events::SYNC_OFFSET_SEMANTICS.to_string(),
         });
     }
+
+    /// Emit a manual validation frame's stitched comparison + advisory verdict
+    /// (MANU-07).
+    ///
+    /// The stitched RGBA payloads ride the typed channel only — the process log
+    /// carries the residual/verdict summary, never the bytes. `reference` is the
+    /// calibration frame's stitched output `(rgba, width, height)` for the blink
+    /// comparison.
+    fn manual_validation_frame(
+        &self,
+        frame: u32,
+        rgba: Vec<u8>,
+        width: u32,
+        height: u32,
+        residual: f64,
+        verdict: crate::events::ValidationVerdict,
+        reference: (Vec<u8>, u32, u32),
+    ) {
+        let (reference_rgba, reference_width, reference_height) = reference;
+        log::info!(
+            "manual validation frame {frame}: residual {residual:.6}, {}",
+            match verdict {
+                crate::events::ValidationVerdict::LooksGood => "looks good",
+                crate::events::ValidationVerdict::CheckSeam => "check the seam",
+            }
+        );
+        let _ = self.tx.send(WorkerEvent::ManualValidationFrame {
+            frame,
+            rgba,
+            width,
+            height,
+            residual,
+            verdict,
+            reference_rgba,
+            reference_width,
+            reference_height,
+        });
+    }
+
+    /// Emit that the manual calibration was saved as a profile (MANU-07).
+    fn manual_saved(&self, path: impl Into<String>) {
+        let path = path.into();
+        log::info!("manual calibration saved: {path}");
+        let _ = self.tx.send(WorkerEvent::ManualSaved { path });
+    }
 }
 
 /// The array index for a camera role (`Left` = 0, `Right` = 1).
@@ -1223,6 +1268,24 @@ pub trait EngineBackend: Send {
     /// Restore the rig layout captured at `manual_begin` (MANU-06).
     fn manual_reset_rig(&mut self, events: &EventSink) -> Result<(), WorkerError>;
 
+    /// Validate the manual result on one additional frame (MANU-07).
+    ///
+    /// Extracts the validation frame pair (the right index carries the session's
+    /// sync offset), renders the stitched comparison under the current manual
+    /// parameters/layout, runs the engine on the frame for a per-frame residual,
+    /// computes the advisory verdict, and emits a typed `ManualValidationFrame`.
+    /// Validation is advisory, never a gate.
+    fn manual_validate(&mut self, frame: u32, events: &EventSink) -> Result<(), WorkerError>;
+
+    /// Assemble and save the manual result as a normal calibration profile
+    /// (MANU-07).
+    ///
+    /// Builds a `MatchCalibration` from the session's parameters, layout, sync
+    /// offset, and the carried profile fields, gates the write on
+    /// `MatchCalibration::validate` (T-04.1-16), writes it through the existing
+    /// `.json` path, adopts it as the live result, and emits `ManualSaved`.
+    fn manual_save(&mut self, path: String, events: &EventSink) -> Result<(), WorkerError>;
+
     /// The instant the armed debounced manual solve should fire, or `None`
     /// when no solve is armed (MANU-03).
     ///
@@ -1719,6 +1782,16 @@ fn handle_command<B: EngineBackend>(
         }
         WorkerCommand::ManualResetRig => {
             if let Err(e) = backend.manual_reset_rig(events) {
+                events.failed(e);
+            }
+        }
+        WorkerCommand::ManualValidate { frame } => {
+            if let Err(e) = backend.manual_validate(frame, events) {
+                events.failed(e);
+            }
+        }
+        WorkerCommand::ManualSave { path } => {
+            if let Err(e) = backend.manual_save(path, events) {
                 events.failed(e);
             }
         }
@@ -3717,6 +3790,151 @@ impl EngineBackend for GpuEngineBackend {
         Ok(())
     }
 
+    fn manual_validate(&mut self, frame: u32, events: &EventSink) -> Result<(), WorkerError> {
+        // Snapshot the session inputs into owned values up front, so no
+        // immutable borrow of `self.manual` spans the render/solve below.
+        let (
+            frames_total,
+            right_frames_total,
+            cal_frame,
+            left_params,
+            right_params,
+            current_layout,
+            sync_offset,
+        ) = match self.manual.as_ref() {
+            Some(session) => (
+                session.frames_total,
+                session.right_frames_total,
+                session.frame,
+                session.left_params.clone(),
+                session.right_params.clone(),
+                session.current_layout.clone(),
+                session.sync_offset,
+            ),
+            None => {
+                return Err(WorkerError::InvalidInput {
+                    field: "frame".to_string(),
+                    reason: "no manual session is open — begin one first".to_string(),
+                });
+            }
+        };
+        // T-04.1-16: clamp the operator-supplied index against the probed frame
+        // count before extraction.
+        let frame = u64::from(frame).min(frames_total.saturating_sub(1));
+        let right_index = self.right_frame_index(frame, right_frames_total);
+        let (left_path, right_path) = self.manual_frame_paths()?;
+        let left_frame = extract_manual_frame(&left_path, frame)?;
+        let right_frame = extract_manual_frame(&right_path, right_index)?;
+
+        // The manual result as a normal profile — the same assembly Save uses, so
+        // the comparison is rendered under exactly the parameters that will be
+        // saved.
+        let base = self.manual_base_calibration();
+        let match_cal = crate::calibration::build_manual_match_calibration(
+            &base,
+            left_params.clone(),
+            right_params.clone(),
+            current_layout.clone(),
+            sync_offset,
+        );
+
+        // Stitched comparison under the current manual parameters/layout. The
+        // calibration-frame reference is what the UI blinks against.
+        let reference = if cal_frame == frame {
+            None
+        } else {
+            let cal_left = extract_manual_frame(&left_path, cal_frame)?;
+            let cal_right = extract_manual_frame(
+                &right_path,
+                self.right_frame_index(cal_frame, right_frames_total),
+            )?;
+            Some(self.render_stitched(&match_cal, &cal_left, &cal_right)?)
+        };
+        let (rgba, width, height) = self.render_stitched(&match_cal, &left_frame, &right_frame)?;
+        let reference = reference.unwrap_or_else(|| (rgba.clone(), width, height));
+
+        // Run the engine on the validation frame under the current intrinsics to
+        // obtain a per-frame residual and the engine's independent layout. The
+        // verdict compares that layout against the operator's manual layout.
+        let config = reco_calibrate::types::CalibrationConfig::default();
+        match reco_calibrate::calibrate(
+            &self.gpu,
+            &[(left_frame, right_frame)],
+            &left_params,
+            &right_params,
+            &config,
+        ) {
+            Ok(result) => {
+                let verdict = crate::calibration::validation_verdict(
+                    &current_layout,
+                    &result.calibration.layout,
+                    result.residual_error,
+                );
+                events.manual_validation_frame(
+                    frame as u32,
+                    rgba,
+                    width,
+                    height,
+                    result.residual_error,
+                    verdict,
+                    reference,
+                );
+                Ok(())
+            }
+            Err(e) => {
+                // A validation frame that cannot be evaluated is a defined
+                // non-result: surface the typed error (Save stays available with
+                // the single-frame caveat) rather than fabricating a residual.
+                events.log(
+                    Level::Warn,
+                    format!("manual validation frame {frame} produced no usable matches: {e}"),
+                );
+                events.failed(WorkerError::Engine(format!(
+                    "validation frame {frame} could not be evaluated: {e}"
+                )));
+                Ok(())
+            }
+        }
+    }
+
+    fn manual_save(&mut self, path: String, events: &EventSink) -> Result<(), WorkerError> {
+        let (left_params, right_params, current_layout, sync_offset) = match self.manual.as_ref() {
+            Some(session) => (
+                session.left_params.clone(),
+                session.right_params.clone(),
+                session.current_layout.clone(),
+                session.sync_offset,
+            ),
+            None => {
+                return Err(WorkerError::InvalidInput {
+                    field: "path".to_string(),
+                    reason: "no manual session is open — begin one first".to_string(),
+                });
+            }
+        };
+        let base = self.manual_base_calibration();
+        let calibration = crate::calibration::build_manual_match_calibration(
+            &base,
+            left_params,
+            right_params,
+            current_layout,
+            sync_offset,
+        );
+        // T-04.1-16: never write a profile that fails validation.
+        calibration
+            .validate()
+            .map_err(|e| WorkerError::ProfileSave(e.to_string()))?;
+        calibration
+            .to_file(std::path::Path::new(&path))
+            .map_err(|e| WorkerError::ProfileSave(e.to_string()))?;
+        // Adopt the saved profile as the live result/preview source, so a later
+        // Preview/Export consumes it unchanged (MANU-07). This mirrors
+        // `load_profile`'s adoption.
+        self.adopt_calibration(calibration);
+        events.manual_saved(path);
+        Ok(())
+    }
+
     fn begin_preview(&mut self, events: &EventSink) -> Result<(), WorkerError> {
         // Clone (not `take`) the calibration: the renderer takes it by value,
         // but a preview must be repeatable without re-importing, so the loaded
@@ -4736,6 +4954,73 @@ impl GpuEngineBackend {
         }
         Ok(())
     }
+
+    /// The base profile whose carried fields the manual assembly preserves
+    /// (MANU-07).
+    ///
+    /// Prefers the live/current calibration (a run result or a loaded profile),
+    /// then the startup-imported calibration; with neither, a neutral base
+    /// carrying the engine defaults for the carried fields. The left/right
+    /// intrinsics and layout are always overwritten by
+    /// [`crate::calibration::build_manual_match_calibration`], so only
+    /// `field_roi`, `lens_correction_amount`, `blend_width`, `rig_tilt`, and
+    /// `rig_roll` are read from the base.
+    fn manual_base_calibration(&self) -> reco_core::calibration::MatchCalibration {
+        self.current_calibration
+            .clone()
+            .or_else(|| self.calibration.clone())
+            .unwrap_or_else(|| reco_core::calibration::MatchCalibration {
+                left: default_camera_params(1, 1),
+                right: default_camera_params(1, 1),
+                layout: default_plane_layout(),
+                rig_tilt: 0.0,
+                rig_roll: 0.0,
+                sync_offset: 0,
+                field_roi: None,
+                lens_correction_amount: 1.0,
+                blend_width: 0.05,
+            })
+    }
+
+    /// Render one stitched frame under `cal` and read back tightly-packed RGBA
+    /// (MANU-07).
+    ///
+    /// Builds a *local* renderer from the given calibration — the live preview
+    /// renderer is left untouched. A fresh renderer's first
+    /// `render_and_readback_rgba` call schedules the render + copy (the
+    /// triple-buffer warmup returns `None`); `flush_rgba` then drains that same
+    /// frame (blocking). Returns `(rgba, width, height)`; an empty `rgba` means
+    /// the readback produced nothing (the caller fails closed).
+    fn render_stitched(
+        &self,
+        cal: &reco_core::calibration::MatchCalibration,
+        left: &reco_core::source::YuvFrame,
+        right: &reco_core::source::YuvFrame,
+    ) -> Result<(Vec<u8>, u32, u32), WorkerError> {
+        let mut renderer = self.build_renderer(cal.clone(), left.width, left.height)?;
+        let left_planes = reco_core::render::planes::YuvPlanes {
+            y: &left.y,
+            u: &left.u,
+            v: &left.v,
+        };
+        let right_planes = reco_core::render::planes::YuvPlanes {
+            y: &right.y,
+            u: &right.u,
+            v: &right.v,
+        };
+        let _ = renderer
+            .render_and_readback_rgba(&left_planes, &right_planes, 0.0, 0.0)
+            .map_err(|e| WorkerError::Engine(e.to_string()))?;
+        let (width, height) = renderer
+            .readback_dimensions()
+            .unwrap_or((self.viewport.width, self.viewport.height));
+        let rgba = renderer
+            .flush_rgba()
+            .map_err(|e| WorkerError::Engine(e.to_string()))?
+            .map(<[u8]>::to_vec)
+            .unwrap_or_default();
+        Ok((rgba, width, height))
+    }
 }
 
 impl GpuEngineBackend {
@@ -5660,6 +5945,61 @@ mod tests {
             Ok(())
         }
 
+        fn manual_validate(&mut self, frame: u32, events: &EventSink) -> Result<(), WorkerError> {
+            self.record("manual_validate");
+            if !self.manual_open {
+                return Err(WorkerError::InvalidInput {
+                    field: "frame".to_string(),
+                    reason: "no manual session is open — begin one first".to_string(),
+                });
+            }
+            // Mirror the real backend's protocol without a GPU or a decoder: a
+            // validation frame with the correct RGBA geometry, an advisory
+            // residual, and the calibration-frame reference. A 2×1 frame =>
+            // `2 * 1 * 4 = 8` bytes.
+            events.manual_validation_frame(
+                frame,
+                vec![0u8; 8],
+                2,
+                1,
+                0.25,
+                crate::events::ValidationVerdict::LooksGood,
+                (vec![0u8; 8], 2, 1),
+            );
+            Ok(())
+        }
+
+        fn manual_save(&mut self, path: String, events: &EventSink) -> Result<(), WorkerError> {
+            self.record("manual_save");
+            if !self.manual_open {
+                return Err(WorkerError::InvalidInput {
+                    field: "path".to_string(),
+                    reason: "no manual session is open — begin one first".to_string(),
+                });
+            }
+            // Mirror the real backend's adoption without touching disk: assemble
+            // the profile from the mock's base calibration and the session's
+            // edits, gate it on validation, and adopt it as the live result.
+            let base = self
+                .current_calibration
+                .clone()
+                .unwrap_or_else(sample_mock_calibration);
+            let calibration = crate::calibration::build_manual_match_calibration(
+                &base,
+                self.manual_left_params.clone(),
+                self.manual_right_params.clone(),
+                self.manual_layout.clone(),
+                0,
+            );
+            calibration
+                .validate()
+                .map_err(|e| WorkerError::ProfileSave(e.to_string()))?;
+            self.current_calibration = Some(calibration);
+            self.has_result = true;
+            events.manual_saved(path);
+            Ok(())
+        }
+
         fn manual_solve_deadline(&self) -> Option<std::time::Instant> {
             self.manual_solve_at
         }
@@ -6367,6 +6707,84 @@ mod tests {
         assert!(
             recorded.contains(&"manual_add_pin") && recorded.contains(&"manual_solve"),
             "the loop must run the solve, not the pin command: {recorded:?}"
+        );
+    }
+
+    #[test]
+    fn manual_validate_and_save_emit_typed_events_and_record_the_path() {
+        // MANU-07: validating a frame crosses as a typed ManualValidationFrame
+        // carrying the stitched comparison geometry + an advisory verdict;
+        // saving crosses as ManualSaved with the written path. Neither command
+        // runs the solver synchronously.
+        let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut mock = MockBackend::new(Arc::clone(&ops));
+        mock.current_calibration = Some(sample_mock_calibration());
+        mock.has_result = true;
+        let (worker, events) = EngineWorker::spawn(mock);
+        let handle = worker.handle();
+        handle
+            .send(WorkerCommand::ManualBegin { frame: 0 })
+            .unwrap();
+        handle
+            .send(WorkerCommand::ManualValidate { frame: 3 })
+            .unwrap();
+        handle
+            .send(WorkerCommand::ManualSave {
+                path: "/media/manual.json".to_string(),
+            })
+            .unwrap();
+        handle.send(WorkerCommand::Shutdown).unwrap();
+
+        let seen = drain_until_shutdown(&events);
+        let validation = seen
+            .iter()
+            .find_map(|e| match e {
+                WorkerEvent::ManualValidationFrame {
+                    frame,
+                    rgba,
+                    width,
+                    height,
+                    verdict,
+                    reference_rgba,
+                    reference_width,
+                    reference_height,
+                    ..
+                } => Some((
+                    *frame,
+                    rgba.len(),
+                    *width,
+                    *height,
+                    *verdict,
+                    reference_rgba.len(),
+                    *reference_width,
+                    *reference_height,
+                )),
+                _ => None,
+            })
+            .expect("ManualValidate must emit a ManualValidationFrame");
+        assert_eq!(validation.0, 3, "the validated frame index must cross");
+        assert_eq!(
+            validation.1 as u32,
+            validation.2 * validation.3 * 4,
+            "the validation RGBA must match its geometry"
+        );
+        assert_eq!(validation.4, crate::events::ValidationVerdict::LooksGood);
+        assert_eq!(
+            validation.5 as u32,
+            validation.6 * validation.7 * 4,
+            "the reference RGBA must match its geometry"
+        );
+        assert!(
+            seen.iter().any(|e| matches!(
+                e,
+                WorkerEvent::ManualSaved { path } if path == "/media/manual.json"
+            )),
+            "save must emit ManualSaved with the path: {seen:?}"
+        );
+        let recorded = ops.lock().unwrap().clone();
+        assert!(
+            recorded.contains(&"manual_validate") && recorded.contains(&"manual_save"),
+            "the commands must be dispatched: {recorded:?}"
         );
     }
 

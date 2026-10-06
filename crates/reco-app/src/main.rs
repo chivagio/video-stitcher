@@ -99,6 +99,8 @@ fn main() -> anyhow::Result<()> {
             commands::manual_set_layout,
             commands::manual_reset_lens,
             commands::manual_reset_rig,
+            commands::manual_validate,
+            commands::manual_save,
             commands::cancel_calibration
         ])
         .setup(|app| {
