@@ -823,6 +823,12 @@ fn solve_layout_warm(
 ///    result is `accepted == false` with [`RefinementReason::GuardRejected`] and
 ///    [`IntrinsicsRefinement::k1`] equals the baseline `left_base.d[0]`.
 ///
+/// The internal layout re-solve only warm-starts the `k1` stage: both the
+/// baseline and the candidate held-out residuals are evaluated at the **caller's**
+/// `layout` — the layout that is actually applied, since only `k1` crosses back
+/// — so the verdict is attributable to the `k1` change and never to the layout
+/// re-solve (WR-01).
+///
 /// `left_base`/`right_base` are never mutated: the caller writes the returned
 /// `k1` into the profile only when `accepted` is `true`. Each camera's raw
 /// pixels are mapped with its own intrinsics (WR-02). The layout is re-solved
@@ -927,23 +933,21 @@ pub fn refine_intrinsics(
         let final_layout =
             solve_layout_warm(&refined_matched, &solved_layout, cfg).unwrap_or(solved_layout);
 
-        // (5) Held-out (and fit) residual at the refined k1 and re-solved layout.
+        // (5) Held-out (and fit) residual at the refined k1, evaluated at the
+        //     CALLER's layout — the layout that is actually applied, since only
+        //     `k1` crosses back. Scoring the candidate at the internally
+        //     re-solved `final_layout` would let a fit-set layout re-solve drive
+        //     the verdict rather than the `k1` change (WR-01).
         let heldout_refined = reprojection_residual(
             &heldout,
-            &final_layout,
+            layout,
             left_base,
             right_base,
             candidate_k1,
             cfg.sigma,
         );
-        let fit_refined = reprojection_residual(
-            &fit,
-            &final_layout,
-            left_base,
-            right_base,
-            candidate_k1,
-            cfg.sigma,
-        );
+        let fit_refined =
+            reprojection_residual(&fit, layout, left_base, right_base, candidate_k1, cfg.sigma);
 
         // Stop as soon as the held-out fit stops improving.
         let improves = best
@@ -2077,6 +2081,49 @@ mod tests {
             r.heldout_baseline,
             r.heldout_refined
         );
+    }
+
+    /// WR-01: the held-out guard scores both the baseline and the candidate at
+    /// the CALLER's layout (the applied configuration), not at the internally
+    /// re-solved layout — so the verdict is attributable to the `k1` change.
+    #[test]
+    fn refine_intrinsics_guard_scores_at_the_callers_layout() {
+        let t = truth();
+        let base = camera_params(0.10);
+        let raw = observation_pool(&t, 0.15, 400, 4, 0.25);
+        let cfg = IntrinsicsConfig::default();
+
+        // A deliberately wrong caller layout: the internal layout re-solve will
+        // move it, which must not influence the guard.
+        let mut caller_layout = layout_from(&t);
+        caller_layout.intersect += 0.05;
+        caller_layout.x_ty -= 0.02;
+
+        let r =
+            refine_intrinsics(&raw, &caller_layout, &base, &base, &cfg).expect("driver should run");
+
+        let (_, heldout) = split_fit_heldout(&raw, &cfg);
+        let baseline =
+            reprojection_residual(&heldout, &caller_layout, &base, &base, base.d[0], cfg.sigma);
+        assert!(
+            (r.heldout_baseline - baseline).abs() < 1e-9,
+            "reported baseline {} must be the caller-layout residual {}",
+            r.heldout_baseline,
+            baseline
+        );
+        if r.accepted {
+            let refined =
+                reprojection_residual(&heldout, &caller_layout, &base, &base, r.k1, cfg.sigma);
+            assert!(
+                (r.heldout_refined - refined).abs() < 1e-9,
+                "reported refined {} must be the caller-layout residual {}",
+                r.heldout_refined,
+                refined
+            );
+            assert!(refined < baseline - cfg.improvement_epsilon);
+        } else {
+            assert_eq!(r.k1, base.d[0]);
+        }
     }
 
     /// Test 6 (no-improvement): a refinement that cannot improve the held-out
