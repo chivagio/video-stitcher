@@ -1,8 +1,10 @@
 <!--
   File drop slot (IMPT-01 / D3-03): a labelled camera slot with a picker + HTML5
-  drop target. Both paths converge on the same validated worker command. The
-  drop zone is keyboard-reachable (a native <button>) with an aria-label naming
-  the camera and role (UI-SPEC Accessibility).
+  drop target. Both paths converge on the same validated worker command
+  (`set_input`), so validation, metadata probing and warnings are identical.
+  The drop zone is keyboard-reachable (a native <button>) with an aria-label
+  naming the camera and role (UI-SPEC Accessibility). A multi-file drop is
+  forwarded as a list so the screen can fill A then B.
 -->
 <script lang="ts">
   import type { InputRole } from "../lib/types";
@@ -12,11 +14,11 @@
   let {
     slot,
     onChoose,
-    onDrop,
+    onDropFiles,
   }: {
     slot: InputSlot;
     onChoose: (role: InputRole) => void;
-    onDrop: (role: InputRole, path: string) => void;
+    onDropFiles: (role: InputRole, paths: string[]) => void;
   } = $props();
 
   let dragging = $state(false);
@@ -29,16 +31,19 @@
     slot.path === null ? "file" : (slot.path.split(/[\\/]/).pop() ?? slot.path),
   );
 
+  /** Pull the OS path off a dropped file (Tauri exposes `path`). */
+  function pathOf(file: File): string {
+    const f = file as File & { path?: string };
+    return f.path ?? f.name;
+  }
+
   function handleDrop(e: DragEvent): void {
     e.preventDefault();
     dragging = false;
     const files = e.dataTransfer?.files;
     if (!files || files.length === 0) return;
-    // Tauri exposes the OS path on dropped files; fall back to the file name
-    // so a browser-context drop still yields a non-empty value.
-    const file = files[0] as File & { path?: string };
-    const path = file.path ?? file.name;
-    if (path) onDrop(slot.role, path);
+    const paths = Array.from(files).map(pathOf).filter((p) => p.length > 0);
+    if (paths.length > 0) onDropFiles(slot.role, paths);
   }
 </script>
 
@@ -63,11 +68,11 @@
       <span class="drop-text">Reading file…</span>
     {:else if slot.status === "error"}
       <span class="drop-text error">
-        Couldn't read <span class="filename">{filename}</span>: {slot.error ?? "unknown error"}.
+        Couldn't read <span class="filename" title={slot.path ?? ""}>{filename}</span>: {slot.error ?? "unknown error"}.
         Choose another file.
       </span>
     {:else if slot.status === "ready"}
-      <span class="drop-text filename">{filename}</span>
+      <span class="drop-text filename" title={slot.path ?? ""}>{filename}</span>
       <span class="drop-hint">Choose another file…</span>
     {:else}
       <span class="drop-text">Drop a video file here — or <span class="link">Choose file…</span></span>
@@ -76,6 +81,8 @@
 
   {#if slot.status === "ready"}
     <MetadataTable metadata={slot.metadata} />
+  {:else if slot.status === "loading"}
+    <MetadataTable metadata={null} loading />
   {/if}
 </section>
 
@@ -135,6 +142,7 @@
   .filename {
     font-family: var(--font-mono);
     color: var(--color-body-text);
+    overflow-wrap: anywhere;
   }
 
   .drop-hint {

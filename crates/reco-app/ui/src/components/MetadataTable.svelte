@@ -1,12 +1,20 @@
 <!--
   Metadata table (IMPT-02): Resolution / Frame rate / Duration / Codec rows,
   each carrying a ProvenanceTag. A missing value renders an em-dash, never `0`.
+  While probing, skeleton rows hold the layout (UI-SPEC metadata-table loading).
+  Fixed two-column rows; numeric values use the tabular monospace family and
+  long values ellipsize with `title` (UI-SPEC metadata-table overflow/long-text).
 -->
 <script lang="ts">
   import type { InputMetadata, MetadataField } from "../lib/types";
   import ProvenanceTag from "./ProvenanceTag.svelte";
 
-  let { metadata }: { metadata: InputMetadata | null } = $props();
+  let {
+    metadata,
+    loading = false,
+  }: { metadata: InputMetadata | null; loading?: boolean } = $props();
+
+  const labels = ["Resolution", "Frame rate", "Duration", "Codec"];
 
   const rows = $derived(
     metadata === null
@@ -24,7 +32,18 @@
   }
 </script>
 
-{#if metadata !== null}
+{#if loading}
+  <dl class="metadata-table" aria-busy="true" aria-label="Reading metadata">
+    {#each labels as label}
+      <div class="metadata-row">
+        <dt class="metadata-label">{label}</dt>
+        <dd class="metadata-value">
+          <span class="skeleton" aria-hidden="true"></span>
+        </dd>
+      </div>
+    {/each}
+  </dl>
+{:else if metadata !== null}
   <dl class="metadata-table">
     {#each rows as row}
       <div class="metadata-row">
@@ -70,9 +89,19 @@
 
   .value {
     font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
     color: var(--color-body-text);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  .skeleton {
+    display: inline-block;
+    width: 120px;
+    height: 12px;
+    border-radius: var(--space-xs);
+    background: var(--color-dominant);
+    opacity: 0.7;
   }
 </style>

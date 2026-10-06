@@ -14,7 +14,19 @@
     | "log"
     | "controls"
     | "reset"
-    | "window";
+    | "window"
+    | "file"
+    | "folder-open"
+    | "save"
+    | "warning"
+    | "check"
+    | "check-circle"
+    | "close"
+    | "chevron-down"
+    | "camera"
+    | "search"
+    | "info"
+    | "refresh";
 
   let { name, size = 16 }: { name: IconName; size?: number } = $props();
 </script>
@@ -68,5 +80,42 @@
   {:else if name === "window"}
     <rect x="3" y="3" width="18" height="18" rx="2" />
     <path d="M3 9h18" />
+  {:else if name === "file"}
+    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+    <polyline points="14 2 14 8 20 8" />
+  {:else if name === "folder-open"}
+    <path d="M6 14l1.45-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.55 6a2 2 0 0 1-1.94 1.5H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.93a2 2 0 0 1 1.66.9l.82 1.2a2 2 0 0 0 1.66.9H18a2 2 0 0 1 2 2v2" />
+  {:else if name === "save"}
+    <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z" />
+    <polyline points="17 21 17 13 7 13 7 21" />
+    <polyline points="7 3 7 8 15 8" />
+  {:else if name === "warning"}
+    <path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" />
+    <line x1="12" y1="9" x2="12" y2="13" />
+    <line x1="12" y1="17" x2="12.01" y2="17" />
+  {:else if name === "check"}
+    <polyline points="20 6 9 17 4 12" />
+  {:else if name === "check-circle"}
+    <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14" />
+    <polyline points="22 4 12 14.01 9 11.01" />
+  {:else if name === "close"}
+    <line x1="18" y1="6" x2="6" y2="18" />
+    <line x1="6" y1="6" x2="18" y2="18" />
+  {:else if name === "chevron-down"}
+    <polyline points="6 9 12 15 18 9" />
+  {:else if name === "camera"}
+    <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z" />
+    <circle cx="12" cy="13" r="4" />
+  {:else if name === "search"}
+    <circle cx="11" cy="11" r="8" />
+    <line x1="21" y1="21" x2="16.65" y2="16.65" />
+  {:else if name === "info"}
+    <circle cx="12" cy="12" r="10" />
+    <line x1="12" y1="16" x2="12" y2="12" />
+    <line x1="12" y1="8" x2="12.01" y2="8" />
+  {:else if name === "refresh"}
+    <polyline points="23 4 23 10 17 10" />
+    <polyline points="1 20 1 14 7 14" />
+    <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15" />
   {/if}
 </svg>

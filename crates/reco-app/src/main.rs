@@ -447,6 +447,13 @@ fn add_chrome_webview(
                 tauri::WebviewUrl::App("index.html".into()),
             )
             .transparent(true)
+            // HTML5 drag-and-drop path (D3-02): Tauri v2 installs a native
+            // drag-drop handler that intercepts OS file drops (and on Windows
+            // replaces WebView2's handler), suppressing the DOM `drop` event the
+            // Import screen's drop zones use. Disable it so the webview receives
+            // real DOM drag events; the resulting OS path is still passed
+            // verbatim to the validated `set_input` command (T-03-13).
+            .disable_drag_drop_handler()
             .auto_resize(),
             tauri::LogicalPosition::new(0.0, 0.0),
             tauri::LogicalSize::new(WIDTH, HEIGHT),

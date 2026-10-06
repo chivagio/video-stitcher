@@ -10,7 +10,7 @@
  * truth for the native viewport geometry; these CSS values MIRROR the
  * Rust constants and must match:
  *   TRANSPORT_BAR_HEIGHT / CONTROLS_PANEL_WIDTH /
- *   CONTROLS_PANEL_COLLAPSED_WIDTH / LOG_DRAWER_HEIGHT.
+ *   CONTROLS_PANEL_COLLAPSED_WIDTH / LOG_DRAWER_HEIGHT / WORKFLOW_RAIL_HEIGHT.
  *
  * The top region must stay transparent so the native panorama child view
  * shows through: never paint a background over it (Phase 2 constraint 1).
@@ -24,6 +24,9 @@
   --color-log-info: #c8c8c8;
   --color-log-warn: #e0a02e;
   --color-log-error: #e5484d;
+  /* Semantic success (UI-SPEC Color): High confidence band, completed stages,
+     "Inputs look compatible", save/load success. */
+  --color-success: #3fb950;
 
   /* Spacing scale (multiples of 4) */
   --space-xs: 4px;
@@ -35,6 +38,7 @@
   --space-3xl: 64px;
 
   /* Chrome geometry (UI-SPEC Surface Layout Contract) */
+  --workflow-rail-height: 48px;
   --transport-bar-height: 72px;
   --controls-panel-width: 280px;
   --controls-panel-collapsed-width: 40px;
@@ -46,6 +50,9 @@
   --text-body: 14px;
   --text-label: 14px;
   --text-heading: 20px;
+  /* Display 28px: reserved for screen titles and the scorecard confidence
+     value only (UI-SPEC Typography). */
+  --text-display: 28px;
   --line-body: 1.5;
   --line-tight: 1.2;
   --weight-regular: 400;

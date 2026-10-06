@@ -1,12 +1,16 @@
 <!--
-  Provenance tag (UI-SPEC): fixed tags `probed` / `estimated` (and `overridden`
-  reserved for the lens picker). Estimated values are visibly tagged; nothing
-  derived is presented as authoritative (IMPT-02 / D-05).
+  Provenance tag (UI-SPEC): fixed tags `probed` / `estimated` for metadata and
+  `detected` / `estimated` / `overridden` for lens rows. Estimated values are
+  visibly tagged; nothing derived is presented as authoritative (IMPT-02 / D-05).
+  The fixed vocabulary carries no user text and never overflows.
 -->
 <script lang="ts">
   import type { Provenance } from "../lib/types";
 
-  let { provenance }: { provenance: Provenance } = $props();
+  /** The fixed tag vocabulary (UI-SPEC Provenance tags + Lens Profile Contract). */
+  export type TagKind = Provenance | "detected" | "overridden";
+
+  let { provenance }: { provenance: TagKind } = $props();
 </script>
 
 <span class="tag {provenance}">{provenance}</span>
@@ -24,7 +28,8 @@
     white-space: nowrap;
   }
 
-  .tag.probed {
+  .tag.probed,
+  .tag.detected {
     color: var(--color-log-info);
     background: var(--color-dominant);
   }
@@ -32,5 +37,12 @@
   .tag.estimated {
     color: var(--color-log-warn);
     border-color: var(--color-log-warn);
+  }
+
+  /* The operator's own lens choice: the reserved accent tag (UI-SPEC Color
+     reserved list item 5). */
+  .tag.overridden {
+    color: var(--color-accent);
+    border-color: var(--color-accent);
   }
 </style>
