@@ -423,9 +423,11 @@ pub fn new_session_transport(
 /// mapping is the whole point of IMPT-02:
 ///
 /// * `resolution` — read directly from the decoder → `Probed`.
-/// * `fps` — read directly from the decoder → `Probed`.
-/// * `duration` — derived from `total_frames / fps` (and `total_frames` is
-///   itself a `duration × fps` estimate) → `Estimated`; never authoritative.
+/// * `fps` — the exact `fps_rational` when the container reports one, else the
+///   decoder's `f64` → `Probed`.
+/// * `duration` — the container-reported `duration_secs` → `Probed`; otherwise
+///   derived from `total_frames / fps` (and `total_frames` is itself a
+///   `duration × fps` estimate) → `Estimated`; never authoritative.
 /// * `codec` — read directly from the container's codec parameters →
 ///   `Probed`; absent (`value: None`) when the container omits it, rendered
 ///   as an em-dash, never `0`.
@@ -440,16 +442,22 @@ pub fn project_metadata(
         MetadataField::missing(Provenance::Probed)
     };
 
-    let fps = if probe.fps > 0.0 {
-        MetadataField::probed(format_fps(probe.fps))
-    } else {
-        MetadataField::missing(Provenance::Probed)
+    // Prefer the exact rational the container reports (IMPT-02 / D3-04); fall
+    // back to the decoder's f64 only when no rational is available.
+    let fps = match probe.fps_rational {
+        Some((n, d)) if d > 0 => MetadataField::probed(format_fps(n as f64 / d as f64)),
+        _ if probe.fps > 0.0 => MetadataField::probed(format_fps(probe.fps)),
+        _ => MetadataField::missing(Provenance::Probed),
     };
 
-    let duration = if probe.fps > 0.0 && probe.total_frames > 0 {
-        MetadataField::estimated(format_duration(probe.total_frames as f64 / probe.fps))
-    } else {
-        MetadataField::missing(Provenance::Estimated)
+    // A container-reported duration is a direct read → `Probed`; deriving it
+    // from `total_frames / fps` is an estimate and stays `Estimated` (IMPT-02).
+    let duration = match probe.duration_secs {
+        Some(secs) if secs > 0.0 => MetadataField::probed(format_duration(secs)),
+        _ if probe.fps > 0.0 && probe.total_frames > 0 => {
+            MetadataField::estimated(format_duration(probe.total_frames as f64 / probe.fps))
+        }
+        _ => MetadataField::missing(Provenance::Estimated),
     };
 
     // Codec is read directly from the container (E2). Absent, never zero.
@@ -3756,7 +3764,7 @@ mod tests {
     }
 
     #[test]
-    fn project_metadata_reports_probed_codec_and_derived_duration_estimated() {
+    fn project_metadata_reports_probed_codec_and_container_duration() {
         use crate::events::Provenance;
         let probe = reco_io::ffmpeg::calibration_io::VideoProbe {
             width: 1920,
@@ -3770,14 +3778,36 @@ mod tests {
         let md = project_metadata(&probe);
         assert_eq!(md.resolution.value.as_deref(), Some("1920×1080"));
         assert_eq!(md.resolution.provenance, Provenance::Probed);
+        // Exact rational preferred; 30/1 -> "30 fps".
         assert_eq!(md.fps.value.as_deref(), Some("30 fps"));
         assert_eq!(md.fps.provenance, Provenance::Probed);
-        // 60 frames / 30 fps = 2 s -> "0:02", and it is DERIVED (estimated).
+        // WR-03: a container-reported duration is a direct read -> PROBED.
         assert_eq!(md.duration.value.as_deref(), Some("0:02"));
-        assert_eq!(md.duration.provenance, Provenance::Estimated);
+        assert_eq!(md.duration.provenance, Provenance::Probed);
         // E2: a container codec is a direct read -> probed, never absent.
         assert_eq!(md.codec.value.as_deref(), Some("h264"));
         assert_eq!(md.codec.provenance, Provenance::Probed);
+    }
+
+    #[test]
+    fn project_metadata_derives_duration_when_the_container_omits_it() {
+        use crate::events::Provenance;
+        // No `duration_secs` -> derive from total_frames / fps -> Estimated.
+        let probe = reco_io::ffmpeg::calibration_io::VideoProbe {
+            width: 1920,
+            height: 1080,
+            fps: 30.0,
+            total_frames: 90,
+            codec: None,
+            duration_secs: None,
+            fps_rational: None,
+        };
+        let md = project_metadata(&probe);
+        assert_eq!(md.fps.value.as_deref(), Some("30 fps"));
+        assert_eq!(md.fps.provenance, Provenance::Probed);
+        // 90 / 30 = 3 s -> "0:03", derived (estimated), never authoritative.
+        assert_eq!(md.duration.value.as_deref(), Some("0:03"));
+        assert_eq!(md.duration.provenance, Provenance::Estimated);
     }
 
     #[test]
