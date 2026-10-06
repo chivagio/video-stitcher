@@ -21,6 +21,8 @@
     | "warning"
     | "alert-triangle"
     | "wrench"
+    | "bug"
+    | "eye"
     | "check"
     | "check-circle"
     | "close"
@@ -101,6 +103,18 @@
     <line x1="12" y1="17" x2="12.01" y2="17" />
   {:else if name === "wrench"}
     <path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z" />
+  {:else if name === "bug"}
+    <rect x="8" y="6" width="8" height="14" rx="4" />
+    <path d="M8 10H5a1 1 0 0 0-1 1v0a1 1 0 0 0 1 1h3" />
+    <path d="M16 10h3a1 1 0 0 1 1 1v0a1 1 0 0 1-1 1h-3" />
+    <path d="M8 14H5a1 1 0 0 0-1 1v0a1 1 0 0 0 1 1h3" />
+    <path d="M16 14h3a1 1 0 0 1 1 1v0a1 1 0 0 1-1 1h-3" />
+    <path d="M9 6 7 4" />
+    <path d="M15 6l2-2" />
+    <line x1="12" y1="6" x2="12" y2="20" />
+  {:else if name === "eye"}
+    <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" />
+    <circle cx="12" cy="12" r="3" />
   {:else if name === "check"}
     <polyline points="20 6 9 17 4 12" />
   {:else if name === "check-circle"}

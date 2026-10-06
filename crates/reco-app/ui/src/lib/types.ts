@@ -200,6 +200,46 @@ export interface CalibrationDiagnosis {
   metrics: DiagnosisMetrics;
 }
 
+/** One feature-match point for the debug inspector (mirror `events::DebugPoint`). */
+export interface DebugPoint {
+  /** Normalized x in the paired frame (`0..1`). */
+  x_nx: number;
+  /** Normalized y in the paired frame (`0..1`). */
+  y_nx: number;
+  /** Reprojection-error proxy for this point (residual map colour). */
+  error: number;
+}
+
+/** One row of the per-frame match-count table (mirror `events::FrameMatchRow`). */
+export interface FrameMatchRow {
+  frame: number;
+  keypoints_left: number;
+  keypoints_right: number;
+  post_ratio_test: number;
+  post_spatial_filter: number;
+  post_ransac: number;
+}
+
+/**
+ * The bounded debug inspector payload (mirror `events::DebugReport`).
+ * Empty thumbnails + zero dimensions mean "no frame pair was retained".
+ */
+export interface DebugReport {
+  frame_index: number;
+  frames_total: number;
+  left_width: number;
+  left_height: number;
+  right_width: number;
+  right_height: number;
+  left_thumb: number[];
+  right_thumb: number[];
+  verified: DebugPoint[];
+  rejected: DebugPoint[];
+  residual_error: number;
+  per_frame: FrameMatchRow[];
+  points_capped: boolean;
+}
+
 /** Advanced calibration options (mirror `events::CalibrationOptions`). */
 export interface CalibrationOptions {
   num_frames: number | null;
@@ -235,6 +275,7 @@ export type WorkerEventTyped =
     }
   | { kind: "calibration_result"; data: { scorecard: Scorecard } }
   | { kind: "calibration_failed"; data: { diagnosis: CalibrationDiagnosis } }
+  | { kind: "calibration_debug"; data: { report: DebugReport } }
   | { kind: "profile_loaded"; data: { path: string } }
   | { kind: "profile_saved"; data: { path: string } }
   | { kind: "result_invalidated"; data: null }
