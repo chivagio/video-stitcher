@@ -159,8 +159,9 @@ fn aggregate_diagnosis_metrics(frames: &[FrameMatches]) -> DiagnosisMetrics {
 ///
 /// Pure (no device/file/channel): the worker calls this before the diagnosis
 /// crosses the event channel, and the frontend only renders the result. Every
-/// error variant gets a specific cause; the fallback variants use the typed
-/// `Display` text plus a generic next step, never a fabricated cause.
+/// [`CalibrateError`] variant gets a specific cause and fix; `InvalidConfig`
+/// and `FftError` fall back to the typed `Display` text plus a generic next
+/// step — never a fabricated cause.
 pub fn diagnose_calibration_failure(
     source: &CalibrateError,
     stage: CalibrationStage,
@@ -168,12 +169,56 @@ pub fn diagnose_calibration_failure(
 ) -> CalibrationDiagnosis {
     let metrics = aggregate_diagnosis_metrics(frames);
     let (cause, fix) = match source {
+        CalibrateError::NoKeypoints { camera, frame_idx } => (
+            format!("No features were detected in the {camera} frame {frame_idx}."),
+            "Shoot a well-lit, textured scene — avoid blank walls, plain sky, or a dark frame — \
+             and check the camera's exposure and focus."
+                .to_string(),
+        ),
+        CalibrateError::InsufficientMatches { got, min } => (
+            format!("Only {got} matches were found, fewer than the {min} the calibration needs."),
+            "Increase the overlap between the cameras, avoid motion blur and large exposure \
+             differences, and check for rolling-shutter skew."
+                .to_string(),
+        ),
+        CalibrateError::RansacFailed => (
+            "Geometric verification rejected every candidate match.".to_string(),
+            "The views may barely overlap or a large moving object dominates the scene; reduce \
+             the mismatched regions (or mask them with the field ROI) and re-aim the cameras."
+                .to_string(),
+        ),
+        CalibrateError::OptimizerFailed { max_evals } => (
+            format!("The optimizer did not converge after {max_evals} evaluations."),
+            "The cameras may be out of sync or the starting guess too far off; confirm the sync \
+             offset and enable IMU rotation seeds."
+                .to_string(),
+        ),
         CalibrateError::NoUsableFrames => (
             "No frame pair produced usable matches.".to_string(),
-            "Increase overlap between the cameras and set the lens profile.".to_string(),
+            "Check that the two clips overlap, and set the correct lens profile so undistortion \
+             matches the camera."
+                .to_string(),
         ),
-        other => (
-            other.to_string(),
+        CalibrateError::InvalidDimensions { width, height } => (
+            format!("A frame had invalid dimensions ({width}×{height})."),
+            "Re-export the clip at a normal video resolution and try again.".to_string(),
+        ),
+        CalibrateError::InvalidBuffer { expected, got } => (
+            format!("A frame buffer was the wrong size (expected {expected} bytes, got {got})."),
+            "This points to a decoding mismatch; re-import the clip or try a different codec."
+                .to_string(),
+        ),
+        CalibrateError::ImageTooSmall { width, height } => (
+            format!("The frames are too small for feature detection ({width}×{height})."),
+            "Use higher-resolution footage — feature matching needs images at least a few hundred \
+             pixels on each side."
+                .to_string(),
+        ),
+        // `InvalidConfig` / `FftError` have no actionable mapping of their own:
+        // fall back to the typed Display text plus a generic next step rather
+        // than inventing a cause (CALB-04 / T-04-02).
+        CalibrateError::FftError(_) | CalibrateError::InvalidConfig(_) => (
+            source.to_string(),
             "Check the clips and settings, then try again.".to_string(),
         ),
     };
