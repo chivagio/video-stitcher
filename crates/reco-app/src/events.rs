@@ -634,11 +634,7 @@ impl WorkerEvent {
             },
             WorkerEvent::LensCandidates { role, candidates } => LogLine {
                 level: Level::Info,
-                message: format!(
-                    "lens candidates: {} for {}",
-                    candidates.len(),
-                    role.name()
-                ),
+                message: format!("lens candidates: {} for {}", candidates.len(), role.name()),
             },
             WorkerEvent::LensOverrideApplied { role, candidate } => LogLine {
                 level: Level::Info,
@@ -1088,7 +1084,10 @@ mod tests {
             json.contains("\"kind\":\"import_metadata\""),
             "unexpected json: {json}"
         );
-        assert!(json.contains("\"role\":\"left\""), "unexpected json: {json}");
+        assert!(
+            json.contains("\"role\":\"left\""),
+            "unexpected json: {json}"
+        );
         assert!(
             json.contains("\"provenance\":\"estimated\""),
             "unexpected json: {json}"

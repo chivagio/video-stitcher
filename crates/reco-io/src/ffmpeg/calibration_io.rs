@@ -73,11 +73,7 @@ pub fn probe_video(path: &Path) -> Result<VideoProbe, CalibrationIoError> {
         .unwrap_or((fps * 60.0) as u64);
     let fps_rational = {
         let r = decoder.frame_rate();
-        if r.1 > 0 {
-            Some((r.0, r.1))
-        } else {
-            None
-        }
+        if r.1 > 0 { Some((r.0, r.1)) } else { None }
     };
 
     Ok(VideoProbe {

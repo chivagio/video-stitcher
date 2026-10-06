@@ -9,11 +9,11 @@
 //!
 //! Typed `thiserror` errors only; this module deliberately imports no `anyhow`.
 
-use reco_core::calibration::CameraParams;
 use reco_calibrate::types::{
     CalibrationConfig, CalibrationResult, CalibrationStep, LensProfileInfo, ProfileSource,
     SyncMethod as EngineSyncMethod,
 };
+use reco_core::calibration::CameraParams;
 
 use crate::events::{
     CalibrationOptions, CalibrationStage, CompatibilityCode, CompatibilityIssue, ConfidenceBand,
@@ -57,9 +57,7 @@ pub fn check_compatibility(
     {
         issues.push(CompatibilityIssue {
             code: CompatibilityCode::ResolutionMismatch,
-            message: format!(
-                "Camera A is {lw}×{lh} but Camera B is {rw}×{rh}"
-            ),
+            message: format!("Camera A is {lw}×{lh} but Camera B is {rw}×{rh}"),
         });
         // Aspect ratio, tolerance ~1% of the larger aspect.
         let left_aspect = lw as f64 / lh as f64;
@@ -80,9 +78,7 @@ pub fn check_compatibility(
     {
         issues.push(CompatibilityIssue {
             code: CompatibilityCode::FpsMismatch,
-            message: format!(
-                "Camera A runs at {lfps} fps but Camera B runs at {rfps} fps"
-            ),
+            message: format!("Camera A runs at {lfps} fps but Camera B runs at {rfps} fps"),
         });
     }
 
@@ -236,10 +232,7 @@ fn profile_source_label(source: &ProfileSource) -> String {
     match source {
         ProfileSource::Database => "database".to_string(),
         ProfileSource::File(path) => {
-            let name = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("file");
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
             format!("file: {name}")
         }
         ProfileSource::AutoDetected => "auto-detected".to_string(),
@@ -359,7 +352,11 @@ mod tests {
             .iter()
             .filter(|i| i.code == CompatibilityCode::SameFile)
             .collect();
-        assert_eq!(same_file.len(), 1, "expected exactly one SameFile: {issues:?}");
+        assert_eq!(
+            same_file.len(),
+            1,
+            "expected exactly one SameFile: {issues:?}"
+        );
     }
 
     #[test]
@@ -484,11 +481,8 @@ mod tests {
         assert!(one_sided.left_params.is_none() && one_sided.right_params.is_none());
 
         // A paired override is applied.
-        let paired = build_video_options(
-            &options,
-            Some(camera(1920, 1080)),
-            Some(camera(1920, 1080)),
-        );
+        let paired =
+            build_video_options(&options, Some(camera(1920, 1080)), Some(camera(1920, 1080)));
         assert!(paired.left_params.is_some() && paired.right_params.is_some());
 
         // Default options leave the engine defaults untouched.

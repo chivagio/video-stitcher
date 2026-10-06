@@ -1201,7 +1201,10 @@ mod tests {
             "hiding a shown window is a change"
         );
         visibility.set(false);
-        assert!(!visibility.is_visible(), "the flag records the hidden state");
+        assert!(
+            !visibility.is_visible(),
+            "the flag records the hidden state"
+        );
         assert!(
             !needs_change(&visibility, false),
             "repeated hide is a no-op"

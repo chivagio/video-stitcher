@@ -220,7 +220,9 @@ impl EventSink {
         role: crate::events::InputRole,
         candidates: Vec<crate::events::LensCandidate>,
     ) {
-        let _ = self.tx.send(WorkerEvent::LensCandidates { role, candidates });
+        let _ = self
+            .tx
+            .send(WorkerEvent::LensCandidates { role, candidates });
     }
 
     /// Emit the applied (or cleared) lens override for one input (IMPT-04).
@@ -229,7 +231,9 @@ impl EventSink {
         role: crate::events::InputRole,
         candidate: Option<crate::events::LensCandidate>,
     ) {
-        let _ = self.tx.send(WorkerEvent::LensOverrideApplied { role, candidate });
+        let _ = self
+            .tx
+            .send(WorkerEvent::LensOverrideApplied { role, candidate });
     }
 
     /// Emit a stage-checklist row change (CALB-01).
@@ -258,12 +262,16 @@ impl EventSink {
 
     /// Emit that a profile was loaded (IMPT-05).
     fn profile_loaded(&self, path: impl Into<String>) {
-        let _ = self.tx.send(WorkerEvent::ProfileLoaded { path: path.into() });
+        let _ = self
+            .tx
+            .send(WorkerEvent::ProfileLoaded { path: path.into() });
     }
 
     /// Emit that a profile was saved (IMPT-06).
     fn profile_saved(&self, path: impl Into<String>) {
-        let _ = self.tx.send(WorkerEvent::ProfileSaved { path: path.into() });
+        let _ = self
+            .tx
+            .send(WorkerEvent::ProfileSaved { path: path.into() });
     }
 
     /// Emit that the current result no longer matches the inputs (D3-08).
@@ -1956,8 +1964,8 @@ impl EngineBackend for GpuEngineBackend {
             width: candidate.width,
             height: candidate.height,
         };
-        let params = reco_calibrate::lens_database::LensDatabase::embedded()
-            .load_by_summary(&summary);
+        let params =
+            reco_calibrate::lens_database::LensDatabase::embedded().load_by_summary(&summary);
         self.lens_overrides[idx] = params;
         events.info(format!(
             "{} lens override: {} {}",
@@ -2039,7 +2047,11 @@ impl EngineBackend for GpuEngineBackend {
             if let Ok(mut guard) = detail.lock() {
                 *guard = (stage, progress.detail.clone());
             }
-            events.stage(stage, crate::events::StageStatus::Active, progress.detail.clone());
+            events.stage(
+                stage,
+                crate::events::StageStatus::Active,
+                progress.detail.clone(),
+            );
             events.progress(stage_fraction(stage));
         };
 
@@ -2073,7 +2085,10 @@ impl EngineBackend for GpuEngineBackend {
             }
             Err(reco_calibrate::video::CalibrateVideosError::Cancelled) => {
                 // CALB-02: the partial result is discarded and never offered.
-                events.log(Level::Warn, "calibration cancelled — partial result discarded");
+                events.log(
+                    Level::Warn,
+                    "calibration cancelled — partial result discarded",
+                );
                 Ok(())
             }
             Err(e) => {
@@ -2090,10 +2105,9 @@ impl EngineBackend for GpuEngineBackend {
     fn load_profile(&mut self, path: String, events: &EventSink) -> Result<(), WorkerError> {
         // Validate by deserialization into `MatchCalibration` (size cap + typed
         // `validate()`); never deserialize unchecked (T-03-08).
-        let calibration = reco_core::calibration::MatchCalibration::from_file(
-            std::path::Path::new(&path),
-        )
-        .map_err(|e| WorkerError::ProfileLoad(e.to_string()))?;
+        let calibration =
+            reco_core::calibration::MatchCalibration::from_file(std::path::Path::new(&path))
+                .map_err(|e| WorkerError::ProfileLoad(e.to_string()))?;
         self.current_calibration = Some(calibration);
         self.has_result = true;
         events.profile_loaded(path);
@@ -2101,9 +2115,10 @@ impl EngineBackend for GpuEngineBackend {
     }
 
     fn save_profile(&mut self, path: String, events: &EventSink) -> Result<(), WorkerError> {
-        let calibration = self.current_calibration.as_ref().ok_or_else(|| {
-            WorkerError::ProfileSave("no calibration result to save".to_string())
-        })?;
+        let calibration = self
+            .current_calibration
+            .as_ref()
+            .ok_or_else(|| WorkerError::ProfileSave("no calibration result to save".to_string()))?;
         calibration
             .to_file(std::path::Path::new(&path))
             .map_err(|e| WorkerError::ProfileSave(e.to_string()))?;
@@ -2845,7 +2860,8 @@ impl GpuEngineBackend {
             let input_resolution = self.inputs[idx]
                 .as_ref()
                 .and_then(crate::calibration::parse_resolution);
-            if let (Some((iw, ih)), Some(over)) = (input_resolution, self.lens_overrides[idx].as_ref())
+            if let (Some((iw, ih)), Some(over)) =
+                (input_resolution, self.lens_overrides[idx].as_ref())
                 && (over.width, over.height) != (iw, ih)
             {
                 issues.push(crate::events::CompatibilityIssue {
@@ -2924,8 +2940,13 @@ pub fn spawn_gpu_worker(
     startup_fallback: Option<String>,
     calibration_cancel: Arc<AtomicBool>,
 ) -> Result<SpawnedWorker, WorkerError> {
-    let backend =
-        GpuEngineBackend::new(instance, presenters, viewport, startup_fallback, calibration_cancel)?;
+    let backend = GpuEngineBackend::new(
+        instance,
+        presenters,
+        viewport,
+        startup_fallback,
+        calibration_cancel,
+    )?;
     let readback_tx = backend.readback_sender();
     let (worker, events) = EngineWorker::spawn(backend);
     Ok((worker, events, readback_tx))
@@ -3173,10 +3194,7 @@ mod tests {
         /// Share the modelled native-view visibility with the test, so the
         /// screen-driven `set_visible` value is observable after the backend is
         /// moved onto the worker thread.
-        fn with_screen_visible(
-            mut self,
-            visible: Arc<std::sync::Mutex<Option<bool>>>,
-        ) -> Self {
+        fn with_screen_visible(mut self, visible: Arc<std::sync::Mutex<Option<bool>>>) -> Self {
             self.screen_visible = visible;
             self
         }
@@ -3361,11 +3379,7 @@ mod tests {
             Ok(())
         }
 
-        fn load_profile(
-            &mut self,
-            path: String,
-            events: &EventSink,
-        ) -> Result<(), WorkerError> {
+        fn load_profile(&mut self, path: String, events: &EventSink) -> Result<(), WorkerError> {
             self.record("load_profile");
             // Mirror the real backend's typed-error shape without touching disk.
             if path.is_empty() {
@@ -3377,11 +3391,7 @@ mod tests {
             Ok(())
         }
 
-        fn save_profile(
-            &mut self,
-            path: String,
-            events: &EventSink,
-        ) -> Result<(), WorkerError> {
+        fn save_profile(&mut self, path: String, events: &EventSink) -> Result<(), WorkerError> {
             self.record("save_profile");
             if self.current_calibration.is_none() {
                 return Err(WorkerError::ProfileSave(
@@ -3943,13 +3953,15 @@ mod tests {
 
         let seen = drain_until_shutdown(&events);
         assert!(
-            seen.iter()
-                .any(|e| matches!(e, WorkerEvent::ProfileLoaded { path } if path == "/media/match.json")),
+            seen.iter().any(
+                |e| matches!(e, WorkerEvent::ProfileLoaded { path } if path == "/media/match.json")
+            ),
             "load must emit ProfileLoaded with the path"
         );
         assert!(
-            seen.iter()
-                .any(|e| matches!(e, WorkerEvent::ProfileSaved { path } if path == "/media/out.json")),
+            seen.iter().any(
+                |e| matches!(e, WorkerEvent::ProfileSaved { path } if path == "/media/out.json")
+            ),
             "save must emit ProfileSaved with the path"
         );
     }

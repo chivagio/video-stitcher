@@ -209,8 +209,7 @@ fn run_skeleton(app: &mut tauri::App) -> Result<(), SkeletonError> {
     // is managed as Tauri state so `cancel_calibration` can set it directly —
     // the documented bypass of the command channel the blocked worker cannot
     // drain (RESEARCH E8 / Pitfall 3).
-    let calibration_cancel =
-        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let calibration_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (worker, events, readback_tx) = worker::spawn_gpu_worker(
         instance,
         presenter_chain,

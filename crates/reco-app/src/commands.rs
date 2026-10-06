@@ -1011,7 +1011,13 @@ mod tests {
     #[test]
     fn validate_profile_path_rejects_empty_and_non_local() {
         assert!(validate_profile_path("/home/op/match.json").is_ok());
-        for bad in ["", "   ", "https://example.com/match.json", "pipe:0", "data:abc"] {
+        for bad in [
+            "",
+            "   ",
+            "https://example.com/match.json",
+            "pipe:0",
+            "data:abc",
+        ] {
             assert!(
                 matches!(
                     validate_profile_path(bad),
