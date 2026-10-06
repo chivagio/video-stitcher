@@ -40,6 +40,45 @@ cargo run -p reco-cli -- preview left.mp4 right.mp4 -c match.json
 cargo run --release -p reco-cli --features profiling -- stitch left.mp4 right.mp4 -c match.json -o out.mp4 --max-frames 300  # Profile 300 frames → reco-trace.json (open in ui.perfetto.dev)
 ```
 
+## Headless GUI verification (reco-app)
+
+Agents can run the Tauri app and screenshot it without a human at a display.
+The environment ships `Xvfb`, `xdotool`, and ImageMagick `import`; read the
+resulting PNG with the image-reading tool.
+
+```bash
+cargo build -p reco-app
+Xvfb :99 -screen 0 1280x800x24 -nolisten tcp &
+export DISPLAY=:99
+export RECO_TEST_MEDIA_DIR="$PWD/test-media" RUST_LOG=reco_app=info
+dbus-run-session -- target/debug/reco-app &     # window name is "Reco"
+xdotool search --name '^Reco$'                   # wait for the window id
+import -display :99 -window root /tmp/opencode/shot.png
+```
+
+- Existing reference rig: `scripts/phase2-chrome-probe.sh` (Xvfb + `xdotool` +
+  log assertions).
+- **Native child view covers the webview.** On X11 the Phase 1/2 native
+  `wgpu` child view composites ABOVE the webview and hides the top region, and
+  pointer input there goes to the child, not the webview. Non-Preview screens
+  (Import/Calibrate) are only visible once the native view is suspended
+  (Phase 3 plan 03-04) or the presenter is forced to Readback. There is **no
+  env override** for presenter selection — it is auto-probed
+  (`presenter::choose_presenter`).
+- **Wayland fallback:** `weston --backend=headless-backend.so` starts, but
+  `weston-screenshooter` aborts in this environment — prefer Xvfb.
+- **Image budget (hard limit).** A model request may include **at most 20
+  images**; exceeding it fails the whole turn with
+  `[invalid_request_error] a request may include at most 20 images`. A UI
+  review can easily capture 30+ screenshots, so never read them one by one.
+  Capture to disk, then read **contact sheets** built with
+  `scripts/contact-sheet.sh` (ImageMagick `montage`), which tiles N frames into
+  one labeled image:
+  `scripts/contact-sheet.sh -o /tmp/opencode/sheet.png -c 3 -w 640 /tmp/opencode/uat-*.png`.
+  Keep at most a couple of full-resolution images (the ones whose fine detail
+  matters) in a turn, reference the rest by path in notes, and re-read an
+  individual PNG only when a specific detail must be inspected.
+
 ## Build & contributing
 
 - Build prerequisites (Rust version, FFmpeg development libraries, clang,
