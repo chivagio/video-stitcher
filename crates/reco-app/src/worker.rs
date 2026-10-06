@@ -305,6 +305,26 @@ impl EventSink {
             .send(WorkerEvent::ProfileSaved { path: path.into() });
     }
 
+    /// Emit the applied field ROI polygon (CALB-09).
+    ///
+    /// Mirrored to the process log at INFO (UI-SPEC Event Log Contract); the
+    /// polygon rides the typed channel. The caller passes the *normalized* value
+    /// that was actually stored, so the editor mirrors what the worker persisted.
+    fn field_roi_applied(&self, field_roi: reco_core::calibration::FieldRoi) {
+        log::info!(
+            "field ROI applied: {} left / {} right vertices",
+            field_roi.left.len(),
+            field_roi.right.len()
+        );
+        let _ = self.tx.send(WorkerEvent::FieldRoiApplied { field_roi });
+    }
+
+    /// Emit that the field ROI polygon was cleared (CALB-09).
+    fn field_roi_cleared(&self) {
+        log::info!("field ROI cleared");
+        let _ = self.tx.send(WorkerEvent::FieldRoiCleared);
+    }
+
     /// Emit that the current result no longer matches the inputs (D3-08).
     fn result_invalidated(&self) {
         let _ = self.tx.send(WorkerEvent::ResultInvalidated);
@@ -316,6 +336,25 @@ fn role_index(role: crate::events::InputRole) -> usize {
     match role {
         crate::events::InputRole::Left => 0,
         crate::events::InputRole::Right => 1,
+    }
+}
+
+/// Normalize a validated field-ROI polygon pair for storage (CALB-09).
+///
+/// A camera polygon with fewer than three vertices is not a polygon, so it is
+/// cleared to an empty list — the autocam path treats an empty list as "no
+/// filter" (UI-SPEC Field ROI Editor Contract / degenerate shapes). The
+/// coordinates are already validated (finite, `[0,1]`, bounded count) at the
+/// command boundary; this only decides what a degenerate shape means, so it is
+/// pure and unit-testable without a worker or a GPU.
+fn normalize_field_roi(
+    left: Vec<[f64; 2]>,
+    right: Vec<[f64; 2]>,
+) -> reco_core::calibration::FieldRoi {
+    let clean = |verts: Vec<[f64; 2]>| if verts.len() < 3 { Vec::new() } else { verts };
+    reco_core::calibration::FieldRoi {
+        left: clean(left),
+        right: clean(right),
     }
 }
 
@@ -752,6 +791,22 @@ pub trait EngineBackend: Send {
         events: &EventSink,
     ) -> Result<(), WorkerError>;
 
+    /// Write the per-camera field ROI polygon onto the current calibration
+    /// (CALB-09).
+    ///
+    /// Normalizes each camera's list (fewer than three vertices clears it) and
+    /// writes the result onto `current_calibration.field_roi` and the preview's
+    /// `calibration.field_roi`, then emits a typed
+    /// `FieldRoiApplied`/`FieldRoiCleared`. Rejects with a typed error when there
+    /// is no current calibration. The ROI does not change the stitch geometry, so
+    /// the result is not invalidated.
+    fn set_field_roi(
+        &mut self,
+        left: Vec<[f64; 2]>,
+        right: Vec<[f64; 2]>,
+        events: &EventSink,
+    ) -> Result<(), WorkerError>;
+
     /// Run calibration on the worker's own device (CALB-01 / FOUND-03).
     ///
     /// `interrupted` is the worker loop's shutdown flag; cancellation of a
@@ -1170,6 +1225,11 @@ fn handle_command<B: EngineBackend>(
         }
         WorkerCommand::SaveProfile { path } => {
             if let Err(e) = backend.save_profile(path, events) {
+                events.failed(e);
+            }
+        }
+        WorkerCommand::SetFieldRoi { left, right } => {
+            if let Err(e) = backend.set_field_roi(left, right, events) {
                 events.failed(e);
             }
         }
@@ -2216,6 +2276,42 @@ impl EngineBackend for GpuEngineBackend {
         events.lens_override_applied(role, None);
         self.emit_readiness(events);
         self.invalidate_result(events);
+        Ok(())
+    }
+
+    fn set_field_roi(
+        &mut self,
+        left: Vec<[f64; 2]>,
+        right: Vec<[f64; 2]>,
+        events: &EventSink,
+    ) -> Result<(), WorkerError> {
+        // A field ROI frames detections; without a calibration there is nothing
+        // to attach it to. Reject with a typed error rather than a silent no-op
+        // (CALB-09), so the editor can render the cause.
+        if self.current_calibration.is_none() {
+            return Err(WorkerError::InvalidInput {
+                field: "field_roi".to_string(),
+                reason: "no calibration result — run or load a calibration first".to_string(),
+            });
+        }
+        let roi = normalize_field_roi(left, right);
+        let cleared = roi.left.is_empty() && roi.right.is_empty();
+        // Write onto both the save-path calibration and the preview source, so
+        // the polygon round-trips through save/load AND is consumed by the
+        // engine/autocam path (CALB-09).
+        if let Some(cal) = self.current_calibration.as_mut() {
+            cal.field_roi = if cleared { None } else { Some(roi.clone()) };
+        }
+        if let Some(cal) = self.calibration.as_mut() {
+            cal.field_roi = if cleared { None } else { Some(roi.clone()) };
+        }
+        // The ROI does not change the stitch geometry, so the result stays valid
+        // (no `invalidate_result`).
+        if cleared {
+            events.field_roi_cleared();
+        } else {
+            events.field_roi_applied(roi);
+        }
         Ok(())
     }
 
@@ -3771,6 +3867,34 @@ mod tests {
             Ok(())
         }
 
+        fn set_field_roi(
+            &mut self,
+            left: Vec<[f64; 2]>,
+            right: Vec<[f64; 2]>,
+            events: &EventSink,
+        ) -> Result<(), WorkerError> {
+            self.record("set_field_roi");
+            // Mirror the real backend's typed rejection exactly, so the protocol
+            // test exercises the same shape.
+            if self.current_calibration.is_none() {
+                return Err(WorkerError::InvalidInput {
+                    field: "field_roi".to_string(),
+                    reason: "no calibration result — run or load a calibration first".to_string(),
+                });
+            }
+            let roi = normalize_field_roi(left, right);
+            let cleared = roi.left.is_empty() && roi.right.is_empty();
+            if let Some(cal) = self.current_calibration.as_mut() {
+                cal.field_roi = if cleared { None } else { Some(roi.clone()) };
+            }
+            if cleared {
+                events.field_roi_cleared();
+            } else {
+                events.field_roi_applied(roi);
+            }
+            Ok(())
+        }
+
         fn calibrate(
             &mut self,
             _options: crate::events::CalibrationOptions,
@@ -4311,6 +4435,141 @@ mod tests {
             !report.points_capped,
             "a small report must not be marked capped"
         );
+    }
+
+    #[test]
+    fn normalize_field_roi_clears_degenerate_polygons() {
+        // CALB-09: fewer than three vertices is not a polygon; it clears.
+        for n in 0..3 {
+            let verts: Vec<[f64; 2]> = (0..n).map(|i| [i as f64 / 10.0, 0.5]).collect();
+            let roi = normalize_field_roi(verts.clone(), verts);
+            assert!(roi.left.is_empty(), "a {n}-vertex left polygon must clear");
+            assert!(
+                roi.right.is_empty(),
+                "a {n}-vertex right polygon must clear"
+            );
+        }
+    }
+
+    #[test]
+    fn normalize_field_roi_keeps_a_valid_polygon_exactly() {
+        let left = vec![[0.1, 0.9], [0.3, 0.7], [0.5, 0.6], [0.4, 0.95]];
+        let right = vec![[0.6, 0.9], [0.8, 0.7], [0.7, 0.6]];
+        let roi = normalize_field_roi(left.clone(), right.clone());
+        assert_eq!(roi.left, left);
+        assert_eq!(roi.right, right);
+    }
+
+    #[test]
+    fn set_field_roi_rejects_without_a_calibration() {
+        // CALB-09: there is nothing to attach a ROI to before a run/load, so the
+        // worker rejects with a typed error and leaves the state unchanged.
+        let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (evt_tx, evt_rx) = std::sync::mpsc::channel();
+        let events = EventSink { tx: evt_tx };
+        let interrupted = AtomicBool::new(false);
+        let mut mock = MockBackend::new(Arc::clone(&ops));
+
+        assert!(handle_command(
+            WorkerCommand::SetFieldRoi {
+                left: vec![[0.1, 0.2], [0.3, 0.4], [0.5, 0.6]],
+                right: vec![],
+            },
+            &mut mock,
+            &events,
+            &interrupted,
+        ));
+
+        assert!(
+            mock.current_calibration.is_none(),
+            "the calibration must be unchanged by a rejected command"
+        );
+        let failed = evt_rx.try_iter().any(|e| {
+            matches!(
+                e,
+                WorkerEvent::Failed(WorkerError::InvalidInput { field, .. })
+                    if field == "field_roi"
+            )
+        });
+        assert!(failed, "a missing calibration must be a typed rejection");
+    }
+
+    #[test]
+    fn set_field_roi_writes_then_clears_the_calibration_polygon() {
+        // CALB-09: a valid polygon is written onto the calibration exactly; a
+        // polygon with fewer than three vertices on both cameras clears it.
+        let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (evt_tx, evt_rx) = std::sync::mpsc::channel();
+        let events = EventSink { tx: evt_tx };
+        let interrupted = AtomicBool::new(false);
+        let mut mock = MockBackend::new(Arc::clone(&ops));
+
+        assert!(handle_command(
+            WorkerCommand::LoadProfile {
+                path: "/media/match.json".to_string(),
+            },
+            &mut mock,
+            &events,
+            &interrupted,
+        ));
+
+        let left = vec![[0.1, 0.9], [0.3, 0.7], [0.5, 0.6], [0.4, 0.95]];
+        let right = vec![[0.6, 0.9], [0.8, 0.7], [0.7, 0.6]];
+        assert!(handle_command(
+            WorkerCommand::SetFieldRoi {
+                left: left.clone(),
+                right: right.clone(),
+            },
+            &mut mock,
+            &events,
+            &interrupted,
+        ));
+
+        let stored = mock
+            .current_calibration
+            .as_ref()
+            .and_then(|c| c.field_roi.clone())
+            .expect("a valid polygon must be stored");
+        assert_eq!(stored.left, left);
+        assert_eq!(stored.right, right);
+        assert!(
+            evt_rx
+                .try_iter()
+                .any(|e| matches!(e, WorkerEvent::FieldRoiApplied { .. })),
+            "a valid polygon must emit FieldRoiApplied"
+        );
+
+        assert!(handle_command(
+            WorkerCommand::SetFieldRoi {
+                left: vec![[0.1, 0.2], [0.3, 0.4]],
+                right: vec![[0.5, 0.6], [0.7, 0.8]],
+            },
+            &mut mock,
+            &events,
+            &interrupted,
+        ));
+        assert!(
+            mock.current_calibration
+                .as_ref()
+                .unwrap()
+                .field_roi
+                .is_none(),
+            "a short polygon on both cameras must clear the ROI"
+        );
+    }
+
+    #[test]
+    fn field_roi_round_trips_through_match_calibration_json() {
+        // CALB-09: the polygon must survive profile save/load, which serializes
+        // the whole `MatchCalibration` (including `field_roi`).
+        let mut cal = sample_mock_calibration();
+        cal.field_roi = Some(reco_core::calibration::FieldRoi {
+            left: vec![[0.1, 0.9], [0.3, 0.7], [0.5, 0.6], [0.4, 0.95]],
+            right: vec![[0.6, 0.9], [0.8, 0.7], [0.7, 0.6]],
+        });
+        let json = cal.to_json_pretty();
+        let back: reco_core::calibration::MatchCalibration = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.field_roi, cal.field_roi);
     }
 
     #[test]

@@ -497,6 +497,74 @@ pub async fn save_profile(
     state.send(WorkerCommand::SaveProfile { path })
 }
 
+/// Upper bound on vertices per camera field-ROI polygon (CALB-09 / T-04-13).
+///
+/// A polygon beyond this is a pathological payload, not an operator edit; the
+/// cap keeps an oversized webview payload from reaching the engine.
+const MAX_FIELD_ROI_VERTICES: usize = 64;
+
+/// Validate a field-ROI polygon pair at the command boundary (T-04-12/T-04-13).
+///
+/// Every coordinate must be finite and within `[0, 1]` (normalized source-frame
+/// space), and each camera's vertex list is capped. A camera polygon with fewer
+/// than three vertices is accepted here and normalized to "clear" by the worker
+/// (the UI states this instead of saving a broken polygon). Extracted as a pure
+/// function so the boundary check is unit-testable without a Tauri `State`.
+fn validate_field_roi(left: &[[f64; 2]], right: &[[f64; 2]]) -> Result<(), WorkerError> {
+    for (camera, verts) in [("left", left), ("right", right)] {
+        if verts.len() > MAX_FIELD_ROI_VERTICES {
+            return Err(WorkerError::InvalidInput {
+                field: format!("field_roi.{camera}"),
+                reason: format!("at most {MAX_FIELD_ROI_VERTICES} vertices are allowed"),
+            });
+        }
+        for (i, [x, y]) in verts.iter().enumerate() {
+            if !x.is_finite() || !y.is_finite() {
+                return Err(WorkerError::InvalidInput {
+                    field: format!("field_roi.{camera}[{i}]"),
+                    reason: "coordinates must be finite".to_string(),
+                });
+            }
+            if !(0.0..=1.0).contains(x) || !(0.0..=1.0).contains(y) {
+                return Err(WorkerError::InvalidInput {
+                    field: format!("field_roi.{camera}[{i}]"),
+                    reason: "coordinates must be within [0, 1]".to_string(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Set the per-camera field ROI polygon for framing (CALB-09).
+///
+/// Thin, same contract as [`set_input`]: validate the polygon at the boundary
+/// (finite, normalized `[0,1]`, bounded vertex count; T-04-12/T-04-13), post a
+/// typed `WorkerCommand::SetFieldRoi`, and return. The worker writes it onto the
+/// current calibration and emits a typed `FieldRoiApplied`/`FieldRoiCleared`.
+/// Names no engine type.
+///
+/// # Why `rename_all = "snake_case"`
+///
+/// `left`/`right` are single words today, but the command is pinned to the
+/// crate's snake_case IPC protocol so a future argument rename cannot reintroduce
+/// the silent-never-fires bug recorded in `crates/reco-app/FRICTION.md` A7.
+///
+/// # Errors
+///
+/// Returns [`WorkerError::InvalidInput`] for an out-of-range, non-finite, or
+/// oversized polygon, or [`WorkerError::ChannelClosed`] if the worker has
+/// already exited.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn set_field_roi(
+    state: tauri::State<'_, WorkerHandle>,
+    left: Vec<[f64; 2]>,
+    right: Vec<[f64; 2]>,
+) -> Result<(), WorkerError> {
+    validate_field_roi(&left, &right)?;
+    state.send(WorkerCommand::SetFieldRoi { left, right })
+}
+
 /// Cancel a running calibration (CALB-02 / D3-11).
 ///
 /// # The documented control-plane bypass
@@ -746,6 +814,21 @@ pub enum WorkerCommand {
     SaveProfile {
         /// The local file path to write.
         path: String,
+    },
+
+    /// Set the per-camera field ROI polygon for framing (CALB-09).
+    ///
+    /// The worker normalizes each camera's vertex list (fewer than three
+    /// vertices clears that camera's polygon) and writes the result onto the
+    /// current calibration's `field_roi`, then emits a typed
+    /// `FieldRoiApplied`/`FieldRoiCleared`. Coordinates are normalized `[0,1]`
+    /// and validated at the command boundary (T-04-12/T-04-13). The ROI does not
+    /// change the stitch geometry, so the result is not invalidated.
+    SetFieldRoi {
+        /// Left-camera polygon vertices, normalized `[0,1]`.
+        left: Vec<[f64; 2]>,
+        /// Right-camera polygon vertices, normalized `[0,1]`.
+        right: Vec<[f64; 2]>,
     },
 
     /// Stop the worker loop and return.
@@ -1130,6 +1213,81 @@ mod tests {
             rx.recv().unwrap(),
             WorkerCommand::SaveProfile {
                 path: "/media/out.json".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn validate_field_roi_accepts_a_normalized_polygon() {
+        // In-range vertices (including the exact bounds) and a degenerate short
+        // list are all accepted at the boundary; the worker decides what a short
+        // list means (clear).
+        assert!(
+            validate_field_roi(
+                &[[0.0, 1.0], [0.5, 0.5], [1.0, 0.0], [0.25, 0.75]],
+                &[[0.1, 0.2]]
+            )
+            .is_ok()
+        );
+        assert!(validate_field_roi(&[], &[]).is_ok());
+    }
+
+    #[test]
+    fn validate_field_roi_rejects_out_of_range_and_non_finite() {
+        // T-04-12: an out-of-range or non-finite coordinate is rejected before
+        // it can reach the engine.
+        for (left, right) in [
+            (vec![[1.2, 0.5]], vec![]),
+            (vec![[0.5, -0.1]], vec![]),
+            (vec![], vec![[0.0, f64::NAN]]),
+            (vec![], vec![[f64::INFINITY, 0.5]]),
+            (vec![], vec![[0.5, f64::NEG_INFINITY]]),
+        ] {
+            assert!(
+                matches!(
+                    validate_field_roi(&left, &right),
+                    Err(WorkerError::InvalidInput { .. })
+                ),
+                "expected {left:?}/{right:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_field_roi_caps_the_vertex_count() {
+        // T-04-13: an oversized vertex list from the webview is rejected.
+        let big: Vec<[f64; 2]> = (0..=MAX_FIELD_ROI_VERTICES)
+            .map(|i| [i as f64 / 100.0, 0.5])
+            .collect();
+        match validate_field_roi(&big, &[]) {
+            Err(WorkerError::InvalidInput { field, reason }) => {
+                assert_eq!(field, "field_roi.left");
+                assert!(reason.contains("at most 64"), "reason: {reason}");
+            }
+            other => panic!("expected InvalidInput for an oversized list, got {other:?}"),
+        }
+        // Exactly the cap is fine.
+        let at_cap: Vec<[f64; 2]> = (0..MAX_FIELD_ROI_VERTICES)
+            .map(|i| [i as f64 / 100.0, 0.5])
+            .collect();
+        assert!(validate_field_roi(&at_cap, &[]).is_ok());
+    }
+
+    #[test]
+    fn set_field_roi_command_round_trips_through_the_channel() {
+        let (tx, rx) = mpsc::channel();
+        let handle = WorkerHandle::new(tx);
+        handle
+            .send(WorkerCommand::SetFieldRoi {
+                left: vec![[0.1, 0.2], [0.3, 0.4], [0.5, 0.6]],
+                right: vec![],
+            })
+            .unwrap();
+        assert_eq!(
+            rx.recv().unwrap(),
+            WorkerCommand::SetFieldRoi {
+                left: vec![[0.1, 0.2], [0.3, 0.4], [0.5, 0.6]],
+                right: vec![]
             }
         );
     }

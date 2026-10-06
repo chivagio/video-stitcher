@@ -226,7 +226,7 @@ pub struct PlaneLayout {
 ///     "right": [[0.63, 0.85], [0.78, 0.68], [0.55, 0.60]]
 /// }
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct FieldRoi {
     /// Polygon vertices for the left camera, in normalized `[0,1]` coordinates.
     #[serde(default)]

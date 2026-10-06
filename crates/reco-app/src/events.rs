@@ -700,6 +700,25 @@ pub enum WorkerEvent {
         report: DebugReport,
     },
 
+    /// The per-camera field ROI polygon was written onto the calibration (CALB-09).
+    ///
+    /// Carries the `FieldRoi` actually stored (a camera polygon with fewer than
+    /// three vertices is normalized to empty, and both empty clears the whole
+    /// value — see [`WorkerEvent::FieldRoiCleared`]). The frontend mirrors this
+    /// so the editor reflects what the worker persisted, never an optimistic
+    /// local value. Projected to an INFO [`LogLine`].
+    FieldRoiApplied {
+        /// The polygon pair now stored on the calibration's `field_roi`.
+        field_roi: reco_core::calibration::FieldRoi,
+    },
+
+    /// The per-camera field ROI polygon was cleared (CALB-09).
+    ///
+    /// Emitted when a command's polygons were all degenerate (<3 vertices per
+    /// camera), so the calibration's `field_roi` was set back to `None`. The
+    /// autocam path treats an absent ROI as "no filter".
+    FieldRoiCleared,
+
     /// A profile was loaded from disk (IMPT-05).
     ProfileLoaded {
         /// The path that was loaded.
@@ -914,6 +933,20 @@ impl WorkerEvent {
                     report.verified.len(),
                     report.rejected.len(),
                 ),
+            },
+            // The field ROI is applied/cleared at INFO (UI-SPEC Event Log
+            // Contract); the polygon rides the typed channel.
+            WorkerEvent::FieldRoiApplied { field_roi } => LogLine {
+                level: Level::Info,
+                message: format!(
+                    "field ROI applied: {} left / {} right vertices",
+                    field_roi.left.len(),
+                    field_roi.right.len()
+                ),
+            },
+            WorkerEvent::FieldRoiCleared => LogLine {
+                level: Level::Info,
+                message: "field ROI cleared".to_string(),
             },
             WorkerEvent::ProfileLoaded { path } => LogLine {
                 level: Level::Info,
@@ -1617,5 +1650,43 @@ mod tests {
             line.message,
             "debug data published: frame 2 of 3, 1 verified / 1 rejected matches"
         );
+    }
+
+    #[test]
+    fn field_roi_events_roundtrip_and_project_to_info_lines() {
+        // CALB-09: the applied polygon crosses as the engine's own `FieldRoi`
+        // shape (normalized `[0,1]`) and both events project to INFO lines.
+        let roi = reco_core::calibration::FieldRoi {
+            left: vec![[0.1, 0.9], [0.3, 0.7], [0.5, 0.6]],
+            right: vec![[0.6, 0.9], [0.8, 0.7], [0.7, 0.6]],
+        };
+        let event = WorkerEvent::FieldRoiApplied {
+            field_roi: roi.clone(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(
+            json.contains("\"kind\":\"field_roi_applied\""),
+            "unexpected json: {json}"
+        );
+        let back: WorkerEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(event, back);
+        assert_eq!(back, WorkerEvent::FieldRoiApplied { field_roi: roi });
+
+        let line = event.to_log_line();
+        assert_eq!(line.level, Level::Info);
+        assert_eq!(line.message, "field ROI applied: 3 left / 3 right vertices");
+
+        let cleared = WorkerEvent::FieldRoiCleared;
+        let json = serde_json::to_string(&cleared).unwrap();
+        assert!(
+            json.contains("\"kind\":\"field_roi_cleared\""),
+            "unexpected json: {json}"
+        );
+        assert_eq!(
+            serde_json::from_str::<WorkerEvent>(&json).unwrap(),
+            WorkerEvent::FieldRoiCleared
+        );
+        assert_eq!(cleared.to_log_line().level, Level::Info);
+        assert_eq!(cleared.to_log_line().message, "field ROI cleared");
     }
 }

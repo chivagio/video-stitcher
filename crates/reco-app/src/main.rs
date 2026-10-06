@@ -85,6 +85,7 @@ fn main() -> anyhow::Result<()> {
             commands::start_calibration,
             commands::load_profile,
             commands::save_profile,
+            commands::set_field_roi,
             commands::cancel_calibration
         ])
         .setup(|app| {
