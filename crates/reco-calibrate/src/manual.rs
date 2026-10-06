@@ -30,7 +30,7 @@
 use reco_core::calibration::PlaneLayout;
 
 use crate::error::CalibrateError;
-use crate::geometry::normalize_to_plane;
+use crate::geometry::{normalize_to_plane, plane_to_pixel};
 use crate::optimizer;
 use crate::types::{CalibrationConfig, MatchedPoint};
 
@@ -85,6 +85,34 @@ pub fn pin_to_matched_point(
         left_pixel_nx: right_px[0] / rw.max(1) as f64,
         right_pixel_nx: left_px[0] / lw.max(1) as f64,
     }
+}
+
+/// Reconstruct natural-order pixel pins from verified optimizer-space matches
+/// (MANU-04).
+///
+/// A verified [`MatchedPoint`] is post-RANSAC and already in plane coordinates
+/// from the pipeline's swap-correct path: `.left` holds the **right** camera's
+/// plane coordinate and `.right` the **left** camera's (see the module header).
+/// This is the inverse of [`pin_to_matched_point`]: it maps each plane
+/// coordinate back to the pixel the operator would have clicked, so the seeded
+/// pins round-trip through the same swap-correct helper.
+///
+/// Only geometrically verified matches are ever passed here; raw or rejected
+/// candidates must never reach the editor (MANU-04 prohibition).
+#[must_use]
+pub fn seed_pins_from_verified(
+    points: &[MatchedPoint],
+    left_wh: (u32, u32),
+    right_wh: (u32, u32),
+) -> Vec<ManualPin> {
+    points
+        .iter()
+        .map(|p| ManualPin {
+            // `.right` is the LEFT camera's plane coord; `.left` is the RIGHT's.
+            left_px: plane_to_pixel(p.right, left_wh.0, left_wh.1),
+            right_px: plane_to_pixel(p.left, right_wh.0, right_wh.1),
+        })
+        .collect()
 }
 
 /// Minimum variance (in plane units squared) of the combined point cloud
@@ -461,5 +489,42 @@ mod tests {
         assert_abs_diff_eq!(result.layout.camera_axis_offset, t.cam_d, epsilon = 0.02);
         assert_abs_diff_eq!(result.layout.intersect, t.intersect, epsilon = 0.05);
         assert_abs_diff_eq!(result.layout.x_ty, t.x_ty, epsilon = 0.01);
+    }
+
+    /// MANU-04: verified (post-RANSAC) plane points convert back to natural-order
+    /// pixel pins whose `.left`/`.right` match the original swap, and re-applying
+    /// the swap-correct helper recovers the source point.
+    #[test]
+    fn seed_pins_from_verified_recovers_the_swap_correct_pixels() {
+        let t = truth();
+        let points = synthetic_points(&t, 16);
+        let pins = seed_pins_from_verified(&points, (LW, LH), (RW, RH));
+        assert_eq!(pins.len(), points.len());
+
+        for (pin, point) in pins.iter().zip(points.iter()) {
+            // `.left` (right camera plane) -> left_px on the LEFT frame.
+            let expected_left = plane_to_px(point.right, LW, LH);
+            assert_abs_diff_eq!(pin.left_px[0], expected_left[0], epsilon = 1e-9);
+            assert_abs_diff_eq!(pin.left_px[1], expected_left[1], epsilon = 1e-9);
+            // `.right` (left camera plane) -> right_px on the RIGHT frame.
+            let expected_right = plane_to_px(point.left, RW, RH);
+            assert_abs_diff_eq!(pin.right_px[0], expected_right[0], epsilon = 1e-9);
+            assert_abs_diff_eq!(pin.right_px[1], expected_right[1], epsilon = 1e-9);
+
+            // The seeded pin round-trips through the single swap-correct helper.
+            let mp = pin_to_matched_point(pin.left_px, pin.right_px, (LW, LH), (RW, RH));
+            assert_abs_diff_eq!(mp.left[0], point.left[0], epsilon = 1e-9);
+            assert_abs_diff_eq!(mp.left[1], point.left[1], epsilon = 1e-9);
+            assert_abs_diff_eq!(mp.right[0], point.right[0], epsilon = 1e-9);
+            assert_abs_diff_eq!(mp.right[1], point.right[1], epsilon = 1e-9);
+        }
+    }
+
+    /// MANU-04: an empty verified set yields an empty pin set (no panic, no
+    /// fabricated pins).
+    #[test]
+    fn empty_verified_matches_yield_no_pins() {
+        let pins = seed_pins_from_verified(&[], (LW, LH), (RW, RH));
+        assert!(pins.is_empty());
     }
 }

@@ -492,6 +492,24 @@ pub fn normalize_to_plane(px: f64, py: f64, img_w: u32, img_h: u32) -> [f64; 2] 
     ]
 }
 
+/// Convert a plane coordinate back to pixels — the exact inverse of
+/// [`normalize_to_plane`].
+///
+/// Used to reconstruct natural-order pixel pins from verified optimizer-space
+/// [`MatchedPoint`](crate::types::MatchedPoint) coordinates (MANU-04): a
+/// verified match's plane coordinate maps back to the pixel the operator would
+/// have clicked. Undoes the `PLANE_WIDTH` scale and the `h/w` aspect scaling.
+#[must_use]
+pub fn plane_to_pixel(plane: [f64; 2], img_w: u32, img_h: u32) -> [f64; 2] {
+    debug_assert!(img_w > 0 && img_h > 0, "image dimensions must be nonzero");
+    let w = img_w.max(1) as f64;
+    let h = img_h.max(1) as f64;
+    [
+        (plane[0] / PLANE_WIDTH + 0.5) * w,
+        (plane[1] / (PLANE_WIDTH * (h / w)) + 0.5) * h,
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -547,6 +565,32 @@ mod tests {
         assert_abs_diff_eq!(x, -0.5, epsilon = 1e-10);
         // y = (0/1080 - 0.5) * (1080/1920) = -0.5 * 0.5625 = -0.28125
         assert_abs_diff_eq!(y, -0.28125, epsilon = 1e-10);
+    }
+
+    /// `plane_to_pixel` is the exact inverse of `normalize_to_plane` (MANU-04),
+    /// across several points and aspect ratios.
+    #[test]
+    fn plane_to_pixel_round_trips_normalize_to_plane() {
+        for &(w, h) in &[
+            (1920_u32, 1080_u32),
+            (3840, 2160),
+            (1280, 720),
+            (1000, 1000),
+        ] {
+            let points = [
+                (0.0, 0.0),
+                (w as f64, h as f64),
+                (w as f64 * 0.5, h as f64 * 0.5),
+                (123.0, 456.0),
+                (w as f64 * 0.75, h as f64 * 0.2),
+            ];
+            for &(px, py) in &points {
+                let plane = normalize_to_plane(px, py, w, h);
+                let back = plane_to_pixel(plane, w, h);
+                assert_abs_diff_eq!(back[0], px, epsilon = 1e-9);
+                assert_abs_diff_eq!(back[1], py, epsilon = 1e-9);
+            }
+        }
     }
 
     #[test]
