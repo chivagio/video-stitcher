@@ -2566,6 +2566,16 @@ pub struct GpuEngineBackend {
     /// frame equals this, so the markers correspond to the displayed content.
     /// `None` when the run carried no pipeline frame context.
     verified_seed_frame: Option<u64>,
+    /// All verified (post-RANSAC) matches from the last successful calibration,
+    /// flattened across every sampled frame.
+    ///
+    /// Retained so the opt-in [`WorkerBackend::refine_lens`] action can
+    /// aggregate enough observations to clear the `k1` conditioning gate
+    /// (CR-01): the single-frame [`Self::verified_seed`] alone is far below
+    /// `RECOMMENDED_MIN_MATCHES` on the real Xiaomi pair. Cleared on a profile
+    /// load (a loaded profile carries no retained matches of its own) and empty
+    /// until a calibration result exists.
+    verified_matches: Vec<reco_calibrate::types::MatchedPoint>,
     /// The instant the armed debounced manual solve should fire, or `None`
     /// (MANU-03). Set by a pin mutation; cleared by [`Self::manual_solve`].
     manual_solve_at: Option<std::time::Instant>,
@@ -2654,6 +2664,86 @@ pub struct GpuEngineBackend {
     /// teardown order (FOUND-06 / RESEARCH Pattern 6). Actually field 1 held the
     /// `GpuContext` in the original skeleton; it now lives here, last.
     gpu: reco_core::gpu::GpuContext,
+}
+
+/// Derive raw distorted-pixel observations from retained verified matches.
+///
+/// Each plane-coordinate match is pushed through the same forward chain the
+/// manual seed uses: plane coord → undistorted pixel
+/// ([`reco_calibrate::geometry::plane_to_pixel`], the single left/right swap) →
+/// raw distorted pixel ([`reco_core::lens::undistorted_to_distorted`] under the
+/// camera's own profile). This is non-circular: the undistort map is a
+/// bijection, so the round-trip returns the true sensor pixel regardless of the
+/// profile's current `k1` (research §2.2). `.right` is the LEFT camera's plane
+/// coord and `.left` the RIGHT's, per the optimizer's swap convention.
+///
+/// Shared by [`WorkerBackend::refine_lens`] and the real-clip acceptance test so
+/// both derive observations identically (CR-01).
+fn raw_observations_from_verified(
+    matches: &[reco_calibrate::types::MatchedPoint],
+    left_params: &reco_core::calibration::CameraParams,
+    right_params: &reco_core::calibration::CameraParams,
+) -> Vec<reco_calibrate::RawPixelMatch> {
+    let (lw, lh) = (left_params.width.max(1), left_params.height.max(1));
+    let (rw, rh) = (right_params.width.max(1), right_params.height.max(1));
+    matches
+        .iter()
+        .map(|p| {
+            let left_und = reco_calibrate::geometry::plane_to_pixel(p.right, lw, lh);
+            let right_und = reco_calibrate::geometry::plane_to_pixel(p.left, rw, rh);
+            let (lx, ly) = reco_core::lens::undistorted_to_distorted(
+                left_und[0],
+                left_und[1],
+                lw,
+                lh,
+                left_params,
+            );
+            let (rx, ry) = reco_core::lens::undistorted_to_distorted(
+                right_und[0],
+                right_und[1],
+                rw,
+                rh,
+                right_params,
+            );
+            reco_calibrate::RawPixelMatch {
+                left_px: [lx, ly],
+                right_px: [rx, ry],
+            }
+        })
+        .collect()
+}
+
+/// Run the reduced `k1` refinement on retained verified matches.
+///
+/// This is the single worker path shared by [`WorkerBackend::refine_lens`] and
+/// the real-clip acceptance test: both derive observations with
+/// [`raw_observations_from_verified`] and refine with
+/// [`reco_calibrate::refine_intrinsics`], so the test cannot mask the runtime
+/// behaviour by exercising a different data volume (CR-01).
+fn refine_verified_lens(
+    matches: &[reco_calibrate::types::MatchedPoint],
+    left_params: &reco_core::calibration::CameraParams,
+    right_params: &reco_core::calibration::CameraParams,
+    layout: &reco_core::calibration::PlaneLayout,
+    heldout_fraction: f64,
+) -> Result<reco_calibrate::IntrinsicsRefinement, WorkerError> {
+    // No retained correspondences (e.g. immediately after a profile load):
+    // refuse with a clear, actionable message rather than a generic
+    // insufficient-matches rejection (CR-01).
+    if matches.is_empty() {
+        return Err(WorkerError::InvalidInput {
+            field: "refine_lens".to_string(),
+            reason: "no verified matches — run a calibration first".to_string(),
+        });
+    }
+
+    let raw = raw_observations_from_verified(matches, left_params, right_params);
+    let config = reco_calibrate::IntrinsicsConfig {
+        heldout_fraction,
+        ..reco_calibrate::IntrinsicsConfig::default()
+    };
+    reco_calibrate::refine_intrinsics(&raw, layout, left_params, right_params, &config)
+        .map_err(|e| WorkerError::Engine(e.to_string()))
 }
 
 impl GpuEngineBackend {
@@ -2768,6 +2858,7 @@ impl GpuEngineBackend {
             manual: None,
             verified_seed: Vec::new(),
             verified_seed_frame: None,
+            verified_matches: Vec::new(),
             manual_solve_at: None,
             manual_relens_pending: false,
             manual_preview_dirty: false,
@@ -3377,54 +3468,13 @@ impl EngineBackend for GpuEngineBackend {
             )
         };
 
-        let (lw, lh) = (left_params.width.max(1), left_params.height.max(1));
-        let (rw, rh) = (right_params.width.max(1), right_params.height.max(1));
-
-        // Derive raw distorted-pixel observations from the retained post-RANSAC
-        // matches: plane coord -> undistorted pixel (`plane_to_pixel`, the same
-        // single left/right swap as `manual::seed_pins_from_verified`) -> raw
-        // pixel (`undistorted_to_distorted` under the current profile). This is
-        // non-circular: the undistort map is a bijection, so the round-trip
-        // returns the true sensor pixel regardless of the profile's current k1
-        // (research §2.2). `.right` is the LEFT camera's plane coord and `.left`
-        // the RIGHT's, per the optimizer's swap convention.
-        let raw: Vec<reco_calibrate::RawPixelMatch> = self
-            .verified_seed
-            .iter()
-            .map(|p| {
-                let left_und = reco_calibrate::geometry::plane_to_pixel(p.right, lw, lh);
-                let right_und = reco_calibrate::geometry::plane_to_pixel(p.left, rw, rh);
-                let (lx, ly) = reco_core::lens::undistorted_to_distorted(
-                    left_und[0],
-                    left_und[1],
-                    lw,
-                    lh,
-                    &left_params,
-                );
-                let (rx, ry) = reco_core::lens::undistorted_to_distorted(
-                    right_und[0],
-                    right_und[1],
-                    rw,
-                    rh,
-                    &right_params,
-                );
-                reco_calibrate::RawPixelMatch {
-                    left_px: [lx, ly],
-                    right_px: [rx, ry],
-                }
-            })
-            .collect();
-
-        // The engine uses the base params' frame dimensions for both cameras;
-        // a same-resolution rig (the supported case) makes this exact.
-        let config = reco_calibrate::IntrinsicsConfig {
+        let refinement = refine_verified_lens(
+            &self.verified_matches,
+            &left_params,
+            &right_params,
+            &layout,
             heldout_fraction,
-            ..reco_calibrate::IntrinsicsConfig::default()
-        };
-
-        let refinement =
-            reco_calibrate::refine_intrinsics(&raw, &layout, &left_params, &right_params, &config)
-                .map_err(|e| WorkerError::Engine(e.to_string()))?;
+        )?;
 
         let view = crate::calibration::project_intrinsics_refinement(&refinement, baseline_k1);
 
@@ -3538,6 +3588,16 @@ impl EngineBackend for GpuEngineBackend {
                     .map(|fm| fm.points.clone())
                     .unwrap_or_default();
                 self.verified_seed_frame = calibration_result.frame_indices.first().copied();
+                // Retain every frame's verified matches (flattened) for the
+                // opt-in k1 refinement. Aggregating across frames is required to
+                // clear the conditioning gate on the real pair: a single
+                // reference frame yields ~7-11 matches, far below
+                // `RECOMMENDED_MIN_MATCHES` (CR-01).
+                self.verified_matches = calibration_result
+                    .per_frame
+                    .iter()
+                    .flat_map(|fm| fm.points.iter().copied())
+                    .collect();
                 // Adopt the result as the preview source too (D3-15 / WR-05),
                 // so the scorecard and the rendered stitch describe one profile.
                 self.adopt_calibration(calibration_result.calibration.clone());
@@ -3635,6 +3695,10 @@ impl EngineBackend for GpuEngineBackend {
         let calibration =
             reco_core::calibration::MatchCalibration::from_file(std::path::Path::new(&path))
                 .map_err(|e| WorkerError::ProfileLoad(e.to_string()))?;
+        // A loaded profile carries no retained raw correspondences, so the
+        // opt-in k1 refinement has nothing to aggregate and must refuse clearly
+        // rather than reuse a previous run's matches (CR-01).
+        self.verified_matches.clear();
         // Adopt the loaded profile as the live result and preview source so the
         // preview/export flows consume it unchanged (D3-15 / WR-05).
         self.adopt_calibration(calibration);
@@ -8268,6 +8332,26 @@ mod tests {
     }
 
     #[test]
+    fn refine_verified_lens_refuses_with_no_retained_matches() {
+        // CR-01: after a profile load there are no retained verified matches, so
+        // the shared refinement path must refuse with a clear, actionable typed
+        // error (not a generic insufficient-matches result).
+        let cal = sample_mock_calibration();
+        let err = refine_verified_lens(&[], &cal.left, &cal.right, &cal.layout, 0.2)
+            .expect_err("no retained matches must be refused");
+        match err {
+            WorkerError::InvalidInput { field, reason } => {
+                assert_eq!(field, "refine_lens");
+                assert!(
+                    reason.contains("no verified matches"),
+                    "the refusal must say what to do: {reason}"
+                );
+            }
+            other => panic!("expected a typed InvalidInput, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn field_roi_round_trips_through_match_calibration_json() {
         // CALB-09: the polygon must survive profile save/load, which serializes
         // the whole `MatchCalibration` (including `field_roi`).
@@ -10324,6 +10408,7 @@ mod tests {
 // CONCERNS.md (GPU tests skip in CI).
 #[cfg(test)]
 mod gpu_tests {
+    use super::refine_verified_lens;
     use std::path::PathBuf;
     use std::sync::atomic::AtomicBool;
 
@@ -10403,44 +10488,27 @@ mod gpu_tests {
         .expect("the real calibration pipeline must succeed on the Xiaomi pair");
 
         let cal = &result.calibration;
-        let (lw, lh) = (cal.left.width, cal.left.height);
-        let (rw, rh) = (cal.right.width, cal.right.height);
 
-        // Derive raw distorted-pixel observations from every verified match
-        // (plane coord -> undistorted pixel -> raw pixel), the same derivation
-        // the worker uses at runtime.
-        let raw: Vec<reco_calibrate::RawPixelMatch> = result
+        // Exercise the SAME worker path the opt-in action uses (CR-01): aggregate
+        // every frame's verified matches — exactly what `calibrate` retains in
+        // `verified_matches` — and run `refine_verified_lens`, which derives the
+        // raw observations and calls the reduced solver. The test cannot mask a
+        // runtime refusal by exercising a different data volume.
+        let matches: Vec<reco_calibrate::types::MatchedPoint> = result
             .per_frame
             .iter()
-            .flat_map(|fm| fm.points.iter())
-            .map(|p| {
-                let left_und = reco_calibrate::geometry::plane_to_pixel(p.right, lw, lh);
-                let right_und = reco_calibrate::geometry::plane_to_pixel(p.left, rw, rh);
-                let (lx, ly) = reco_core::lens::undistorted_to_distorted(
-                    left_und[0],
-                    left_und[1],
-                    lw,
-                    lh,
-                    &cal.left,
-                );
-                let (rx, ry) = reco_core::lens::undistorted_to_distorted(
-                    right_und[0],
-                    right_und[1],
-                    rw,
-                    rh,
-                    &cal.right,
-                );
-                reco_calibrate::RawPixelMatch {
-                    left_px: [lx, ly],
-                    right_px: [rx, ry],
-                }
-            })
+            .flat_map(|fm| fm.points.iter().copied())
             .collect();
 
         let cfg = reco_calibrate::IntrinsicsConfig::default();
-        let refinement =
-            reco_calibrate::refine_intrinsics(&raw, &cal.layout, &cal.left, &cal.right, &cfg)
-                .expect("the reduced k1 refinement must run on the real observations");
+        let refinement = refine_verified_lens(
+            &matches,
+            &cal.left,
+            &cal.right,
+            &cal.layout,
+            cfg.heldout_fraction,
+        )
+        .expect("the reduced k1 refinement must run on the real observations");
 
         let baseline_k1 = cal.left.d[0];
         let bound = cfg.k1_bound;
@@ -10495,7 +10563,7 @@ mod gpu_tests {
         }
         println!(
             "  observations: {} across {} frames",
-            raw.len(),
+            matches.len(),
             result.per_frame.len()
         );
     }
