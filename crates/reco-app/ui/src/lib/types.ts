@@ -150,10 +150,22 @@ export interface LensProfileView {
   source: string;
 }
 
-/** The sync method and its confidence, if any (mirror `events::SyncView`). */
+/** The provenance chain mark over IMU → Audio → Manual (mirror `events::SyncProvenance`). */
+export interface SyncProvenance {
+  /** The step in the chain that produced the offset. */
+  ran: SyncMethod;
+  /** Whether the operator set the offset manually. */
+  is_manual: boolean;
+}
+
+/** The sync method, confidence, signed offset, and fixed semantics (mirror `events::SyncView`). */
 export interface SyncView {
   method: SyncMethod;
   confidence: number | null;
+  offset_frames: number;
+  provenance: SyncProvenance;
+  /** The fixed offset-semantics sentence (authored once in Rust). */
+  offset_semantics: string;
 }
 
 /** The CALB-03 scorecard (mirror `events::Scorecard`). */

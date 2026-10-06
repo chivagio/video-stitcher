@@ -9,7 +9,7 @@
   Re-run calibration (owned by the screen, since the advanced options live there).
 -->
 <script lang="ts">
-  import type { ConfidenceBand, Scorecard } from "../lib/types";
+  import type { ConfidenceBand, Scorecard, SyncMethod } from "../lib/types";
   import { importStore } from "../lib/import.svelte";
   import ActionButton from "./ActionButton.svelte";
   import Icon from "./Icon.svelte";
@@ -31,19 +31,38 @@
     none: "None",
   } as const;
 
+  /** The provenance chain order (UI-SPEC Sync Diagnostics Contract). */
+  const SYNC_CHAIN: SyncMethod[] = ["imu", "audio", "manual"];
+
   const confidencePct = $derived(Math.round(scorecard.confidence * 100));
   const residual = $derived(scorecard.residual_error.toFixed(2));
   const perFrame = $derived(scorecard.per_frame_matches.toFixed(1));
   const saving = $derived(importStore.profileStatus === "saving");
 
-  const syncText = $derived.by(() => {
-    if (scorecard.sync.method === "none") return "None";
+  /** Whether a sync path actually ran (a `none` result shows "None"). */
+  const syncHasChain = $derived(scorecard.sync.method !== "none");
+  const syncRan = $derived(scorecard.sync.provenance.ran);
+
+  /** Confidence wording: `Not reported` for IMU/manual, `<n>%` for audio. */
+  const syncConfidence = $derived.by(() => {
+    if (!syncHasChain) return null;
     const confidence = scorecard.sync.confidence;
-    const label = SYNC_WORD[scorecard.sync.method];
     return confidence === null
-      ? `${label} · Not reported`
-      : `${label} · ${Math.round(confidence * 100)}%`;
+      ? "Not reported"
+      : `${Math.round(confidence * 100)}%`;
   });
+
+  /** The signed offset; the sign is always shown (monospace, tabular). */
+  const syncOffset = $derived.by(() => {
+    const frames = scorecard.sync.offset_frames;
+    const sign = frames < 0 ? "−" : "+";
+    return `offset ${sign}${Math.abs(frames)} frames`;
+  });
+
+  /** Full chain + semantics for assistive tech (never colour alone). */
+  const chainAria = $derived(
+    `Provenance IMU, Audio, Manual; ${SYNC_WORD[syncRan]} produced the offset. ${scorecard.sync.offset_semantics}`,
+  );
 </script>
 
 <section class="scorecard-card">
@@ -91,7 +110,29 @@
 
     <div class="row">
       <dt class="label">Sync</dt>
-      <dd class="value">{syncText}</dd>
+      <dd class="value sync-value">
+        {#if !syncHasChain}
+          <span class="sync-none">None</span>
+        {:else}
+          <span class="sync-chain" aria-label={chainAria}>
+            {#each SYNC_CHAIN as step, i (step)}
+              {#if i > 0}
+                <span class="chain-arrow" aria-hidden="true">→</span>
+              {/if}
+              <span class="chain-step" class:ran={syncRan === step}>
+                {SYNC_WORD[step]}
+              </span>
+            {/each}
+          </span>
+          <span class="sync-detail">
+            {#if syncConfidence !== null}
+              <span class="sync-confidence">{syncConfidence}</span>
+            {/if}
+            <span class="sync-offset mono">{syncOffset}</span>
+          </span>
+          <span class="sync-semantics">{scorecard.sync.offset_semantics}</span>
+        {/if}
+      </dd>
     </div>
   </dl>
 
@@ -213,5 +254,47 @@
 
   .save-line.error {
     color: var(--color-log-error);
+  }
+
+  .sync-value {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .sync-chain {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-xs);
+  }
+
+  .chain-arrow {
+    color: var(--color-log-info);
+  }
+
+  .chain-step {
+    color: var(--color-log-info);
+  }
+
+  /* The path that produced the offset is marked by weight + colour; the full
+     chain is also available to assistive tech via the span's aria-label. */
+  .chain-step.ran {
+    color: var(--color-body-text);
+    font-weight: var(--weight-semibold);
+  }
+
+  .sync-detail {
+    display: inline-flex;
+    align-items: baseline;
+    gap: var(--space-sm);
+  }
+
+  .sync-offset {
+    color: var(--color-body-text);
+  }
+
+  .sync-semantics {
+    color: var(--color-log-info);
+    font-size: 12px;
   }
 </style>

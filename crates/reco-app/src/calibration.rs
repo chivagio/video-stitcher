@@ -19,7 +19,7 @@ use reco_core::calibration::CameraParams;
 use crate::events::{
     CalibrationDiagnosis, CalibrationOptions, CalibrationStage, ConfidenceBand, DiagnosisMetrics,
     InputMetadata, LensProfileView, ReadinessCode, ReadinessFinding, ReadinessReport,
-    ReadinessSeverity, Scorecard, SyncMethod, SyncProvenance, SyncView, SYNC_OFFSET_SEMANTICS,
+    ReadinessSeverity, SYNC_OFFSET_SEMANTICS, Scorecard, SyncMethod, SyncProvenance, SyncView,
 };
 
 /// Sampled statistics feeding the readiness estimate (CALB-05).
@@ -354,16 +354,22 @@ pub fn project_scorecard(result: &CalibrationResult) -> Scorecard {
         per_frame_matches,
         frames_used: result.frames_used as u64,
         lens_profile,
-        sync: SyncView {
-            method: map_sync_method(result.sync.method),
-            confidence: result.sync.confidence,
-            // (RED stub — populated from `result.sync` in the GREEN step.)
-            offset_frames: 0,
-            provenance: SyncProvenance {
-                ran: SyncMethod::None,
-                is_manual: false,
-            },
-            offset_semantics: String::new(),
+        sync: {
+            // The provenance chain mark mirrors the method that produced the
+            // offset; manual is the only path with no computed confidence.
+            let method = map_sync_method(result.sync.method);
+            SyncView {
+                method,
+                confidence: result.sync.confidence,
+                offset_frames: result.sync.offset_frames,
+                provenance: SyncProvenance {
+                    ran: method,
+                    is_manual: matches!(method, SyncMethod::Manual),
+                },
+                // The fixed semantics string is authored once (CALB-06): carry
+                // it on the payload so no surface re-types it.
+                offset_semantics: SYNC_OFFSET_SEMANTICS.to_string(),
+            }
         },
     }
 }
