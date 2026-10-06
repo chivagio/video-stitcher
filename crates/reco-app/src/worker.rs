@@ -203,15 +203,20 @@ impl EventSink {
         self.tx.clone()
     }
 
-    /// Emit the advisory compatibility findings (IMPT-03).
+    /// Emit the severity-sorted readiness report (CALB-05).
     ///
-    /// Each issue is also mirrored to the process log at WARN, so a headless
-    /// run shows the same reasons the webview banner renders.
-    fn compatibility(&self, issues: Vec<crate::events::CompatibilityIssue>) {
-        for issue in &issues {
-            log::warn!("compatibility: {}", issue.message);
+    /// Each finding is also mirrored to the process log, so a headless run
+    /// shows the same reasons the webview banner renders. A likely-doomed pair
+    /// (a blocking-shape finding) logs at WARN; informational notes at INFO.
+    fn readiness(&self, report: crate::events::ReadinessReport) {
+        for finding in &report.findings {
+            if finding.severity == crate::events::ReadinessSeverity::BlockingShape {
+                log::warn!("readiness: {}", finding.message);
+            } else {
+                log::info!("readiness: {}", finding.message);
+            }
         }
-        let _ = self.tx.send(WorkerEvent::Compatibility { issues });
+        let _ = self.tx.send(WorkerEvent::Readiness { report });
     }
 
     /// Emit the lens-profile candidates for one input (IMPT-04).
@@ -495,6 +500,172 @@ fn format_fps(fps: f64) -> String {
         s.pop();
     }
     format!("{s} fps")
+}
+
+/// Number of columns in the sampled intensity profile (CALB-05).
+const READINESS_PROFILE_COLUMNS: usize = 64;
+
+/// Maximum pixels averaged for the sampled mean luma (T-04-07).
+const READINESS_SAMPLE_MAX_PIXELS: usize = 65_536;
+
+/// One sampled frame's readiness statistics.
+struct SampledFrame {
+    /// Mean luma of the Y plane (0..=255).
+    mean_luma: f64,
+    /// Per-column mean-luma profile, used for the overlap estimate.
+    profile: Vec<f64>,
+}
+
+/// Decode one mid-clip frame per input and derive the readiness estimates
+/// (CALB-05).
+///
+/// Bounded and fail-closed (T-04-07): one frame per input, a strided sample for
+/// the mean, and a fixed-width column profile. Any failure (probe, decode, a
+/// flat frame) yields `None` for the affected estimate — an honest unknown,
+/// never a fabricated `0.0`.
+fn sample_readiness(left_path: &str, right_path: &str) -> crate::calibration::ReadinessSamples {
+    let left = sample_frame(std::path::Path::new(left_path));
+    let right = sample_frame(std::path::Path::new(right_path));
+    match (left, right) {
+        (Some(l), Some(r)) => crate::calibration::ReadinessSamples {
+            overlap: estimate_overlap(&l.profile, &r.profile),
+            exposure_delta_stops: estimate_exposure_delta_stops(l.mean_luma, r.mean_luma),
+        },
+        _ => crate::calibration::ReadinessSamples::default(),
+    }
+}
+
+/// Probe and decode one mid-clip frame, returning its luma stats, or `None`.
+fn sample_frame(path: &std::path::Path) -> Option<SampledFrame> {
+    let probe = reco_io::ffmpeg::calibration_io::probe_video(path).ok()?;
+    let mid = probe.total_frames / 2;
+    let frames = reco_io::ffmpeg::calibration_io::extract_frames(path, &[mid]).ok()?;
+    let frame = frames.first()?;
+    Some(SampledFrame {
+        mean_luma: mean_luma(frame)?,
+        profile: column_profile(frame)?,
+    })
+}
+
+/// The strided mean luma of a frame's Y plane, bounded by
+/// [`READINESS_SAMPLE_MAX_PIXELS`] (T-04-07).
+fn mean_luma(frame: &reco_core::source::YuvFrame) -> Option<f64> {
+    if frame.y.is_empty() {
+        return None;
+    }
+    let stride = (frame.y.len() / READINESS_SAMPLE_MAX_PIXELS).max(1);
+    let mut sum = 0u64;
+    let mut count = 0u64;
+    let mut idx = 0;
+    while idx < frame.y.len() {
+        sum += frame.y[idx] as u64;
+        count += 1;
+        idx += stride;
+    }
+    (count > 0).then(|| sum as f64 / count as f64)
+}
+
+/// A per-column mean-luma profile over a bounded row sample (CALB-05).
+///
+/// `None` when the frame's Y plane is smaller than its stated geometry (a
+/// malformed buffer) or no pixel could be read.
+fn column_profile(frame: &reco_core::source::YuvFrame) -> Option<Vec<f64>> {
+    let w = frame.width as usize;
+    let h = frame.height as usize;
+    if w == 0 || h == 0 || frame.y.len() < w * h {
+        return None;
+    }
+    let cols = READINESS_PROFILE_COLUMNS.min(w);
+    let mut sums = vec![0.0f64; cols];
+    let mut counts = vec![0u32; cols];
+    let row_stride = (h / 256).max(1);
+    let mut row = 0;
+    while row < h {
+        let base = row * w;
+        for (col, (sum, count)) in sums.iter_mut().zip(counts.iter_mut()).enumerate() {
+            let src = col * w / cols;
+            if let Some(px) = frame.y.get(base + src) {
+                *sum += *px as f64;
+                *count += 1;
+            }
+        }
+        row += row_stride;
+    }
+    for (sum, count) in sums.iter_mut().zip(counts) {
+        if count == 0 {
+            return None;
+        }
+        *sum /= count as f64;
+    }
+    Some(sums)
+}
+
+/// Estimate the exposure difference in stops from two mean luma values.
+///
+/// `None` when either mean is effectively black (a ratio against ~0 is
+/// meaningless and would amplify noise).
+fn estimate_exposure_delta_stops(left_mean: f64, right_mean: f64) -> Option<f64> {
+    if left_mean <= 1.0 || right_mean <= 1.0 {
+        return None;
+    }
+    Some((left_mean / right_mean).log2())
+}
+
+/// Estimate horizontal overlap from two column profiles (CALB-05).
+///
+/// The best integer-shift normalized cross-correlation aligns the profiles; the
+/// aligned fraction of the width is the overlap estimate. A flat profile (no
+/// contrast) yields `None` — an honest unknown rather than a fake number.
+fn estimate_overlap(left: &[f64], right: &[f64]) -> Option<f64> {
+    if left.len() != right.len() || left.len() < 4 {
+        return None;
+    }
+    let ln = normalize_profile(left)?;
+    let rn = normalize_profile(right)?;
+    let n = left.len() as i64;
+    let mut best_shift = 0i64;
+    let mut best_corr = f64::NEG_INFINITY;
+    for shift in -(n - 1)..=(n - 1) {
+        let (a_start, b_start, len) = if shift >= 0 {
+            (0usize, shift as usize, (n - shift) as usize)
+        } else {
+            ((-shift) as usize, 0usize, (n + shift) as usize)
+        };
+        if len < 4 {
+            continue;
+        }
+        let mut dot = 0.0;
+        let mut na = 0.0;
+        let mut nb = 0.0;
+        for k in 0..len {
+            let a = ln[a_start + k];
+            let b = rn[b_start + k];
+            dot += a * b;
+            na += a * a;
+            nb += b * b;
+        }
+        let corr = if na > 0.0 && nb > 0.0 {
+            dot / (na.sqrt() * nb.sqrt())
+        } else {
+            0.0
+        };
+        if corr > best_corr {
+            best_corr = corr;
+            best_shift = shift;
+        }
+    }
+    Some(((n - best_shift.abs()) as f64 / n as f64).clamp(0.0, 1.0))
+}
+
+/// Subtract the mean and divide by the standard deviation; `None` if flat.
+fn normalize_profile(profile: &[f64]) -> Option<Vec<f64>> {
+    let mean = profile.iter().sum::<f64>() / profile.len() as f64;
+    let variance = profile.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / profile.len() as f64;
+    let std = variance.sqrt();
+    if std < 1e-6 {
+        return None;
+    }
+    Some(profile.iter().map(|v| (v - mean) / std).collect())
 }
 
 /// Format a duration in seconds as `M:SS` (or `H:MM:SS` past an hour).
@@ -1920,7 +2091,7 @@ impl EngineBackend for GpuEngineBackend {
         // Recompute the advisory checks from both inputs and report them
         // (IMPT-03). Changing an input after a run invalidates the result
         // (D3-08): the scorecard must reflect the clips it actually used.
-        self.emit_compatibility(events);
+        self.emit_readiness(events);
         self.invalidate_result(events);
         Ok(())
     }
@@ -1935,7 +2106,7 @@ impl EngineBackend for GpuEngineBackend {
         self.input_paths.remove(&role);
         self.lens_overrides[idx] = None;
         events.info(format!("{} cleared", role.label()));
-        self.emit_compatibility(events);
+        self.emit_readiness(events);
         self.invalidate_result(events);
         Ok(())
     }
@@ -2013,7 +2184,7 @@ impl EngineBackend for GpuEngineBackend {
                 events.lens_override_applied(role, None);
             }
         }
-        self.emit_compatibility(events);
+        self.emit_readiness(events);
         self.invalidate_result(events);
         Ok(())
     }
@@ -2027,7 +2198,7 @@ impl EngineBackend for GpuEngineBackend {
         self.lens_overrides[idx] = None;
         events.info(format!("{} lens override cleared", role.label()));
         events.lens_override_applied(role, None);
-        self.emit_compatibility(events);
+        self.emit_readiness(events);
         self.invalidate_result(events);
         Ok(())
     }
@@ -2916,34 +3087,50 @@ impl EngineBackend for GpuEngineBackend {
 }
 
 impl GpuEngineBackend {
-    /// Recompute the full advisory compatibility list from the current inputs
-    /// and lens overrides (IMPT-03 / D3-06).
+    /// Recompute the severity-sorted readiness report from the current inputs
+    /// and lens overrides (CALB-05 / D3-06).
     ///
-    /// Overlap is never part of this — it is unknown until calibration.
-    fn current_compatibility(&self) -> Vec<crate::events::CompatibilityIssue> {
+    /// Samples one mid-clip frame per input for the overlap/exposure estimates;
+    /// any sampling failure leaves the estimate `None` (honest unknown). The
+    /// report is non-blocking — the operator may always calibrate anyway.
+    fn current_readiness(&self) -> crate::events::ReadinessReport {
+        use crate::events::{InputRole, ReadinessFinding, ReadinessReport, ReadinessSeverity};
+
         let left_path = self
             .input_paths
-            .get(&crate::events::InputRole::Left)
+            .get(&InputRole::Left)
             .map(String::as_str)
             .unwrap_or("");
         let right_path = self
             .input_paths
-            .get(&crate::events::InputRole::Right)
+            .get(&InputRole::Right)
             .map(String::as_str)
             .unwrap_or("");
-        let mut issues = match (&self.inputs[0], &self.inputs[1]) {
-            (Some(left), Some(right)) => {
-                crate::calibration::check_compatibility(left, right, left_path, right_path)
-            }
-            _ => Vec::new(),
+
+        let (Some(left), Some(right)) = (&self.inputs[0], &self.inputs[1]) else {
+            return ReadinessReport {
+                findings: Vec::new(),
+                overlap_estimate: None,
+                exposure_delta_stops: None,
+            };
         };
+
+        let lens_available = self.lens_available_for(0) && self.lens_available_for(1);
+        let samples = sample_readiness(left_path, right_path);
+        let mut report = crate::calibration::estimate_readiness(
+            left,
+            right,
+            left_path,
+            right_path,
+            lens_available,
+            samples,
+        );
+
         // A lens override whose calibration resolution differs from the clip is
-        // a lens/resolution mismatch (D3-06) — the comparison needs the
-        // override, so it lives here rather than in the pure input check.
-        for (idx, role) in [
-            (0, crate::events::InputRole::Left),
-            (1, crate::events::InputRole::Right),
-        ] {
+        // a shape mismatch (D3-06) — the comparison needs the override, so it is
+        // folded in here rather than in the pure input check, then the list is
+        // re-sorted so the severity order still holds.
+        for (idx, role) in [(0, InputRole::Left), (1, InputRole::Right)] {
             let input_resolution = self.inputs[idx]
                 .as_ref()
                 .and_then(crate::calibration::parse_resolution);
@@ -2951,23 +3138,48 @@ impl GpuEngineBackend {
                 (input_resolution, self.lens_overrides[idx].as_ref())
                 && (over.width, over.height) != (iw, ih)
             {
-                issues.push(crate::events::CompatibilityIssue {
-                    code: crate::events::CompatibilityCode::LensResolutionMismatch,
+                report.findings.push(ReadinessFinding {
+                    code: crate::events::ReadinessCode::LensResolutionMismatch,
+                    severity: ReadinessSeverity::BlockingShape,
                     message: format!(
                         "{} lens override is {}×{} but the clip is {iw}×{ih}",
                         role.label(),
                         over.width,
                         over.height
                     ),
+                    estimated: false,
                 });
             }
         }
-        issues
+        report.findings.sort_by_key(|finding| finding.severity);
+        report
     }
 
-    /// Emit the current advisory compatibility list (IMPT-03).
-    fn emit_compatibility(&self, events: &EventSink) {
-        events.compatibility(self.current_compatibility());
+    /// Whether a lens profile can be resolved for one input (CALB-05).
+    ///
+    /// True when an override is applied or the embedded database has at least
+    /// one candidate for the input's resolution; an unknown resolution never
+    /// claims a profile is unavailable.
+    fn lens_available_for(&self, idx: usize) -> bool {
+        if self.lens_overrides[idx].is_some() {
+            return true;
+        }
+        match self.inputs[idx]
+            .as_ref()
+            .and_then(crate::calibration::parse_resolution)
+        {
+            Some((w, h)) if w > 0 && h > 0 => {
+                !reco_calibrate::lens_database::LensDatabase::embedded()
+                    .candidates(w, h)
+                    .is_empty()
+            }
+            _ => true,
+        }
+    }
+
+    /// Emit the current severity-sorted readiness report (CALB-05).
+    fn emit_readiness(&self, events: &EventSink) {
+        events.readiness(self.current_readiness());
     }
 
     /// Invalidate a live result if inputs/profile changed (D3-08).
@@ -3326,19 +3538,28 @@ mod tests {
             self.ops.lock().unwrap().push(op);
         }
 
-        /// Recompute and emit the advisory compatibility list, using the SAME
-        /// pure decision the real backend uses (never a reimplementation).
-        fn emit_mock_compatibility(&self, events: &EventSink) {
-            let issues = match (&self.inputs[0], &self.inputs[1]) {
-                (Some(left), Some(right)) => crate::calibration::check_compatibility(
+        /// Recompute and emit the readiness report, using the SAME pure decision
+        /// the real backend uses (never a reimplementation).
+        ///
+        /// The mock is GPU- and file-free, so it passes no sampled estimates and
+        /// assumes a lens profile is available.
+        fn emit_mock_readiness(&self, events: &EventSink) {
+            let report = match (&self.inputs[0], &self.inputs[1]) {
+                (Some(left), Some(right)) => crate::calibration::estimate_readiness(
                     left,
                     right,
                     self.input_paths[0].as_deref().unwrap_or(""),
                     self.input_paths[1].as_deref().unwrap_or(""),
+                    true,
+                    crate::calibration::ReadinessSamples::default(),
                 ),
-                _ => Vec::new(),
+                _ => crate::events::ReadinessReport {
+                    findings: Vec::new(),
+                    overlap_estimate: None,
+                    exposure_delta_stops: None,
+                },
             };
-            events.compatibility(issues);
+            events.readiness(report);
         }
 
         /// Invalidate a live result if one exists (D3-08).
@@ -3393,7 +3614,7 @@ mod tests {
             events.info(format!("{} selected: {filename}", role.label()));
             events.metadata(role, metadata);
             // Use the same pure decision the real backend uses.
-            self.emit_mock_compatibility(events);
+            self.emit_mock_readiness(events);
             self.invalidate_mock_result(events);
             Ok(())
         }
@@ -3409,7 +3630,7 @@ mod tests {
             self.input_paths[idx] = None;
             self.lens_overrides[idx] = None;
             events.info(format!("{} cleared", role.label()));
-            self.emit_mock_compatibility(events);
+            self.emit_mock_readiness(events);
             self.invalidate_mock_result(events);
             Ok(())
         }
@@ -3450,7 +3671,7 @@ mod tests {
                 d: [0.0; 4],
             });
             events.lens_override_applied(role, Some(candidate));
-            self.emit_mock_compatibility(events);
+            self.emit_mock_readiness(events);
             self.invalidate_mock_result(events);
             Ok(())
         }
@@ -3464,7 +3685,7 @@ mod tests {
             let idx = role_index(role);
             self.lens_overrides[idx] = None;
             events.lens_override_applied(role, None);
-            self.emit_mock_compatibility(events);
+            self.emit_mock_readiness(events);
             self.invalidate_mock_result(events);
             Ok(())
         }
@@ -3996,7 +4217,7 @@ mod tests {
     }
 
     #[test]
-    fn two_incompatible_inputs_emit_a_compatibility_event() {
+    fn two_incompatible_inputs_emit_a_readiness_report() {
         let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut mock = MockBackend::new(Arc::clone(&ops));
         // Preload the right input with a different resolution than the default.
@@ -4024,9 +4245,10 @@ mod tests {
 
         let seen = drain_until_shutdown(&events);
         let mismatch = seen.iter().any(|e| match e {
-            WorkerEvent::Compatibility { issues } => issues
+            WorkerEvent::Readiness { report } => report
+                .findings
                 .iter()
-                .any(|i| i.code == crate::events::CompatibilityCode::ResolutionMismatch),
+                .any(|f| f.code == crate::events::ReadinessCode::ResolutionMismatch),
             _ => false,
         });
         assert!(

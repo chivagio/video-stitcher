@@ -142,40 +142,6 @@ pub struct InputMetadata {
     pub codec: MetadataField,
 }
 
-/// Which advisory compatibility check failed (IMPT-03 / D3-06).
-///
-/// The checks are deliberately **advisory**: the operator may know the clips
-/// better than the heuristic, so a finding is reported as a non-blocking warning,
-/// never a hard block (D3-05).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CompatibilityCode {
-    /// The two clips have different frame resolutions.
-    ResolutionMismatch,
-    /// The two clips have different aspect ratios (tolerance ~1%).
-    AspectMismatch,
-    /// The two clips' frame rates differ by more than 0.5 fps.
-    FpsMismatch,
-    /// The two clips use different codecs.
-    CodecMismatch,
-    /// A lens override's resolution does not match the input's.
-    LensResolutionMismatch,
-    /// Both slots point at the same file.
-    SameFile,
-}
-
-/// One advisory compatibility finding (IMPT-03).
-///
-/// `message` is already user-facing: the webview renders it verbatim and never
-/// invents a cause.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct CompatibilityIssue {
-    /// Which check failed.
-    pub code: CompatibilityCode,
-    /// Human-readable reason.
-    pub message: String,
-}
-
 /// Severity of one readiness finding (CALB-05).
 ///
 /// Declared least-severe-last so a plain `sort` puts blocking-shape findings
@@ -547,13 +513,13 @@ pub enum WorkerEvent {
         metadata: InputMetadata,
     },
 
-    /// Advisory compatibility findings for the two selected inputs (IMPT-03).
+    /// The severity-sorted readiness report for the two selected inputs (CALB-05).
     ///
-    /// Emitted after every input change; an empty list means all checks passed.
-    /// Non-blocking by design (D3-05).
-    Compatibility {
-        /// The findings; empty when every check passed.
-        issues: Vec<CompatibilityIssue>,
+    /// Emitted after every input/lens change; an empty `findings` list means
+    /// every check passed. Non-blocking by design (D3-05).
+    Readiness {
+        /// The severity-sorted report (findings + honest optional estimates).
+        report: ReadinessReport,
     },
 
     /// Lens-profile candidates for one input's override dropdown (IMPT-04).
@@ -753,17 +719,26 @@ impl WorkerEvent {
                     metadata.resolution.value.as_deref().unwrap_or("—"),
                 ),
             },
-            // Compatibility findings are a WARN narrative (UI-SPEC Event Log
-            // Contract); the structured list rides the typed channel.
-            WorkerEvent::Compatibility { issues } => LogLine {
-                level: Level::Warn,
-                message: match issues.first() {
+            // Readiness is a WARN narrative when a run is likely doomed (a
+            // blocking-shape finding) and INFO otherwise (UI-SPEC Event Log
+            // Contract); the structured report rides the typed channel.
+            WorkerEvent::Readiness { report } => LogLine {
+                level: if report
+                    .findings
+                    .iter()
+                    .any(|f| f.severity == ReadinessSeverity::BlockingShape)
+                {
+                    Level::Warn
+                } else {
+                    Level::Info
+                },
+                message: match report.findings.first() {
                     Some(first) => format!(
-                        "compatibility: {} issue(s) found — {}",
-                        issues.len(),
+                        "readiness: {} issue(s) found — {}",
+                        report.findings.len(),
                         first.message
                     ),
-                    None => "compatibility: all checks passed".to_string(),
+                    None => "readiness: all checks passed".to_string(),
                 },
             },
             WorkerEvent::LensCandidates { role, candidates } => LogLine {
@@ -1310,18 +1285,34 @@ mod tests {
     }
 
     #[test]
-    fn compatibility_issue_roundtrips_through_serde() {
-        let issue = CompatibilityIssue {
-            code: CompatibilityCode::ResolutionMismatch,
-            message: "Camera A is 1920×1080 but Camera B is 3840×2160".to_string(),
+    fn readiness_report_roundtrips_and_keeps_unknown_estimates_null() {
+        // CALB-05: the typed report carries severity-classified findings plus
+        // honest optional estimates; an unknown estimate is null, never 0.0.
+        let report = ReadinessReport {
+            findings: vec![ReadinessFinding {
+                code: ReadinessCode::ResolutionMismatch,
+                severity: ReadinessSeverity::BlockingShape,
+                message: "Camera A is 1920×1080 but Camera B is 3840×2160".to_string(),
+                estimated: false,
+            }],
+            overlap_estimate: None,
+            exposure_delta_stops: None,
         };
-        let json = serde_json::to_string(&issue).unwrap();
+        let json = serde_json::to_string(&report).unwrap();
         assert!(
             json.contains("\"code\":\"resolution_mismatch\""),
             "unexpected json: {json}"
         );
-        let back: CompatibilityIssue = serde_json::from_str(&json).unwrap();
-        assert_eq!(issue, back);
+        assert!(
+            json.contains("\"severity\":\"blocking_shape\""),
+            "unexpected json: {json}"
+        );
+        assert!(
+            json.contains("\"overlap_estimate\":null"),
+            "an unknown overlap must serialize as null: {json}"
+        );
+        let back: ReadinessReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(report, back);
     }
 
     #[test]
@@ -1344,14 +1335,40 @@ mod tests {
         assert_eq!(stage, back);
         assert_eq!(stage.to_log_line().level, Level::Info);
 
-        // Compatibility findings are a WARN narrative.
-        let compat = WorkerEvent::Compatibility {
-            issues: vec![CompatibilityIssue {
-                code: CompatibilityCode::FpsMismatch,
-                message: "fps differ".to_string(),
-            }],
+        // A blocking-shape readiness finding is a WARN narrative; an
+        // informational-only report stays INFO.
+        let doomed = WorkerEvent::Readiness {
+            report: ReadinessReport {
+                findings: vec![ReadinessFinding {
+                    code: ReadinessCode::ResolutionMismatch,
+                    severity: ReadinessSeverity::BlockingShape,
+                    message: "resolutions differ".to_string(),
+                    estimated: false,
+                }],
+                overlap_estimate: None,
+                exposure_delta_stops: None,
+            },
         };
-        assert_eq!(compat.to_log_line().level, Level::Warn);
+        assert_eq!(doomed.to_log_line().level, Level::Warn);
+        assert!(
+            doomed.to_log_line().message.starts_with("readiness:"),
+            "unexpected line: {}",
+            doomed.to_log_line().message
+        );
+
+        let informational = WorkerEvent::Readiness {
+            report: ReadinessReport {
+                findings: vec![ReadinessFinding {
+                    code: ReadinessCode::LensUnavailable,
+                    severity: ReadinessSeverity::Informational,
+                    message: "no profile".to_string(),
+                    estimated: false,
+                }],
+                overlap_estimate: None,
+                exposure_delta_stops: None,
+            },
+        };
+        assert_eq!(informational.to_log_line().level, Level::Info);
 
         // Result invalidation is a WARN.
         assert_eq!(

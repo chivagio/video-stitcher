@@ -17,10 +17,9 @@ use reco_calibrate::types::{
 use reco_core::calibration::CameraParams;
 
 use crate::events::{
-    CalibrationDiagnosis, CalibrationOptions, CalibrationStage, CompatibilityCode,
-    CompatibilityIssue, ConfidenceBand, DiagnosisMetrics, InputMetadata, LensProfileView,
-    ReadinessCode, ReadinessFinding, ReadinessReport, ReadinessSeverity, Scorecard, SyncMethod,
-    SyncView,
+    CalibrationDiagnosis, CalibrationOptions, CalibrationStage, ConfidenceBand, DiagnosisMetrics,
+    InputMetadata, LensProfileView, ReadinessCode, ReadinessFinding, ReadinessReport,
+    ReadinessSeverity, Scorecard, SyncMethod, SyncView,
 };
 
 /// Sampled statistics feeding the readiness estimate (CALB-05).
@@ -36,74 +35,70 @@ pub struct ReadinessSamples {
     pub exposure_delta_stops: Option<f64>,
 }
 
+/// Exposure difference (stops) above which readiness flags a likely quality
+/// loss (CALB-05 discretion). One stop is a visible mismatch on consumer gear.
+pub const READINESS_EXPOSURE_WARN_STOPS: f64 = 1.0;
+
+/// Overlap fraction below which readiness warns the pair may not stitch
+/// (CALB-05 discretion).
+pub const READINESS_OVERLAP_WARN: f64 = 0.20;
+
 /// Severity-sorted readiness projection for the two selected inputs (CALB-05).
 ///
-/// (RED stub — the severity classification and the sampled findings are added
-/// in the GREEN step.)
+/// Supersedes the Phase-3 [`check_compatibility`]: the same resolution/aspect/
+/// fps/codec checks become severity-classified findings, joined by the sampled
+/// exposure/overlap estimates and lens-profile availability. Results are sorted
+/// blocking-shape first, informational last. Non-blocking by design — the
+/// operator may always calibrate anyway (D3-05).
+///
+/// Pure (no device/file/channel): the worker samples the clips and calls this;
+/// the frontend only renders the findings. An unknown estimate is `None`, never
+/// a fabricated `0.0` (T-04-07).
 pub fn estimate_readiness(
-    _left: &InputMetadata,
-    _right: &InputMetadata,
-    _left_path: &str,
-    _right_path: &str,
-    _lens_available: bool,
-    samples: ReadinessSamples,
-) -> ReadinessReport {
-    ReadinessReport {
-        findings: Vec::new(),
-        overlap_estimate: samples.overlap,
-        exposure_delta_stops: samples.exposure_delta_stops,
-    }
-}
-
-/// The advisory compatibility findings for the two selected inputs (IMPT-03).
-///
-/// The checks are deliberately **advisory** (D3-05): a finding is reported as a
-/// non-blocking warning, never a hard block. Overlap is never computed here — it
-/// is **unknown until calibration** and is not faked with a sampling pre-pass
-/// (D3-06).
-///
-/// Covers resolution, aspect (tolerance ~1%), frame rate (>0.5 fps), codec
-/// (both present and different), and the same-file guard. A
-/// `LensResolutionMismatch` is emitted by the worker when a lens override's
-/// resolution differs from the input's — that comparison needs the override,
-/// which this function does not receive.
-pub fn check_compatibility(
     left: &InputMetadata,
     right: &InputMetadata,
     left_path: &str,
     right_path: &str,
-) -> Vec<CompatibilityIssue> {
-    let mut issues = Vec::new();
+    lens_available: bool,
+    samples: ReadinessSamples,
+) -> ReadinessReport {
+    let mut findings = Vec::new();
 
     // Same-file guard: the only check shown even though it is almost always
     // wrong; still non-blocking (D3-05). An empty path is a not-yet-filled slot
     // and never equals another empty path for this purpose.
     if !left_path.is_empty() && left_path == right_path {
-        issues.push(CompatibilityIssue {
-            code: CompatibilityCode::SameFile,
+        findings.push(ReadinessFinding {
+            code: ReadinessCode::SameFile,
+            severity: ReadinessSeverity::BlockingShape,
             message: format!(
                 "Camera A and Camera B point at the same file ({left_path}); they must be different clips"
             ),
+            estimated: false,
         });
     }
 
     if let (Some((lw, lh)), Some((rw, rh))) = (parse_resolution(left), parse_resolution(right))
         && (lw, lh) != (rw, rh)
     {
-        issues.push(CompatibilityIssue {
-            code: CompatibilityCode::ResolutionMismatch,
+        findings.push(ReadinessFinding {
+            code: ReadinessCode::ResolutionMismatch,
+            severity: ReadinessSeverity::BlockingShape,
             message: format!("Camera A is {lw}×{lh} but Camera B is {rw}×{rh}"),
+            estimated: false,
         });
         // Aspect ratio, tolerance ~1% of the larger aspect.
         let left_aspect = lw as f64 / lh as f64;
         let right_aspect = rw as f64 / rh as f64;
         let tolerance = 0.01 * left_aspect.max(right_aspect);
         if (left_aspect - right_aspect).abs() > tolerance {
-            issues.push(CompatibilityIssue {
-                code: CompatibilityCode::AspectMismatch,
+            findings.push(ReadinessFinding {
+                code: ReadinessCode::AspectMismatch,
+                severity: ReadinessSeverity::BlockingShape,
                 message: format!(
                     "Camera A and Camera B have different aspect ratios ({left_aspect:.3} vs {right_aspect:.3})"
                 ),
+                estimated: false,
             });
         }
     }
@@ -111,24 +106,76 @@ pub fn check_compatibility(
     if let (Some(lfps), Some(rfps)) = (parse_fps(left), parse_fps(right))
         && (lfps - rfps).abs() > 0.5
     {
-        issues.push(CompatibilityIssue {
-            code: CompatibilityCode::FpsMismatch,
+        findings.push(ReadinessFinding {
+            code: ReadinessCode::FpsMismatch,
+            severity: ReadinessSeverity::LikelyQuality,
             message: format!("Camera A runs at {lfps} fps but Camera B runs at {rfps} fps"),
+            estimated: false,
         });
     }
 
     if let (Some(lcodec), Some(rcodec)) = (codec_name(left), codec_name(right))
         && lcodec != rcodec
     {
-        issues.push(CompatibilityIssue {
-            code: CompatibilityCode::CodecMismatch,
+        findings.push(ReadinessFinding {
+            code: ReadinessCode::CodecMismatch,
+            severity: ReadinessSeverity::LikelyQuality,
             message: format!(
                 "Camera A is {lcodec} but Camera B is {rcodec}; they should use the same codec"
             ),
+            estimated: false,
         });
     }
 
-    issues
+    // Exposure mismatch from the sampled pass — labelled `estimated`, never
+    // presented as a measured value (CALB-05 / prohibition).
+    if let Some(stops) = samples.exposure_delta_stops
+        && stops.abs() > READINESS_EXPOSURE_WARN_STOPS
+    {
+        findings.push(ReadinessFinding {
+            code: ReadinessCode::ExposureMismatch,
+            severity: ReadinessSeverity::LikelyQuality,
+            message: format!(
+                "Exposure differs by {:.1} stops between cameras.",
+                stops.abs()
+            ),
+            estimated: true,
+        });
+    }
+
+    // Low overlap from the sampled pass — labelled `estimated`.
+    if let Some(overlap) = samples.overlap
+        && overlap < READINESS_OVERLAP_WARN
+    {
+        findings.push(ReadinessFinding {
+            code: ReadinessCode::LowOverlap,
+            severity: ReadinessSeverity::LikelyQuality,
+            message: format!(
+                "Estimated overlap is only {:.0}% — the cameras may barely see the same scene.",
+                overlap * 100.0
+            ),
+            estimated: true,
+        });
+    }
+
+    // Lens-profile availability is informational, never blocking: the engine
+    // auto-detects, so a missing profile is a specific, actionable note.
+    if !lens_available {
+        findings.push(ReadinessFinding {
+            code: ReadinessCode::LensUnavailable,
+            severity: ReadinessSeverity::Informational,
+            message: "No lens profile matched; the engine will auto-detect.".to_string(),
+            estimated: false,
+        });
+    }
+
+    findings.sort_by_key(|finding| finding.severity);
+
+    ReadinessReport {
+        findings,
+        overlap_estimate: samples.overlap,
+        exposure_delta_stops: samples.exposure_delta_stops,
+    }
 }
 
 /// Parse a `"1920×1080"` display value into `(width, height)`.
@@ -462,57 +509,84 @@ mod tests {
     }
 
     #[test]
-    fn different_resolutions_produce_a_resolution_mismatch() {
+    fn identical_resolutions_never_report_a_resolution_finding() {
         let left = metadata("1920×1080", "30 fps", Some("h264"));
-        let right = metadata("3840×2160", "30 fps", Some("h264"));
-        let issues = check_compatibility(&left, &right, "/a.mp4", "/b.mp4");
-        assert!(
-            issues
-                .iter()
-                .any(|i| i.code == CompatibilityCode::ResolutionMismatch),
-            "expected a ResolutionMismatch, got {issues:?}"
+        let report = estimate_readiness(
+            &left,
+            &left.clone(),
+            "/a.mp4",
+            "/b.mp4",
+            true,
+            ReadinessSamples::default(),
         );
-
-        let same = check_compatibility(&left, &left.clone(), "/a.mp4", "/b.mp4");
         assert!(
-            same.iter()
-                .all(|i| i.code != CompatibilityCode::ResolutionMismatch),
-            "identical resolutions must not report a mismatch: {same:?}"
+            report
+                .findings
+                .iter()
+                .all(|f| f.code != ReadinessCode::ResolutionMismatch),
+            "identical resolutions must not report a mismatch: {:?}",
+            report.findings
         );
     }
 
     #[test]
-    fn the_same_path_for_both_roles_produces_exactly_one_same_file_issue() {
+    fn the_same_path_for_both_roles_produces_exactly_one_same_file_finding() {
         let left = metadata("1920×1080", "30 fps", Some("h264"));
-        let issues = check_compatibility(&left, &left.clone(), "/a.mp4", "/a.mp4");
-        let same_file: Vec<_> = issues
+        let report = estimate_readiness(
+            &left,
+            &left.clone(),
+            "/a.mp4",
+            "/a.mp4",
+            true,
+            ReadinessSamples::default(),
+        );
+        let same_file: Vec<_> = report
+            .findings
             .iter()
-            .filter(|i| i.code == CompatibilityCode::SameFile)
+            .filter(|f| f.code == ReadinessCode::SameFile)
             .collect();
         assert_eq!(
             same_file.len(),
             1,
-            "expected exactly one SameFile: {issues:?}"
+            "expected exactly one SameFile: {:?}",
+            report.findings
         );
     }
 
     #[test]
-    fn fps_differing_by_more_than_half_a_frame_is_a_mismatch() {
+    fn fps_differing_by_more_than_half_a_frame_is_a_likely_quality_finding() {
         let left = metadata("1920×1080", "30 fps", Some("h264"));
         let right = metadata("1920×1080", "60 fps", Some("h264"));
-        assert!(
-            check_compatibility(&left, &right, "/a.mp4", "/b.mp4")
-                .iter()
-                .any(|i| i.code == CompatibilityCode::FpsMismatch),
-            "30 vs 60 fps must report an FpsMismatch"
+        let report = estimate_readiness(
+            &left,
+            &right,
+            "/a.mp4",
+            "/b.mp4",
+            true,
+            ReadinessSamples::default(),
         );
+        let fps = report
+            .findings
+            .iter()
+            .find(|f| f.code == ReadinessCode::FpsMismatch)
+            .expect("30 vs 60 fps must report an FpsMismatch");
+        assert_eq!(fps.severity, ReadinessSeverity::LikelyQuality);
 
-        // Within tolerance: no issue.
+        // Within tolerance: no finding.
         let near = metadata("1920×1080", "30.2 fps", Some("h264"));
+        let tolerant = estimate_readiness(
+            &left,
+            &near,
+            "/a.mp4",
+            "/b.mp4",
+            true,
+            ReadinessSamples::default(),
+        );
         assert!(
-            check_compatibility(&left, &near, "/a.mp4", "/b.mp4")
+            tolerant
+                .findings
                 .iter()
-                .all(|i| i.code != CompatibilityCode::FpsMismatch),
+                .all(|f| f.code != ReadinessCode::FpsMismatch),
             "30 vs 30.2 fps is within tolerance"
         );
     }
@@ -530,8 +604,11 @@ mod tests {
             ReadinessSamples::default(),
         );
         assert!(
-            report.findings.iter().any(|f| f.code == ReadinessCode::ResolutionMismatch
-                && f.severity == ReadinessSeverity::BlockingShape),
+            report
+                .findings
+                .iter()
+                .any(|f| f.code == ReadinessCode::ResolutionMismatch
+                    && f.severity == ReadinessSeverity::BlockingShape),
             "expected a BlockingShape resolution finding: {:?}",
             report.findings
         );
