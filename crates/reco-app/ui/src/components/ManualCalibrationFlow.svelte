@@ -10,6 +10,7 @@
   import { manual, MANUAL_STEPS, type ManualStep } from "../lib/manual.svelte";
   import TimeAlignStep from "./TimeAlignStep.svelte";
   import FramePickStep from "./FramePickStep.svelte";
+  import PinEditorStep from "./PinEditorStep.svelte";
   import SolveStatus from "./SolveStatus.svelte";
   import ActionButton from "./ActionButton.svelte";
   import InlineNotice from "./InlineNotice.svelte";
@@ -78,6 +79,8 @@
       <TimeAlignStep />
     {:else if manual.step === "frame"}
       <FramePickStep />
+    {:else if manual.step === "pin"}
+      <PinEditorStep />
     {:else}
       <div class="step-placeholder">
         <p class="placeholder-text">
