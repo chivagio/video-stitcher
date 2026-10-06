@@ -113,6 +113,50 @@ pub struct IntrinsicsRefinement {
     pub residual: f64,
 }
 
+/// Result of the conditioning gate that guards the reduced solve.
+///
+/// The gate answers "is this observation set able to constrain `k1` at all?"
+/// *before* the solver runs, so an ill-conditioned set is refused with a typed
+/// non-result rather than silently fitted (research C2: `k1` is separable from
+/// `fx` only by the *shape* of the radial field, which needs features spanning
+/// a wide radius range).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Conditioning {
+    /// Number of raw-pixel observations considered.
+    pub match_count: usize,
+    /// Mean normalized radial position of the observations, in `[0, 1]`.
+    ///
+    /// Each match contributes the average of its two cameras' distances from
+    /// their principal points, normalized by the frame's corner radius
+    /// (`hypot(width/2, height/2)`). `0.0` is the optical centre, `1.0` the
+    /// frame corner. A centre-weighted set scores ≈`0.05`; a set spread across
+    /// the frame scores ≈`0.4`–`0.5`.
+    pub radial_spread: f64,
+    /// Whether the set passes *both* the match-count and radial-spread gates
+    /// (and sits at a finite layout).
+    pub well_conditioned: bool,
+}
+
+/// Recommended minimum match count for a well-conditioned `k1` solve.
+///
+/// Rationale: the pipeline's `min_matches` floor admits far fewer points than a
+/// 1-parameter radial solve needs to average out detection noise, and the
+/// research (C2) asks for "≥N well-spread matches across ≥2 frames". `30` is a
+/// conservative floor — the synthetic harness recovers `k1` comfortably with
+/// ~40+ in-frame observations — and leaves margin for the ~20% held-out split
+/// (04.2-03) without dropping the fit set below a workable size.
+pub const RECOMMENDED_MIN_MATCHES: usize = 30;
+
+/// Recommended minimum mean normalized radius for a well-conditioned solve.
+///
+/// `radial_spread` is the mean, over observations, of each match's distance
+/// from the principal point normalized by the frame's corner radius. `0.30`
+/// requires the average observation to sit at least ~30% of the way to the
+/// corner — enough radial leverage for `k1` to be separated from `fx` by the
+/// shape of the radial field (research C2) — while not demanding the extreme
+/// edge the pipeline's border filter removes (`features.rs`).
+pub const RECOMMENDED_MIN_SPREAD: f64 = 0.30;
+
 /// Convert a raw-pixel correspondence to an optimizer-space [`MatchedPoint`].
 ///
 /// Each raw distorted pixel is mapped to an undistorted output pixel with
@@ -306,6 +350,82 @@ pub fn optimize_intrinsics(
     })
 }
 
+/// Frame corner radius in pixels for `params`.
+///
+/// The diagonal half-extent `hypot(width/2, height/2)` is the natural
+/// normalization for a radial measurement: `0` at the principal point, `1` at
+/// the frame corner.
+fn frame_corner_radius(params: &CameraParams) -> f64 {
+    let hw = params.width.max(1) as f64 / 2.0;
+    let hh = params.height.max(1) as f64 / 2.0;
+    (hw * hw + hh * hh).sqrt()
+}
+
+/// Distance of a pixel from the principal point, normalized by `radius`.
+fn normalized_radius(px: [f64; 2], params: &CameraParams, radius: f64) -> f64 {
+    let dx = px[0] - params.cx;
+    let dy = px[1] - params.cy;
+    (dx * dx + dy * dy).sqrt() / radius
+}
+
+/// Evaluate whether an observation set is conditioned to constrain `k1`.
+///
+/// The gate is the "well-posed" half of INTR-01: a reduced solve is only
+/// meaningful when the correspondences span a wide radius range, so this
+/// predicate reports the match count *and* the radial spread of the raw
+/// observations, and a set that fails it must not reach the solver.
+///
+/// `radial_spread` is the mean, over observations, of each match's distance
+/// from the principal point (per-camera `base.cx`/`base.cy`), normalized by the
+/// frame's corner radius and averaged across the two cameras. `well_conditioned`
+/// requires `match_count >= min_matches`, `radial_spread >= min_spread`, and a
+/// finite `layout` — the layout is the fixed solve context, and a layout that
+/// cannot host a solve is itself a reason to refuse. Recommended thresholds are
+/// [`RECOMMENDED_MIN_MATCHES`] and [`RECOMMENDED_MIN_SPREAD`].
+///
+/// This mirrors the covariance-style reasoning of
+/// [`crate::manual::solve_manual_calibration`]'s degeneracy check, applied to
+/// the *radial distribution* that `k1` specifically needs.
+#[must_use]
+pub fn conditioning(
+    points: &[RawPixelMatch],
+    layout: &PlaneLayout,
+    base: &CameraParams,
+    min_matches: usize,
+    min_spread: f64,
+) -> Conditioning {
+    let match_count = points.len();
+    let radius = frame_corner_radius(base);
+
+    let mut spread_sum = 0.0_f64;
+    for raw in points {
+        let left_r = normalized_radius(raw.left_px, base, radius);
+        let right_r = normalized_radius(raw.right_px, base, radius);
+        // A match constrains `k1` only where both cameras carry radial
+        // leverage, so the per-match position is their average.
+        spread_sum += 0.5 * (left_r + right_r);
+    }
+    let radial_spread = if match_count == 0 {
+        0.0
+    } else {
+        spread_sum / match_count as f64
+    };
+
+    let layout_finite = layout.x_ty.is_finite()
+        && layout.intersect.is_finite()
+        && layout.camera_axis_offset.is_finite()
+        && layout.x_rz.is_finite()
+        && layout.z_rx.is_finite();
+
+    Conditioning {
+        match_count,
+        radial_spread,
+        well_conditioned: match_count >= min_matches
+            && radial_spread >= min_spread
+            && layout_finite,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -453,17 +573,64 @@ mod tests {
         }
     }
 
+    /// An alternate truth rig: a modestly different baseline and intersection
+    /// so the widened sweep exercises more than one geometry.
+    fn alt_rig() -> OptParams {
+        OptParams {
+            x_ty: -0.015,
+            intersect: 0.48,
+            cam_d: 0.20,
+            x_rz: 0.0,
+            z_rx: 0.0,
+            z_rz: None,
+            x_rx: None,
+        }
+    }
+
+    /// The fixed solve layout implied by a truth rig.
+    fn layout_from(t: &OptParams) -> PlaneLayout {
+        PlaneLayout {
+            camera_axis_offset: t.cam_d,
+            intersect: t.intersect,
+            x_ty: t.x_ty,
+            x_rz: t.x_rz,
+            z_rx: t.z_rx,
+            x_rx: 0.0,
+            z_rz: 0.0,
+        }
+    }
+
+    /// Build `n` observations whose pixels are placed by `place` in both
+    /// cameras (used by the conditioning tests, which only care about the
+    /// radial distribution).
+    fn matches_from(place: impl Fn(usize) -> [f64; 2], n: usize) -> Vec<RawPixelMatch> {
+        (0..n)
+            .map(|i| {
+                let p = place(i);
+                RawPixelMatch {
+                    left_px: p,
+                    right_px: p,
+                }
+            })
+            .collect()
+    }
+
     /// The gate: recover a known `k1` from synthesized raw pixels.
     ///
     /// Returns the absolute recovery error `|recovered - true|`.
     fn recover_k1_error(seed: u64, noise_px: f64, true_k1: f64) -> f64 {
-        let t = truth();
+        recover_k1_error_with_rig(seed, noise_px, true_k1, &truth())
+    }
+
+    /// Recovery error for an arbitrary truth rig — the widened sweep varies
+    /// the rig geometry, not just the seed and noise level.
+    fn recover_k1_error_with_rig(seed: u64, noise_px: f64, true_k1: f64, t: &OptParams) -> f64 {
         let synth = camera_params(true_k1);
         // The solver starts from a deliberately wrong k1 (0.0) so recovery is
         // a genuine search, not a no-op.
         let base = camera_params(0.0);
 
-        let plane_points = synthetic_points(&t, 196);
+        let plane_points = synthetic_points(t, 196);
         assert!(
             plane_points.len() >= 40,
             "not enough synthetic points: {}",
@@ -477,15 +644,7 @@ mod tests {
         );
         add_noise(&mut raw, seed, noise_px);
 
-        let layout = PlaneLayout {
-            camera_axis_offset: t.cam_d,
-            intersect: t.intersect,
-            x_ty: t.x_ty,
-            x_rz: t.x_rz,
-            z_rx: t.z_rx,
-            x_rx: 0.0,
-            z_rz: 0.0,
-        };
+        let layout = layout_from(t);
 
         let cfg = IntrinsicsConfig::default();
         let refinement =
@@ -686,5 +845,138 @@ mod tests {
             checked += 1;
         }
         assert!(checked >= 24, "not enough in-frame observations: {checked}");
+    }
+
+    /// A full-frame spread set (both axes), used by the conditioning tests.
+    fn spread_matches(n: usize) -> Vec<RawPixelMatch> {
+        matches_from(
+            |i| {
+                let col = i % 8;
+                let row = i / 8;
+                [120.0 + col as f64 * 240.0, 100.0 + row as f64 * 220.0]
+            },
+            n,
+        )
+    }
+
+    /// The conditioning gate refuses a centre-weighted set *before* any solve:
+    /// with no radial leverage, `k1` cannot be constrained (T-04.2-05).
+    #[test]
+    fn conditioning_rejects_centre_weighted_set() {
+        let points = matches_from(
+            |i| {
+                let a = i as f64 * 0.7;
+                [960.0 + 40.0 * a.cos(), 540.0 + 40.0 * a.sin()]
+            },
+            40,
+        );
+        let c = conditioning(
+            &points,
+            &layout_from(&truth()),
+            &camera_params(0.0),
+            RECOMMENDED_MIN_MATCHES,
+            RECOMMENDED_MIN_SPREAD,
+        );
+        assert_eq!(c.match_count, 40);
+        assert!(
+            c.radial_spread < 0.10,
+            "centre-weighted spread should be tiny, got {}",
+            c.radial_spread
+        );
+        assert!(
+            !c.well_conditioned,
+            "a centre-weighted set must be refused, never solved"
+        );
+    }
+
+    /// The conditioning gate accepts a set spread across the frame.
+    #[test]
+    fn conditioning_accepts_spread_set() {
+        let points = spread_matches(40);
+        let c = conditioning(
+            &points,
+            &layout_from(&truth()),
+            &camera_params(0.0),
+            RECOMMENDED_MIN_MATCHES,
+            RECOMMENDED_MIN_SPREAD,
+        );
+        assert_eq!(c.match_count, 40);
+        assert!(
+            c.radial_spread >= RECOMMENDED_MIN_SPREAD,
+            "a full-frame spread should clear the threshold, got {}",
+            c.radial_spread
+        );
+        assert!(c.well_conditioned, "a spread set should be accepted");
+    }
+
+    /// A well-spread but too-small set is refused on the count gate, and an
+    /// empty set is refused on both gates without dividing by zero.
+    #[test]
+    fn conditioning_rejects_too_few_and_empty_sets() {
+        let few = spread_matches(10);
+        let c = conditioning(
+            &few,
+            &layout_from(&truth()),
+            &camera_params(0.0),
+            RECOMMENDED_MIN_MATCHES,
+            RECOMMENDED_MIN_SPREAD,
+        );
+        assert_eq!(c.match_count, 10);
+        assert!(!c.well_conditioned, "10 < min_matches must be refused");
+
+        let empty = conditioning(
+            &[],
+            &layout_from(&truth()),
+            &camera_params(0.0),
+            RECOMMENDED_MIN_MATCHES,
+            RECOMMENDED_MIN_SPREAD,
+        );
+        assert_eq!(empty.match_count, 0);
+        assert_eq!(empty.radial_spread, 0.0);
+        assert!(!empty.well_conditioned);
+    }
+
+    /// A non-finite layout cannot host a solve and is refused even with a
+    /// well-spread set (the gate is evaluated in the solve's context).
+    #[test]
+    fn conditioning_refuses_non_finite_layout() {
+        let points = spread_matches(40);
+        let mut layout = layout_from(&truth());
+        layout.camera_axis_offset = f64::NAN;
+        let c = conditioning(
+            &points,
+            &layout,
+            &camera_params(0.0),
+            RECOMMENDED_MIN_MATCHES,
+            RECOMMENDED_MIN_SPREAD,
+        );
+        assert!(c.radial_spread >= RECOMMENDED_MIN_SPREAD);
+        assert!(!c.well_conditioned, "a non-finite layout must be refused");
+    }
+
+    /// Test 1, widened (the robustness gate): a known `k1` is recovered within
+    /// tolerance across >= 5 seeds, >= 3 noise levels, and >= 2 rig geometries
+    /// — the INTR-03 claim is stated over a sweep, not one lucky configuration.
+    #[test]
+    fn recovers_known_k1_across_wide_sweep() {
+        let true_k1 = 0.15;
+        let rigs = [truth(), alt_rig()];
+        let noises = [0.10_f64, 0.25, 1.5];
+        for (ri, rig) in rigs.iter().enumerate() {
+            for &noise in &noises {
+                for seed in 1u64..=5 {
+                    let err = recover_k1_error_with_rig(seed, noise, true_k1, rig);
+                    // Tolerance scales with the noise floor; the sensitivity
+                    // table measures ~1000 px of raw displacement per unit k1,
+                    // so a few px of noise leaves recovery well inside this band.
+                    let tol = if noise >= 1.0 { 0.12 } else { 0.06 };
+                    assert!(
+                        err <= tol,
+                        "rig={ri} seed={seed} noise={noise}: \
+                         |recovered - true| = {err} > {tol}"
+                    );
+                }
+            }
+        }
     }
 }
