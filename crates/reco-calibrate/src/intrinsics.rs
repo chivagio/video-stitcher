@@ -979,4 +979,288 @@ mod tests {
             }
         }
     }
+
+    // -----------------------------------------------------------------------
+    // `k2` observability experiment (Task 2)
+    //
+    // Production stays a 1-parameter solve: `k2` is NEVER in the free vector.
+    // This experiment asks whether it *could* be: it synthesizes a known
+    // `(k1, k2)` and attempts a joint `(k1, k2)` recovery at a realistic
+    // feature spread, then measures the recovery error and the k1/k2 coupling.
+    // The recorded go/no-go decision (04.2-GO-NO-GO.md) is asserted here.
+    // -----------------------------------------------------------------------
+
+    /// Camera intrinsics with an explicit `(k1, k2)` pair; `k3/k4` stay fixed
+    /// and shared by synthesis and solve, so only the two radial terms vary.
+    fn camera_params_k2(k1: f64, k2: f64) -> CameraParams {
+        let mut p = camera_params(k1);
+        p.d[1] = k2;
+        p
+    }
+
+    /// Objective of a joint `(k1, k2)` solve at a fixed layout.
+    ///
+    /// Shared by the test-local joint cost and the finite-difference Hessian
+    /// used to measure the k1/k2 coupling.
+    fn joint_objective(
+        points: &[RawPixelMatch],
+        base: &CameraParams,
+        layout: &OptParams,
+        sigma: f64,
+        trim_fraction: f64,
+        k1: f64,
+        k2: f64,
+    ) -> f64 {
+        let mut params = base.clone();
+        params.d[0] = k1;
+        params.d[1] = k2;
+        let wh = (base.width, base.height);
+        let mut matched = Vec::with_capacity(points.len());
+        for raw in points {
+            match raw_to_matched_point(raw, &params, wh, wh) {
+                Some(mp) => matched.push(mp),
+                None => return OUT_OF_DOMAIN_COST,
+            }
+        }
+        if trim_fraction > 0.0 {
+            geometry::trimmed_seam_weighted_reprojection_error(
+                &matched,
+                layout,
+                sigma,
+                trim_fraction,
+            )
+        } else {
+            geometry::seam_weighted_reprojection_error(&matched, layout, sigma)
+        }
+    }
+
+    /// Test-local 2-parameter `(k1, k2)` cost — the joint solve the experiment
+    /// runs. Mirrors the production 1-D [`IntrinsicsCost`] with a second free
+    /// radial term; production never frees `k2`.
+    #[derive(Clone)]
+    struct JointK2Cost<'a> {
+        points: &'a [RawPixelMatch],
+        base: &'a CameraParams,
+        layout: OptParams,
+        sigma: f64,
+        trim_fraction: f64,
+        bounds: [(f64, f64); 2],
+    }
+
+    impl CostFunction for JointK2Cost<'_> {
+        type Param = Vec<f64>;
+        type Output = f64;
+
+        fn cost(&self, p: &Self::Param) -> Result<Self::Output, Error> {
+            let obj = joint_objective(
+                self.points,
+                self.base,
+                &self.layout,
+                self.sigma,
+                self.trim_fraction,
+                p[0],
+                p[1],
+            );
+            Ok(obj
+                + k1_bounds_penalty(p[0], self.bounds[0])
+                + k1_bounds_penalty(p[1], self.bounds[1]))
+        }
+    }
+
+    /// Jointly solve `(k1, k2)` from a deliberately wrong start `(0, 0)`,
+    /// bounded to `±k1_bound` around each starting value.
+    fn joint_solve_k2(
+        points: &[RawPixelMatch],
+        layout: &OptParams,
+        base: &CameraParams,
+        cfg: &IntrinsicsConfig,
+    ) -> (f64, f64) {
+        let range = cfg.k1_bound;
+        let bounds = [
+            (base.d[0] - range, base.d[0] + range),
+            (base.d[1] - range, base.d[1] + range),
+        ];
+        let cost = JointK2Cost {
+            points,
+            base,
+            layout: *layout,
+            sigma: cfg.sigma,
+            trim_fraction: cfg.trim_fraction,
+            bounds,
+        };
+        let start = [
+            base.d[0].clamp(bounds[0].0, bounds[0].1),
+            base.d[1].clamp(bounds[1].0, bounds[1].1),
+        ];
+        let p = SIMPLEX_PERTURBATION * (bounds[0].1 - bounds[0].0);
+        let simplex = vec![
+            vec![start[0], start[1]],
+            vec![(start[0] + p).min(bounds[0].1), start[1]],
+            vec![start[0], (start[1] + p).min(bounds[1].1)],
+        ];
+        let solver = NelderMead::new(simplex)
+            .with_sd_tolerance(1e-12)
+            .expect("joint simplex should construct");
+        let result = Executor::new(cost, solver)
+            .configure(|s| s.max_iters(cfg.max_iters as u64))
+            .run()
+            .expect("joint solve should run");
+        let best = result
+            .state()
+            .get_best_param()
+            .expect("joint solve should have a best");
+        (best[0], best[1])
+    }
+
+    /// Central-difference Hessian of the smooth (untrimmed) joint objective at
+    /// `(k1, k2)`. Its off-diagonal correlation and eigenvalue ratio are the
+    /// k1/k2 coupling evidence.
+    fn joint_hessian(
+        points: &[RawPixelMatch],
+        base: &CameraParams,
+        layout: &OptParams,
+        sigma: f64,
+        k1: f64,
+        k2: f64,
+    ) -> [[f64; 2]; 2] {
+        let h = 1e-4;
+        let f = |a: f64, b: f64| joint_objective(points, base, layout, sigma, 0.0, a, b);
+        let f00 = f(k1, k2);
+        let h11 = (f(k1 + h, k2) - 2.0 * f00 + f(k1 - h, k2)) / (h * h);
+        let h22 = (f(k1, k2 + h) - 2.0 * f00 + f(k1, k2 - h)) / (h * h);
+        let h12 = (f(k1 + h, k2 + h) - f(k1 + h, k2 - h) - f(k1 - h, k2 + h) + f(k1 - h, k2 - h))
+            / (4.0 * h * h);
+        [[h11, h12], [h12, h22]]
+    }
+
+    /// Absolute k1/k2 correlation `|rho|` and Hessian condition number from a
+    /// coupling matrix.
+    fn coupling(h: &[[f64; 2]; 2]) -> (f64, f64) {
+        let rho = (h[0][1] / (h[0][0].abs() * h[1][1].abs()).sqrt()).abs();
+        let trace = h[0][0] + h[1][1];
+        let det = h[0][0] * h[1][1] - h[0][1] * h[0][1];
+        let disc = (trace * trace - 4.0 * det).max(0.0).sqrt();
+        let cond = (trace + disc) / (trace - disc).max(1e-30);
+        (rho, cond)
+    }
+
+    /// Run the joint `(k1, k2)` experiment for one seed at a realistic feature
+    /// spread (the pipeline's 8% border margin) plus pixel noise. Returns
+    /// `(k1_err, k2_err, |rho|, condition)`.
+    fn k2_experiment(seed: u64, noise_px: f64) -> (f64, f64, f64, f64) {
+        let t = truth();
+        let (k1_true, k2_true) = (0.15, 0.02);
+        let synth = camera_params_k2(k1_true, k2_true);
+        let base = camera_params_k2(0.0, 0.0);
+        let layout = layout_from(&t);
+        let layout_params = OptParams::from_5param(&[
+            layout.x_ty,
+            layout.intersect,
+            layout.camera_axis_offset,
+            layout.x_rz,
+            layout.z_rx,
+        ]);
+
+        let plane_points = synthetic_points(&t, 196);
+        let mut raw = raw_from_plane_points(&plane_points, &synth);
+        assert!(raw.len() >= 24, "not enough in-frame observations");
+        add_noise(&mut raw, seed, noise_px);
+
+        let cfg = IntrinsicsConfig::default();
+        let (k1, k2) = joint_solve_k2(&raw, &layout_params, &base, &cfg);
+        let h = joint_hessian(&raw, &base, &layout_params, cfg.sigma, k1, k2);
+        let (rho, cond) = coupling(&h);
+        ((k1 - k1_true).abs(), (k2 - k2_true).abs(), rho, cond)
+    }
+
+    /// Joint `(k1, k2)` recovery under a small k3/k4 model mismatch between
+    /// synthesis and the (fixed) solve values. A well-determined parameter
+    /// survives; a near-degenerate one absorbs the mismatch and blows up.
+    /// Returns `(k2_err, k1_err)`.
+    fn k2_mismatch_experiment(seed: u64) -> (f64, f64) {
+        let t = truth();
+        let layout = layout_from(&t);
+        let layout_params = OptParams::from_5param(&[
+            layout.x_ty,
+            layout.intersect,
+            layout.camera_axis_offset,
+            layout.x_rz,
+            layout.z_rx,
+        ]);
+        let cfg = IntrinsicsConfig::default();
+        // Truth carries higher-order terms the solve fixes to different values.
+        let mut synth = camera_params_k2(0.15, 0.02);
+        synth.d[2] = 0.03;
+        synth.d[3] = 0.01;
+        let base = camera_params_k2(0.0, 0.0); // fixed k3=-0.01, k4=0.005
+
+        let mut raw = raw_from_plane_points(&synthetic_points(&t, 196), &synth);
+        add_noise(&mut raw, seed, 0.25);
+        let (k1, k2) = joint_solve_k2(&raw, &layout_params, &base, &cfg);
+        ((k2 - 0.02).abs(), (k1 - 0.15).abs())
+    }
+
+    /// The `k2` observability experiment (INTR-03 / ROADMAP criterion 5): a
+    /// joint `(k1, k2)` solve is attempted and its coupling is measured. The
+    /// recorded decision (04.2-GO-NO-GO.md) is **DEFER** — `k2` is not
+    /// independently observable on this rig — and this test asserts that
+    /// outcome, not a wish:
+    ///
+    /// 1. A self-consistent synthetic model lets a joint solve recover both,
+    ///    but the k1/k2 directions are near-perfectly collinear: `|rho| ≈
+    ///    0.9955` with a Hessian condition number `≈ 4.6e2` (variance
+    ///    inflation `1/(1-rho²) ≈ 110×`). The two parameters are not
+    ///    separately identifiable.
+    /// 2. Under a realistic k3/k4 model mismatch, the joint `k2` estimate
+    ///    absorbs the model error and is off by several times its own value —
+    ///    no useful signal-to-noise margin.
+    ///
+    /// Production therefore keeps `k2` OUT of [`IntrinsicsConfig`]'s free
+    /// vector; only `k1` is ever solved.
+    #[test]
+    fn k2_is_not_independently_observable() {
+        let n = 5u64;
+
+        // (1) Coupling on a self-consistent model.
+        let (mut k1_sum, mut rho_sum, mut cond_sum) = (0.0, 0.0, 0.0);
+        for seed in 1..=n {
+            let (k1e, _k2e, rho, cond) = k2_experiment(seed, 0.25);
+            k1_sum += k1e;
+            rho_sum += rho;
+            cond_sum += cond;
+        }
+        let mean_k1 = k1_sum / n as f64;
+        let mean_rho = rho_sum / n as f64;
+        let mean_cond = cond_sum / n as f64;
+        assert!(
+            mean_k1 < 0.02,
+            "the joint solve should still recover k1: k1err={mean_k1}"
+        );
+        assert!(
+            mean_rho > 0.95,
+            "k1/k2 must be near-collinear (degenerate): |rho|={mean_rho}"
+        );
+        assert!(
+            mean_cond > 100.0,
+            "the k1/k2 design must be ill-conditioned: cond={mean_cond}"
+        );
+
+        // (2) No useful margin under a realistic model mismatch.
+        let (mut k2_mis_sum, mut k1_mis_sum) = (0.0, 0.0);
+        for seed in 1..=n {
+            let (k2e, k1e) = k2_mismatch_experiment(seed);
+            k2_mis_sum += k2e;
+            k1_mis_sum += k1e;
+        }
+        let mean_k2_mis = k2_mis_sum / n as f64;
+        let mean_k1_mis = k1_mis_sum / n as f64;
+        assert!(
+            mean_k2_mis > 0.05,
+            "under model mismatch k2 must not be usefully recovered: k2err={mean_k2_mis}"
+        );
+        assert!(
+            mean_k1_mis < 0.06,
+            "the same data should still pin k1 to the same order: k1err={mean_k1_mis}"
+        );
+    }
 }
