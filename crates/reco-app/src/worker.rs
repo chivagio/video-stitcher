@@ -893,12 +893,13 @@ fn handle_command<B: EngineBackend>(
         WorkerCommand::SetChrome {
             panel_expanded,
             drawer_expanded,
+            active_screen,
         } => {
             backend.set_chrome(
                 crate::presenter::ChromeState {
                     panel_expanded,
                     drawer_expanded,
-                    ..crate::presenter::ChromeState::default()
+                    active_screen,
                 },
                 events,
             );
@@ -2207,6 +2208,14 @@ impl EngineBackend for GpuEngineBackend {
             return Ok(());
         }
 
+        // UI-SPEC Screen Router (E6): the native view is suspended on
+        // Import/Calibrate, so never render a frame into a hidden surface. The
+        // session/transport/pose are left untouched — a tick that resumes on
+        // Preview continues from here (the transport is not advanced).
+        if self.chrome.active_screen != crate::presenter::Screen::Preview {
+            return Ok(());
+        }
+
         // Pick up any webview readback channel attached since the last tick
         // (PREV-05) at a tick boundary, before a frame is produced.
         self.drain_readback_channels();
@@ -2517,6 +2526,13 @@ impl EngineBackend for GpuEngineBackend {
 
     fn set_chrome(&mut self, chrome: crate::presenter::ChromeState, events: &EventSink) {
         self.chrome = chrome;
+        // UI-SPEC Screen Router (E6): the native child view is live only on the
+        // Preview screen. Import/Calibrate are opaque webview screens, so the
+        // native view is suspended (X11 unmap) while either is active — no black
+        // or idle native surface may show through. Called here (a screen change
+        // boundary), never per tick; `set_visible` is idempotent (T-03-12).
+        self.presenter
+            .set_visible(chrome.active_screen == crate::presenter::Screen::Preview);
         self.reconfigure_viewport(events);
     }
 
@@ -3102,6 +3118,12 @@ mod tests {
         has_result: bool,
         /// The mock's shared calibration-cancel flag (CALB-02).
         calibration_cancel: Arc<AtomicBool>,
+        /// The mock's modelled native-view visibility (UI-SPEC Screen Router).
+        ///
+        /// Mirrors the real backend's `presenter.set_visible(screen == Preview)`
+        /// so a worker test can observe the screen-driven visibility without a
+        /// GPU. Shared because the backend is moved onto the worker thread.
+        screen_visible: Arc<std::sync::Mutex<Option<bool>>>,
     }
 
     impl MockBackend {
@@ -3133,6 +3155,7 @@ mod tests {
                 current_calibration: None,
                 has_result: false,
                 calibration_cancel: Arc::new(AtomicBool::new(false)),
+                screen_visible: Arc::new(std::sync::Mutex::new(None)),
             }
         }
 
@@ -3144,6 +3167,17 @@ mod tests {
             gesture: crate::presenter::pointer_input::PointerGesture,
         ) -> Self {
             self.pending_gesture = Some(gesture);
+            self
+        }
+
+        /// Share the modelled native-view visibility with the test, so the
+        /// screen-driven `set_visible` value is observable after the backend is
+        /// moved onto the worker thread.
+        fn with_screen_visible(
+            mut self,
+            visible: Arc<std::sync::Mutex<Option<bool>>>,
+        ) -> Self {
+            self.screen_visible = visible;
             self
         }
 
@@ -3541,8 +3575,11 @@ mod tests {
             events.presenter(self.active_kind, self.active_reason.clone());
         }
 
-        fn set_chrome(&mut self, _chrome: crate::presenter::ChromeState, _events: &EventSink) {
+        fn set_chrome(&mut self, chrome: crate::presenter::ChromeState, _events: &EventSink) {
             self.record("set_chrome");
+            // Mirror the real backend: the native view is live only on Preview.
+            *self.screen_visible.lock().unwrap() =
+                Some(chrome.active_screen == crate::presenter::Screen::Preview);
         }
 
         fn resize_viewport(&mut self, _width: u32, _height: u32, _events: &EventSink) {
@@ -5324,6 +5361,7 @@ mod tests {
             .send(WorkerCommand::SetChrome {
                 panel_expanded: true,
                 drawer_expanded: true,
+                active_screen: crate::presenter::Screen::Preview,
             })
             .unwrap();
         handle
@@ -5346,6 +5384,61 @@ mod tests {
             &*ops.lock().unwrap(),
             &["set_chrome", "resize_viewport", "shutdown"]
         );
+    }
+
+    #[test]
+    fn set_chrome_drives_native_visibility_from_the_active_screen() {
+        // UI-SPEC Screen Router (E6): the native child view is live only on
+        // Preview. Import/Calibrate suspend it. The mock mirrors the real
+        // backend's `presenter.set_visible(screen == Preview)` so the
+        // screen-driven contract is exercised without a GPU.
+        let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let visible = Arc::new(std::sync::Mutex::new(None));
+        let (worker, _events) = EngineWorker::spawn(
+            MockBackend::new(Arc::clone(&ops)).with_screen_visible(Arc::clone(&visible)),
+        );
+        let handle = worker.handle();
+
+        let wait_for = |target: Option<bool>| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while std::time::Instant::now() < deadline {
+                if *visible.lock().unwrap() == target {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            panic!("timed out waiting for screen visibility == {target:?}");
+        };
+
+        // Import: the native view is suspended.
+        handle
+            .send(WorkerCommand::SetChrome {
+                panel_expanded: false,
+                drawer_expanded: false,
+                active_screen: crate::presenter::Screen::Import,
+            })
+            .unwrap();
+        wait_for(Some(false));
+
+        // Preview: the native view is shown again.
+        handle
+            .send(WorkerCommand::SetChrome {
+                panel_expanded: false,
+                drawer_expanded: false,
+                active_screen: crate::presenter::Screen::Preview,
+            })
+            .unwrap();
+        wait_for(Some(true));
+
+        handle.send(WorkerCommand::Shutdown).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            if ops.lock().unwrap().contains(&"shutdown") {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        let _ = worker.join(Duration::from_secs(2));
     }
 
     #[test]

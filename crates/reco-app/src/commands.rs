@@ -172,23 +172,24 @@ pub async fn set_loop(
 
 /// Report the webview chrome's collapsible state (UI-SPEC Geometry authority).
 ///
-/// Thin: posts `SetChrome`; the worker recomputes the native viewport. Names no
-/// engine type.
+/// Thin: posts `SetChrome`; the worker recomputes the native viewport and the
+/// native view's visibility from the active screen (Import/Calibrate suspend
+/// it; Preview shows it). Names no engine type.
 ///
 /// # Why `rename_all = "snake_case"`
 ///
 /// Tauri resolves each command argument by a single payload key
 /// (`v.get(key)` in `tauri::ipc::command`), and `#[tauri::command]` defaults that
 /// key to **camelCase**. The frontend reports chrome state with snake_case keys
-/// (`{ panel_expanded, drawer_expanded }`) to match the rest of the typed
-/// protocol — `WorkerCommand::SetChrome`, `ViewMode`'s `serde(rename_all =
-/// "snake_case")`, `PresenterKind`, and every other payload in this crate. Left
-/// at the default, the command deserialization fails with `missing required key
-/// panelExpanded`, the worker's `set_chrome` never runs, and the native child
-/// window keeps its stale geometry: the controls panel expands in the webview
-/// while the panorama keeps painting over it. `void invoke(...)` in the frontend
-/// swallows the rejection, so the only symptom is a silently wrong viewport —
-/// see `crates/reco-app/FRICTION.md` A7.
+/// (`{ panel_expanded, drawer_expanded, active_screen }`) to match the rest of
+/// the typed protocol — `WorkerCommand::SetChrome`, `ViewMode`'s `serde(rename_all =
+/// "snake_case")`, `PresenterKind`, `Screen`, and every other payload in this
+/// crate. Left at the default, the command deserialization fails with `missing
+/// required key panelExpanded`, the worker's `set_chrome` never runs, and the
+/// native child window keeps its stale geometry: the controls panel expands in
+/// the webview while the panorama keeps painting over it. `void invoke(...)` in
+/// the frontend swallows the rejection, so the only symptom is a silently wrong
+/// viewport — see `crates/reco-app/FRICTION.md` A7.
 ///
 /// # Errors
 ///
@@ -198,10 +199,12 @@ pub async fn set_chrome(
     state: tauri::State<'_, WorkerHandle>,
     panel_expanded: bool,
     drawer_expanded: bool,
+    active_screen: crate::presenter::Screen,
 ) -> Result<(), WorkerError> {
     state.send(WorkerCommand::SetChrome {
         panel_expanded,
         drawer_expanded,
+        active_screen,
     })
 }
 
@@ -621,12 +624,18 @@ pub enum WorkerCommand {
     SetLoop(bool),
 
     /// Report the webview chrome's collapsible state so the worker recomputes
-    /// the native viewport (UI-SPEC Geometry authority).
+    /// the native viewport and the native view's visibility (UI-SPEC Geometry
+    /// authority / Screen Router).
     SetChrome {
         /// Whether the right controls panel is expanded.
         panel_expanded: bool,
         /// Whether the event-log drawer is expanded.
         drawer_expanded: bool,
+        /// Which top-level screen is active. Import/Calibrate suspend the native
+        /// child view; Preview shows it. Typed [`Screen`](crate::presenter::Screen)
+        /// — never a string; an unknown value is rejected at the IPC boundary
+        /// (T-03-11).
+        active_screen: crate::presenter::Screen,
     },
 
     /// Reconfigure the native viewport for a new window size (PREV-01/04).
@@ -840,6 +849,7 @@ mod tests {
             .send(WorkerCommand::SetChrome {
                 panel_expanded: true,
                 drawer_expanded: false,
+                active_screen: crate::presenter::Screen::Calibrate,
             })
             .unwrap();
         handle
@@ -866,7 +876,8 @@ mod tests {
             rx.recv().unwrap(),
             WorkerCommand::SetChrome {
                 panel_expanded: true,
-                drawer_expanded: false
+                drawer_expanded: false,
+                active_screen: crate::presenter::Screen::Calibrate
             }
         );
         assert_eq!(

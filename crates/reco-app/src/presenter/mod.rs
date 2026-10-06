@@ -787,9 +787,6 @@ pub trait SurfacePresenter {
     /// implementors that own a child window override it. Must be **idempotent**
     /// (a request matching the current state issues no platform request) and a
     /// **no-op after the window is released**.
-    // Wired by the worker's screen-driven `set_chrome` in plan 03-04 Task 2;
-    // the guard is removed there once the consumer exists.
-    #[allow(dead_code)]
     fn set_visible(&mut self, visible: bool) {
         let _ = visible;
     }

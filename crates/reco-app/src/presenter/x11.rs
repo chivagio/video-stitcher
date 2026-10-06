@@ -163,16 +163,13 @@ impl PointerState {
 /// after the window has been released is a no-op (there is no window to map).
 /// Extracted so this contract is unit-testable without a live X server, the
 /// same way [`PointerState`] isolates the event mapping.
-// Wired by the worker's screen-driven `set_chrome` in plan 03-04 Task 2; the
-// guard is removed there once the consumer exists.
-#[allow(dead_code)]
+// Wired by the worker's screen-driven `set_chrome`.
 #[derive(Debug, Default, Clone, Copy)]
 struct VisibilityState {
     /// The last requested visibility. `false` means unmapped.
     visible: bool,
 }
 
-#[allow(dead_code)]
 impl VisibilityState {
     /// Whether the child window is currently mapped.
     fn is_visible(&self) -> bool {
@@ -277,9 +274,6 @@ pub struct X11Presenter {
     ///
     /// See [`SurfacePresenter::set_visible`]. The child is mapped at
     /// construction, so this starts `true`.
-    // Wired by the worker's screen-driven `set_chrome` in plan 03-04 Task 2;
-    // the guard is removed there once the consumer exists.
-    #[allow(dead_code)]
     visibility: VisibilityState,
 }
 

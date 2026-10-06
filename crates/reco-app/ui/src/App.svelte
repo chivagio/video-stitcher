@@ -79,11 +79,14 @@
     };
   });
 
-  // Report chrome state changes to the worker.
+  // Report chrome state changes to the worker. The active screen is part of
+  // chrome state so Rust (the geometry/visibility authority) can suspend the
+  // native child view on Import/Calibrate and show it on Preview (D3-01/E6).
   $effect(() => {
     void invoke("set_chrome", {
       panel_expanded: panelExpanded,
       drawer_expanded: drawerExpanded,
+      active_screen: screen,
     });
   });
 
