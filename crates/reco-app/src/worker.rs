@@ -468,6 +468,24 @@ impl EventSink {
         let _ = self.tx.send(WorkerEvent::FieldRoiCleared);
     }
 
+    /// Emit a typed lens-refinement result (INTR-03).
+    ///
+    /// Mirrored to the process log at INFO on accept and WARN on reject (UI-SPEC
+    /// Event Log Contract); the structured view rides the typed channel so the
+    /// readout renders the engine's verdict verbatim and never re-types a value.
+    fn intrinsics_refined(&self, refinement: crate::events::IntrinsicsRefinementView) {
+        let line = WorkerEvent::IntrinsicsRefined {
+            refinement: refinement.clone(),
+        }
+        .to_log_line();
+        match line.level {
+            Level::Info => log::info!("{}", line.message),
+            Level::Warn => log::warn!("{}", line.message),
+            Level::Error => log::error!("{}", line.message),
+        }
+        let _ = self.tx.send(WorkerEvent::IntrinsicsRefined { refinement });
+    }
+
     /// Emit that the current result no longer matches the inputs (D3-08).
     fn result_invalidated(&self) {
         let _ = self.tx.send(WorkerEvent::ResultInvalidated);
@@ -1299,6 +1317,18 @@ pub trait EngineBackend: Send {
         events: &EventSink,
     ) -> Result<(), WorkerError>;
 
+    /// Refine the current profile's lens `k1` against the retained matches
+    /// (INTR-03).
+    ///
+    /// Opt-in only: derives raw-pixel observations from the retained verified
+    /// matches, runs the reduced `k1` refinement behind the held-out guard,
+    /// emits a typed `IntrinsicsRefined`, and writes the profile's `k1` onto
+    /// both cameras **only** when the result is accepted (T-04.2-10). A
+    /// rejected or ill-conditioned refinement leaves the profile unchanged. The
+    /// calibration wizard never calls this (T-04.2-11).
+    fn refine_lens(&mut self, heldout_fraction: f64, events: &EventSink)
+    -> Result<(), WorkerError>;
+
     /// Run calibration on the worker's own device (CALB-01 / FOUND-03).
     ///
     /// `interrupted` is the worker loop's shutdown flag; cancellation of a
@@ -1875,6 +1905,11 @@ fn handle_command<B: EngineBackend>(
         }
         WorkerCommand::SetFieldRoi { left, right } => {
             if let Err(e) = backend.set_field_roi(left, right, events) {
+                events.failed(e);
+            }
+        }
+        WorkerCommand::RefineLens { heldout_fraction } => {
+            if let Err(e) = backend.refine_lens(heldout_fraction, events) {
                 events.failed(e);
             }
         }
@@ -3316,6 +3351,98 @@ impl EngineBackend for GpuEngineBackend {
         } else {
             events.field_roi_applied(roi);
         }
+        Ok(())
+    }
+
+    fn refine_lens(
+        &mut self,
+        heldout_fraction: f64,
+        events: &EventSink,
+    ) -> Result<(), WorkerError> {
+        // A refinement needs a profile to write back into and a layout to solve
+        // at. Without a calibration there is nothing to refine; reject with a
+        // typed error rather than a silent no-op (INTR-03).
+        let (left_params, right_params, layout, baseline_k1) = {
+            let Some(cal) = self.current_calibration.as_ref() else {
+                return Err(WorkerError::InvalidInput {
+                    field: "refine_lens".to_string(),
+                    reason: "no calibration result — run or load a calibration first".to_string(),
+                });
+            };
+            (
+                cal.left.clone(),
+                cal.right.clone(),
+                cal.layout.clone(),
+                cal.left.d[0],
+            )
+        };
+
+        let (lw, lh) = (left_params.width.max(1), left_params.height.max(1));
+        let (rw, rh) = (right_params.width.max(1), right_params.height.max(1));
+
+        // Derive raw distorted-pixel observations from the retained post-RANSAC
+        // matches: plane coord -> undistorted pixel (`plane_to_pixel`, the same
+        // single left/right swap as `manual::seed_pins_from_verified`) -> raw
+        // pixel (`undistorted_to_distorted` under the current profile). This is
+        // non-circular: the undistort map is a bijection, so the round-trip
+        // returns the true sensor pixel regardless of the profile's current k1
+        // (research §2.2). `.right` is the LEFT camera's plane coord and `.left`
+        // the RIGHT's, per the optimizer's swap convention.
+        let raw: Vec<reco_calibrate::RawPixelMatch> = self
+            .verified_seed
+            .iter()
+            .map(|p| {
+                let left_und = reco_calibrate::geometry::plane_to_pixel(p.right, lw, lh);
+                let right_und = reco_calibrate::geometry::plane_to_pixel(p.left, rw, rh);
+                let (lx, ly) = reco_core::lens::undistorted_to_distorted(
+                    left_und[0],
+                    left_und[1],
+                    lw,
+                    lh,
+                    &left_params,
+                );
+                let (rx, ry) = reco_core::lens::undistorted_to_distorted(
+                    right_und[0],
+                    right_und[1],
+                    rw,
+                    rh,
+                    &right_params,
+                );
+                reco_calibrate::RawPixelMatch {
+                    left_px: [lx, ly],
+                    right_px: [rx, ry],
+                }
+            })
+            .collect();
+
+        // The engine uses the base params' frame dimensions for both cameras;
+        // a same-resolution rig (the supported case) makes this exact.
+        let config = reco_calibrate::IntrinsicsConfig {
+            heldout_fraction,
+            ..reco_calibrate::IntrinsicsConfig::default()
+        };
+
+        let refinement = reco_calibrate::refine_intrinsics(&raw, &layout, &left_params, &config)
+            .map_err(|e| WorkerError::Engine(e.to_string()))?;
+
+        let view = crate::calibration::project_intrinsics_refinement(&refinement, baseline_k1);
+
+        // Write the refined k1 onto the profile ONLY when the guard accepted it
+        // (T-04.2-10). A rejected or ill-conditioned result leaves `k1`
+        // unchanged on both the save path and the preview source, so the
+        // round-trip profile is always the safe one.
+        if refinement.accepted {
+            if let Some(cal) = self.current_calibration.as_mut() {
+                cal.left.d[0] = refinement.k1;
+                cal.right.d[0] = refinement.k1;
+            }
+            if let Some(cal) = self.calibration.as_mut() {
+                cal.left.d[0] = refinement.k1;
+                cal.right.d[0] = refinement.k1;
+            }
+        }
+
+        events.intrinsics_refined(view);
         Ok(())
     }
 
@@ -5818,6 +5945,11 @@ mod tests {
         /// Mirrors the real backend's coalescing flag so a burst of pin
         /// mutations collapses to one preview pair, not one per command.
         manual_preview_dirty: bool,
+        /// Whether the mock's `refine_lens` reports an accepted result (INTR-03).
+        ///
+        /// Defaults to true; a test sets it false to exercise the
+        /// rejected/no-write guard (T-04.2-10) without a GPU.
+        mock_refine_accepted: bool,
     }
 
     /// The mock's debounce window (MANU-03): short, so a worker test observes
@@ -5869,6 +6001,7 @@ mod tests {
                 manual_baseline_layout: super::default_plane_layout(),
                 manual_relens_pending: false,
                 manual_preview_dirty: false,
+                mock_refine_accepted: true,
             }
         }
 
@@ -6121,6 +6254,57 @@ mod tests {
             } else {
                 events.field_roi_applied(roi);
             }
+            Ok(())
+        }
+
+        fn refine_lens(
+            &mut self,
+            _heldout_fraction: f64,
+            events: &EventSink,
+        ) -> Result<(), WorkerError> {
+            self.record("refine_lens");
+            // Mirror the real backend's typed rejection exactly, so the protocol
+            // test exercises the same shape.
+            let Some(baseline) = self.current_calibration.as_ref().map(|c| c.left.d[0]) else {
+                return Err(WorkerError::InvalidInput {
+                    field: "refine_lens".to_string(),
+                    reason: "no calibration result — run or load a calibration first".to_string(),
+                });
+            };
+
+            // A deterministic typed result so the protocol test can assert the
+            // event crosses and the profile is written only on acceptance.
+            let view = if self.mock_refine_accepted {
+                let new_k1 = baseline + 0.01;
+                if let Some(cal) = self.current_calibration.as_mut() {
+                    cal.left.d[0] = new_k1;
+                    cal.right.d[0] = new_k1;
+                }
+                crate::events::IntrinsicsRefinementView {
+                    k1: new_k1,
+                    baseline_k1: baseline,
+                    accepted: true,
+                    reason: crate::calibration::refinement_reason_text(
+                        reco_calibrate::RefinementReason::Accepted,
+                    )
+                    .to_string(),
+                    heldout_baseline: Some(1.0),
+                    heldout_refined: Some(0.9),
+                }
+            } else {
+                crate::events::IntrinsicsRefinementView {
+                    k1: baseline,
+                    baseline_k1: baseline,
+                    accepted: false,
+                    reason: crate::calibration::refinement_reason_text(
+                        reco_calibrate::RefinementReason::GuardRejected,
+                    )
+                    .to_string(),
+                    heldout_baseline: Some(1.0),
+                    heldout_refined: Some(1.0),
+                }
+            };
+            events.intrinsics_refined(view);
             Ok(())
         }
 

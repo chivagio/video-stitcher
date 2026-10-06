@@ -24,6 +24,7 @@ import type {
   CalibrationOptions,
   CalibrationStage,
   DebugReport,
+  IntrinsicsRefinementView,
   Scorecard,
   StageStatus,
   WorkerEventTyped,
@@ -115,6 +116,15 @@ export function defaultOptions(): CalibrationOptions {
 }
 
 /**
+ * The held-out fraction the opt-in refinement sends (INTR-03).
+ *
+ * Matches the engine's `IntrinsicsConfig::heldout_fraction` default (~20%
+ * reserved as the held-out guard set). The worker clamps the split to at least
+ * one observation on each side, so a small match set is still guarded.
+ */
+export const DEFAULT_HELDOUT_FRACTION = 0.2;
+
+/**
  * The calibration rune store (class with `$state` fields, shared across
  * components).
  */
@@ -141,6 +151,17 @@ class CalibrationStore {
   diagnosis = $state<CalibrationDiagnosis | null>(null);
   /** The bounded debug inspector payload for the last completed run (CALB-08). */
   debug = $state<DebugReport | null>(null);
+  /**
+   * The last opt-in lens refinement result (INTR-03), or null until one runs.
+   *
+   * Mirrors the typed `IntrinsicsRefined` event verbatim; the readout renders it
+   * and never re-types a value.
+   */
+  intrinsicsRefinement = $state<IntrinsicsRefinementView | null>(null);
+  /** Whether a lens refinement is in flight (drives the `refining…` chip). */
+  refining = $state(false);
+  /** The typed failure text when a refinement command/engine call failed. */
+  refineError = $state<string | null>(null);
 
   /** Wall-clock time of the last heartbeat tick (for the "last update" line). */
   #lastHeartbeatAt: number | null = null;
@@ -217,6 +238,15 @@ class CalibrationStore {
         this.debug = event.data.report;
         break;
       }
+      case "intrinsics_refined": {
+        // INTR-03: the worker is authoritative for the refinement verdict. The
+        // store mirrors the typed view and clears the in-flight chip; it never
+        // derives a value or a reason.
+        this.intrinsicsRefinement = event.data.refinement;
+        this.refining = false;
+        this.refineError = null;
+        break;
+      }
       case "log": {
         // A cancelled run is signalled by a WARN log line; there is no result.
         // Return to ready and discard any partial result (CALB-02).
@@ -240,6 +270,11 @@ class CalibrationStore {
           this.error = formatWorkerError(event.data);
           this.status = "failed";
           this.#stopClock();
+        } else if (this.refining) {
+          // A failed opt-in refinement keeps the last readout and surfaces the
+          // typed error; it never disturbs the calibration result.
+          this.refineError = formatWorkerError(event.data);
+          this.refining = false;
         }
         break;
       }
@@ -281,6 +316,28 @@ class CalibrationStore {
     }
   }
 
+  /**
+   * Run the opt-in lens `k1` refinement (INTR-03).
+   *
+   * Explicit only — never triggered by the wizard (T-04.2-11). The worker is
+   * authoritative: this posts the typed command and the store mirrors the
+   * `IntrinsicsRefined` event; a rejected result leaves the profile unchanged.
+   */
+  async refineLens(): Promise<void> {
+    if (this.status !== "done" || this.refining) return;
+    this.refining = true;
+    this.refineError = null;
+    try {
+      await invoke("refine_lens", {
+        heldout_fraction: DEFAULT_HELDOUT_FRACTION,
+      });
+    } catch (e) {
+      // The command boundary rejected the request; surface the typed text.
+      this.refineError = formatWorkerError(e);
+      this.refining = false;
+    }
+  }
+
   /** Discard the run state and return to the ready screen. */
   reset(): void {
     this.#clearRun();
@@ -300,6 +357,9 @@ class CalibrationStore {
     this.error = null;
     this.diagnosis = null;
     this.debug = null;
+    this.intrinsicsRefinement = null;
+    this.refining = false;
+    this.refineError = null;
     this.#lastHeartbeatAt = null;
   }
 

@@ -612,6 +612,35 @@ impl CameraParamsView {
     }
 }
 
+/// The typed result of an opt-in `k1` lens refinement as it crosses to the
+/// webview (INTR-03).
+///
+/// Every field is a real engine value. `k1`/`baseline_k1` are the refined and
+/// pre-refinement first radial coefficients (so the readout can render
+/// `old → new`); `accepted` is the held-out guard verdict; and `reason` is the
+/// engine-authored, user-facing explanation. The held-out residuals are `None`
+/// when the conditioning gate refused *before* any held-out evaluation — never
+/// a fabricated `0.0` (UI-SPEC Readout & Guard Contract). The webview renders
+/// this verbatim and never re-types a value (T-04.2-12).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct IntrinsicsRefinementView {
+    /// The refined first radial distortion coefficient (`k1`).
+    ///
+    /// Equals `baseline_k1` whenever the refinement was rejected, so an
+    /// unconditional render never shows a fabricated new value.
+    pub k1: f64,
+    /// The profile's `k1` before the refinement (the `old` side of `old → new`).
+    pub baseline_k1: f64,
+    /// Whether the refinement passed the held-out guard and may be applied.
+    pub accepted: bool,
+    /// The engine-authored, user-facing reason — rendered verbatim.
+    pub reason: String,
+    /// Held-out residual at the baseline `k1`, or `None` when not evaluated.
+    pub heldout_baseline: Option<f64>,
+    /// Held-out residual at the refined `k1`, or `None` when not evaluated.
+    pub heldout_refined: Option<f64>,
+}
+
 /// One correspondence pin as it crosses to the webview (MANU-03).
 ///
 /// `left_px`/`right_px` are natural-order pixel coordinates (the operator's
@@ -1035,6 +1064,19 @@ pub enum WorkerEvent {
         path: String,
     },
 
+    /// An opt-in lens `k1` refinement completed (INTR-03).
+    ///
+    /// Carries the typed [`IntrinsicsRefinementView`] so the Calibrate result
+    /// surface renders the engine's verdict verbatim — the refined `k1`,
+    /// whether it was accepted, the reason, and the held-out residual delta.
+    /// The profile's `k1` is written only when `refinement.accepted` is true;
+    /// a rejected or ill-conditioned refinement leaves it unchanged. Projected
+    /// to an INFO [`LogLine`] on accept and a WARN one on reject.
+    IntrinsicsRefined {
+        /// The typed refinement result.
+        refinement: IntrinsicsRefinementView,
+    },
+
     /// The current result no longer matches the inputs or profile (D3-08).
     ///
     /// Emitted when an input or lens override changes after a run/load, so the
@@ -1411,6 +1453,34 @@ impl WorkerEvent {
                 level: Level::Info,
                 message: format!("manual calibration saved: {path}"),
             },
+            // A lens refinement is INFO on accept and WARN on reject (UI-SPEC
+            // Event Log Contract). The engine-authored reason rides the message
+            // so a log reader sees exactly what the readout shows.
+            WorkerEvent::IntrinsicsRefined { refinement } => {
+                if refinement.accepted {
+                    LogLine {
+                        level: Level::Info,
+                        message: match (refinement.heldout_baseline, refinement.heldout_refined) {
+                            (Some(baseline), Some(refined)) => format!(
+                                "Lens k1 refined: {:.4} → {:.4} (held-out {baseline:.6} → {refined:.6})",
+                                refinement.baseline_k1, refinement.k1
+                            ),
+                            _ => format!(
+                                "Lens k1 refined: {:.4} → {:.4}",
+                                refinement.baseline_k1, refinement.k1
+                            ),
+                        },
+                    }
+                } else {
+                    LogLine {
+                        level: Level::Warn,
+                        message: format!(
+                            "Lens k1 refinement rejected: {} — lens unchanged",
+                            refinement.reason
+                        ),
+                    }
+                }
+            }
             WorkerEvent::ResultInvalidated => LogLine {
                 level: Level::Warn,
                 message: "result invalidated — inputs changed; re-run calibration".to_string(),

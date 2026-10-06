@@ -589,6 +589,51 @@ pub async fn set_field_roi(
     state.send(WorkerCommand::SetFieldRoi { left, right })
 }
 
+/// Refine the current profile's lens `k1` against the retained matches (INTR-03).
+///
+/// Thin, same contract as [`set_field_roi`]: validate the held-out fraction at
+/// the boundary, post a typed `WorkerCommand::RefineLens`, and return. The
+/// worker derives raw-pixel observations from the retained verified matches,
+/// runs the reduced `k1` refinement behind the held-out guard, emits a typed
+/// `IntrinsicsRefined`, and writes the profile's `k1` **only** when the result
+/// is accepted. The refinement is opt-in — this command is the only trigger and
+/// it is never called from the calibration wizard. Names no engine type.
+///
+/// # Why `rename_all = "snake_case"`
+///
+/// `heldout_fraction` is pinned to the crate's snake_case IPC protocol so a
+/// future argument rename cannot reintroduce the silent-never-fires bug
+/// recorded in `crates/reco-app/FRICTION.md` A7.
+///
+/// # Errors
+///
+/// Returns [`WorkerError::InvalidInput`] for a non-finite or out-of-range
+/// fraction, or [`WorkerError::ChannelClosed`] if the worker has already exited.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn refine_lens(
+    state: tauri::State<'_, WorkerHandle>,
+    heldout_fraction: f64,
+) -> Result<(), WorkerError> {
+    validate_heldout_fraction(heldout_fraction)?;
+    state.send(WorkerCommand::RefineLens { heldout_fraction })
+}
+
+/// Validate the held-out fraction at the command boundary (INTR-03).
+///
+/// The fraction must be finite and strictly inside `(0, 1)`: `0` would leave no
+/// guard set and `1` no fit set, so either would defeat the held-out guard.
+/// Extracted as a pure function so the boundary check is unit-testable without a
+/// Tauri `State`.
+fn validate_heldout_fraction(fraction: f64) -> Result<(), WorkerError> {
+    if !fraction.is_finite() || fraction <= 0.0 || fraction >= 1.0 {
+        return Err(WorkerError::InvalidInput {
+            field: "heldout_fraction".to_string(),
+            reason: "must be a finite fraction strictly between 0 and 1".to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// Open a manual calibration session at `frame` (MANU-01 / MANU-03).
 ///
 /// Thin, same contract as [`set_field_roi`]: post a typed
@@ -1182,6 +1227,23 @@ pub enum WorkerCommand {
         left: Vec<[f64; 2]>,
         /// Right-camera polygon vertices, normalized `[0,1]`.
         right: Vec<[f64; 2]>,
+    },
+
+    /// Refine the current profile's lens `k1` against the retained matches
+    /// (INTR-03).
+    ///
+    /// An opt-in diagnostic: the worker derives raw-pixel observations from the
+    /// retained verified matches, runs the reduced `k1` refinement behind the
+    /// held-out guard, emits a typed `IntrinsicsRefined`, and writes the
+    /// profile's `k1` onto both cameras **only** when the result is accepted
+    /// (T-04.2-10). It is never invoked by the calibration wizard (T-04.2-11).
+    RefineLens {
+        /// Fraction of observations reserved as the held-out guard set.
+        ///
+        /// Validated to be finite and strictly inside `(0, 1)` at the command
+        /// boundary; the engine clamps the split to at least one observation on
+        /// each side.
+        heldout_fraction: f64,
     },
 
     /// Open a manual calibration session at `frame` (MANU-01 / MANU-03).
@@ -1798,6 +1860,41 @@ mod tests {
                 right: vec![]
             }
         );
+    }
+
+    #[test]
+    fn refine_lens_command_round_trips_through_the_channel() {
+        // INTR-03: the opt-in refinement crosses as a typed command with its
+        // held-out fraction, never a string.
+        let (tx, rx) = mpsc::channel();
+        let handle = WorkerHandle::new(tx);
+        handle
+            .send(WorkerCommand::RefineLens {
+                heldout_fraction: 0.2,
+            })
+            .unwrap();
+        assert_eq!(
+            rx.recv().unwrap(),
+            WorkerCommand::RefineLens {
+                heldout_fraction: 0.2
+            }
+        );
+    }
+
+    #[test]
+    fn validate_heldout_fraction_rejects_out_of_range_and_non_finite() {
+        // INTR-03: a fraction outside (0, 1) or non-finite would defeat the
+        // held-out guard, so the boundary rejects it before it reaches the worker.
+        assert!(validate_heldout_fraction(0.2).is_ok());
+        for bad in [0.0, 1.0, -0.1, 1.5, f64::NAN, f64::INFINITY] {
+            assert!(
+                matches!(
+                    validate_heldout_fraction(bad),
+                    Err(WorkerError::InvalidInput { .. })
+                ),
+                "expected {bad} to be rejected"
+            );
+        }
     }
 
     #[test]

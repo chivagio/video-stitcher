@@ -95,6 +95,30 @@ export interface CameraParamsView {
 }
 
 /**
+ * The typed result of an opt-in `k1` lens refinement (mirror
+ * `events::IntrinsicsRefinementView`, INTR-03).
+ *
+ * Every field is a real engine value. The held-out residuals are `null` when
+ * the conditioning gate refused before any held-out evaluation — never a
+ * fabricated `0` (UI-SPEC Readout & Guard Contract). The readout renders this
+ * verbatim and never re-types a value.
+ */
+export interface IntrinsicsRefinementView {
+  /** The refined first radial distortion coefficient (`k1`). */
+  k1: number;
+  /** The profile's `k1` before the refinement (the `old` side of `old → new`). */
+  baseline_k1: number;
+  /** Whether the refinement passed the held-out guard and may be applied. */
+  accepted: boolean;
+  /** The engine-authored, user-facing reason — rendered verbatim. */
+  reason: string;
+  /** Held-out residual at the baseline `k1`, or `null` when not evaluated. */
+  heldout_baseline: number | null;
+  /** Held-out residual at the refined `k1`, or `null` when not evaluated. */
+  heldout_refined: number | null;
+}
+
+/**
  * The advisory validation verdict for one manual validation frame (mirror
  * `events::ValidationVerdict`, MANU-07). Advisory only — never a hard gate.
  */
@@ -413,6 +437,7 @@ export type WorkerEventTyped =
       };
     }
   | { kind: "manual_saved"; data: { path: string } }
+  | { kind: "intrinsics_refined"; data: { refinement: IntrinsicsRefinementView } }
   | { kind: "result_invalidated"; data: null }
   | { kind: "log"; data: LogLine }
   | { kind: "failed"; data: unknown };

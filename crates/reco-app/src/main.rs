@@ -87,6 +87,7 @@ fn main() -> anyhow::Result<()> {
             commands::load_profile,
             commands::save_profile,
             commands::set_field_roi,
+            commands::refine_lens,
             commands::manual_begin,
             commands::manual_set_frame,
             commands::manual_exit,

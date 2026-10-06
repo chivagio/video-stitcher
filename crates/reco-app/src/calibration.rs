@@ -11,6 +11,7 @@
 
 use reco_calibrate::error::CalibrateError;
 use reco_calibrate::geometry::{OptParams, per_point_reprojection_error};
+use reco_calibrate::intrinsics::{IntrinsicsRefinement, RefinementReason};
 use reco_calibrate::types::{
     CalibrationConfig, CalibrationResult, CalibrationStep, FrameMatches, LensProfileInfo,
     MatchedPoint, ProfileSource, SyncMethod as EngineSyncMethod,
@@ -19,9 +20,9 @@ use reco_core::calibration::{CameraParams, MatchCalibration, PlaneLayout};
 
 use crate::events::{
     CalibrationDiagnosis, CalibrationOptions, CalibrationStage, ConfidenceBand, DebugPoint,
-    DebugReport, DiagnosisMetrics, FrameMatchRow, InputMetadata, LensProfileView, ReadinessCode,
-    ReadinessFinding, ReadinessReport, ReadinessSeverity, SYNC_OFFSET_SEMANTICS, Scorecard,
-    SyncMethod, SyncProvenance, SyncView, ValidationVerdict,
+    DebugReport, DiagnosisMetrics, FrameMatchRow, InputMetadata, IntrinsicsRefinementView,
+    LensProfileView, ReadinessCode, ReadinessFinding, ReadinessReport, ReadinessSeverity,
+    SYNC_OFFSET_SEMANTICS, Scorecard, SyncMethod, SyncProvenance, SyncView, ValidationVerdict,
 };
 
 /// Sampled statistics feeding the readiness estimate (CALB-05).
@@ -373,6 +374,63 @@ pub fn project_scorecard(result: &CalibrationResult) -> Scorecard {
                 offset_semantics: SYNC_OFFSET_SEMANTICS.to_string(),
             }
         },
+    }
+}
+
+/// The user-facing text for a refinement reason (INTR-03).
+///
+/// Authored **once** in Rust — exactly as the CALB-04 diagnosis `cause` is — so
+/// the webview renders the engine's verdict verbatim and never re-types a cause
+/// (T-04.2-12). The rejection wording matches the UI-SPEC Copywriting Contract.
+#[must_use]
+pub fn refinement_reason_text(reason: RefinementReason) -> &'static str {
+    match reason {
+        RefinementReason::Accepted => "Refinement accepted.",
+        RefinementReason::GuardRejected => {
+            "Refinement rejected — it did not improve the held-out fit. Lens unchanged."
+        }
+        RefinementReason::NotEnoughSpread => {
+            "Not enough spread to refine the lens — matches are too centre-weighted. Lens unchanged."
+        }
+        RefinementReason::InsufficientMatches => {
+            "Not enough matches to refine the lens. Lens unchanged."
+        }
+        RefinementReason::IllConditioned => {
+            "Lens refinement is ill-conditioned on this data. Lens unchanged."
+        }
+    }
+}
+
+/// Project an engine [`IntrinsicsRefinement`] into the typed webview view
+/// (INTR-03).
+///
+/// Pure (no device/file/channel): the worker passes the engine result plus the
+/// profile's pre-refinement `k1` and this returns exactly what the readout
+/// renders. The held-out residuals are `None` when the conditioning gate
+/// refused before any held-out evaluation (an `InsufficientMatches` /
+/// `NotEnoughSpread` / `IllConditioned` reason), so a refusal never renders a
+/// fabricated `0.0` (UI-SPEC Readout & Guard Contract). `k1` is passed through
+/// verbatim: on any rejection the engine returns the baseline `k1`, so the
+/// readout always shows the value the profile actually holds.
+#[must_use]
+pub fn project_intrinsics_refinement(
+    refinement: &IntrinsicsRefinement,
+    baseline_k1: f64,
+) -> IntrinsicsRefinementView {
+    // Only an accepted or guard-rejected result has evaluated the held-out
+    // split; a conditioning refusal returns before the split is built.
+    let evaluated = matches!(
+        refinement.reason,
+        RefinementReason::Accepted | RefinementReason::GuardRejected
+    );
+
+    IntrinsicsRefinementView {
+        k1: refinement.k1,
+        baseline_k1,
+        accepted: refinement.accepted,
+        reason: refinement_reason_text(refinement.reason).to_string(),
+        heldout_baseline: evaluated.then_some(refinement.heldout_baseline),
+        heldout_refined: evaluated.then_some(refinement.heldout_refined),
     }
 }
 
