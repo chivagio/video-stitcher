@@ -329,6 +329,44 @@ impl EventSink {
     fn result_invalidated(&self) {
         let _ = self.tx.send(WorkerEvent::ResultInvalidated);
     }
+
+    /// Emit that a manual calibration session opened (MANU-01 / MANU-03).
+    ///
+    /// Mirrored to the process log at INFO; the structured payload rides the
+    /// typed channel.
+    fn manual_session_started(&self, frame: u64, fps: f64, frames_total: u64) {
+        log::info!("manual session started: frame {frame}/{frames_total} @ {fps:.3} fps");
+        let _ = self.tx.send(WorkerEvent::ManualSessionStarted {
+            frame,
+            fps,
+            frames_total,
+        });
+    }
+
+    /// Emit one camera's reference frame rendered under real `CameraParams`
+    /// (MANU-03).
+    ///
+    /// The RGBA bytes ride the typed channel only — the process log carries the
+    /// geometry summary, never the payload.
+    fn manual_preview_frame(
+        &self,
+        side: crate::events::ManualSide,
+        rgba: Vec<u8>,
+        width: u32,
+        height: u32,
+    ) {
+        let _ = self.tx.send(WorkerEvent::ManualPreviewFrame {
+            side,
+            rgba,
+            width,
+            height,
+        });
+    }
+
+    /// Emit the manual solve's busy/stale state (MANU-03).
+    fn manual_solve_state(&self, busy: bool, stale: bool) {
+        let _ = self.tx.send(WorkerEvent::ManualSolveState { busy, stale });
+    }
 }
 
 /// The array index for a camera role (`Left` = 0, `Right` = 1).
@@ -355,6 +393,41 @@ fn normalize_field_roi(
     reco_core::calibration::FieldRoi {
         left: clean(left),
         right: clean(right),
+    }
+}
+
+/// Extract one reference frame's YUV planes from a clip (MANU-03).
+///
+/// Mirrors the `worker.rs` frame-extraction seam (`extract_frames(path, &[i])`)
+/// and fails with a typed [`WorkerError::Engine`] when the decoder returns no
+/// frame for the index, rather than silently previewing nothing.
+fn extract_manual_frame(
+    path: &str,
+    frame: u64,
+) -> Result<reco_core::source::YuvFrame, WorkerError> {
+    let frames =
+        reco_io::ffmpeg::calibration_io::extract_frames(std::path::Path::new(path), &[frame])
+            .map_err(|e| WorkerError::Engine(e.to_string()))?;
+    frames.into_iter().next().ok_or_else(|| {
+        WorkerError::Engine(format!("frame {frame} could not be extracted from {path}"))
+    })
+}
+
+/// A neutral pinhole `CameraParams` for a frame of the given size (MANU-03).
+///
+/// Only reached when neither a loaded profile nor a lens override is available.
+/// It is still a **real** `CameraParams` (identity distortion, principal point
+/// at the frame centre) so the preview remains a GPU undistort under real
+/// parameters, never an arbitrary 2-D warp.
+fn default_camera_params(width: u32, height: u32) -> reco_core::calibration::CameraParams {
+    reco_core::calibration::CameraParams {
+        width,
+        height,
+        fx: width as f64,
+        fy: width as f64,
+        cx: width as f64 / 2.0,
+        cy: height as f64 / 2.0,
+        d: [0.0; 4],
     }
 }
 
@@ -846,6 +919,23 @@ pub trait EngineBackend: Send {
     /// Save the current calibration profile to a local file (IMPT-06).
     fn save_profile(&mut self, path: String, events: &EventSink) -> Result<(), WorkerError>;
 
+    /// Open a manual calibration session at `frame` (MANU-01 / MANU-03).
+    ///
+    /// Extracts the reference frame for both clips, retains the YUV planes for
+    /// the session's duration, seeds the per-camera `CameraParams`, and emits a
+    /// typed `ManualSessionStarted` plus one `ManualPreviewFrame` per camera
+    /// rendered by the GPU undistort under the real parameters. The index is
+    /// clamped against the probed frame count (T-04.1-01).
+    fn manual_begin(&mut self, frame: u64, events: &EventSink) -> Result<(), WorkerError>;
+
+    /// Change the manual session's reference frame (MANU-03).
+    ///
+    /// Clamps the index, re-extracts only when it changed, and re-renders.
+    fn manual_set_frame(&mut self, frame: u64, events: &EventSink) -> Result<(), WorkerError>;
+
+    /// Close the manual session, dropping the retained planes (MANU-01).
+    fn manual_exit(&mut self, events: &EventSink) -> Result<(), WorkerError>;
+
     /// Begin a preview **session**: build/ensure the renderer, paint the idle
     /// frame, and start the transport, but do NOT run a frame loop.
     ///
@@ -1254,6 +1344,21 @@ fn handle_command<B: EngineBackend>(
                 events.failed(e);
             }
         }
+        WorkerCommand::ManualBegin { frame } => {
+            if let Err(e) = backend.manual_begin(frame, events) {
+                events.failed(e);
+            }
+        }
+        WorkerCommand::ManualSetFrame { frame } => {
+            if let Err(e) = backend.manual_set_frame(frame, events) {
+                events.failed(e);
+            }
+        }
+        WorkerCommand::ManualExit => {
+            if let Err(e) = backend.manual_exit(events) {
+                events.failed(e);
+            }
+        }
         WorkerCommand::Export => {
             interrupted.store(false, Ordering::SeqCst);
             match backend.export(events, interrupted) {
@@ -1502,6 +1607,29 @@ fn join_with_timeout(handle: JoinHandle<()>, timeout: Duration) -> Result<(), Wo
 // Real engine backend (owns the GPU device, renderer, and pose)
 // ---------------------------------------------------------------------------
 
+/// The retained reference-frame state for an open manual calibration session
+/// (MANU-03 / T-04.1-02).
+///
+/// Exactly **one** reference frame pair is retained for the session's
+/// duration; it is dropped on `ManualExit`, so a session never accumulates
+/// planes. The per-camera `CameraParams` seed every preview render, so the
+/// feedback is always produced by the real GPU undistort — never an arbitrary
+/// 2-D warp (UI-SPEC Real-parameters constraint).
+struct ManualSession {
+    /// The current reference frame index (0-based).
+    frame: u64,
+    /// Total frames in the reference clip.
+    frames_total: u64,
+    /// The retained left reference frame's YUV planes.
+    left_frame: reco_core::source::YuvFrame,
+    /// The retained right reference frame's YUV planes.
+    right_frame: reco_core::source::YuvFrame,
+    /// Left camera intrinsics used for the preview.
+    left_params: reco_core::calibration::CameraParams,
+    /// Right camera intrinsics used for the preview.
+    right_params: reco_core::calibration::CameraParams,
+}
+
 /// The engine objects exclusively owned by the worker thread (FOUND-03).
 ///
 /// Field order is the drop order and is load-bearing (see the module header):
@@ -1573,6 +1701,11 @@ pub struct GpuEngineBackend {
     has_result: bool,
     /// The loaded calibration, if `Import` has run.
     calibration: Option<reco_core::calibration::MatchCalibration>,
+    /// The open manual calibration session, if one is active (MANU-03).
+    ///
+    /// Retains exactly one reference-frame YUV pair for the session's duration
+    /// (T-04.1-02); `None` when no manual session is open.
+    manual: Option<ManualSession>,
     /// The open decode source, if `Import` has run.
     ///
     /// Drops **first** (declaration order): the CLI documents that the decode
@@ -1753,6 +1886,7 @@ impl GpuEngineBackend {
             current_calibration: None,
             has_result: false,
             calibration: None,
+            manual: None,
             source: None,
             input_size: None,
             presenter,
@@ -2539,6 +2673,75 @@ impl EngineBackend for GpuEngineBackend {
             .to_file(std::path::Path::new(&path))
             .map_err(|e| WorkerError::ProfileSave(e.to_string()))?;
         events.profile_saved(path);
+        Ok(())
+    }
+
+    fn manual_begin(&mut self, frame: u64, events: &EventSink) -> Result<(), WorkerError> {
+        // The manual flow is always reachable and never requires a `.json`; it
+        // uses the operator's selected clips when both are set, else the
+        // startup hardcoded clips (MANU-01).
+        let (left_path, right_path) = self.manual_frame_paths()?;
+        let probe = reco_io::ffmpeg::calibration_io::probe_video(std::path::Path::new(&left_path))
+            .map_err(|e| WorkerError::Engine(e.to_string()))?;
+        let frames_total = probe.total_frames.max(1);
+        // T-04.1-01: clamp the operator-supplied index against the probed frame
+        // count BEFORE extraction, so an out-of-range index cannot reach the
+        // decoder.
+        let frame = frame.min(frames_total.saturating_sub(1));
+        let left_frame = extract_manual_frame(&left_path, frame)?;
+        let right_frame = extract_manual_frame(&right_path, frame)?;
+        let (left_params, right_params) = self.manual_params(&left_frame, &right_frame);
+        self.manual = Some(ManualSession {
+            frame,
+            frames_total,
+            left_frame,
+            right_frame,
+            left_params,
+            right_params,
+        });
+        events.manual_session_started(frame, probe.fps, frames_total);
+        self.render_manual_preview(events)?;
+        Ok(())
+    }
+
+    fn manual_set_frame(&mut self, frame: u64, events: &EventSink) -> Result<(), WorkerError> {
+        if self.manual.is_none() {
+            return Err(WorkerError::InvalidInput {
+                field: "frame".to_string(),
+                reason: "no manual session is open — begin one first".to_string(),
+            });
+        }
+        let frames_total = self
+            .manual
+            .as_ref()
+            .map(|session| session.frames_total)
+            .unwrap_or(1);
+        let frame = frame.min(frames_total.saturating_sub(1));
+        let changed = self
+            .manual
+            .as_ref()
+            .is_some_and(|session| session.frame != frame);
+        if changed {
+            let (left_path, right_path) = self.manual_frame_paths()?;
+            let left_frame = extract_manual_frame(&left_path, frame)?;
+            let right_frame = extract_manual_frame(&right_path, frame)?;
+            if let Some(session) = self.manual.as_mut() {
+                session.frame = frame;
+                session.left_frame = left_frame;
+                session.right_frame = right_frame;
+            }
+        }
+        self.render_manual_preview(events)?;
+        Ok(())
+    }
+
+    fn manual_exit(&mut self, events: &EventSink) -> Result<(), WorkerError> {
+        // T-04.1-02: drop the retained planes; a session never accumulates.
+        // Exiting does not touch `current_calibration`, so an existing profile
+        // survives leaving the flow (UI-SPEC "never a dead end").
+        self.manual = None;
+        events.info("manual calibration session ended");
+        events.manual_solve_state(false, false);
         Ok(())
     }
 
@@ -3388,6 +3591,93 @@ impl GpuEngineBackend {
             self.renderer_input = None;
         }
     }
+
+    /// The left/right clip paths a manual session extracts from (MANU-01).
+    ///
+    /// Prefers the operator-selected inputs; falls back to the startup
+    /// hardcoded clips per role. This is why the flow is always reachable — it
+    /// never requires an imported profile or an explicit file selection.
+    fn manual_frame_paths(&self) -> Result<(String, String), WorkerError> {
+        use crate::events::InputRole;
+        let left = self.input_paths.get(&InputRole::Left).cloned();
+        let right = self.input_paths.get(&InputRole::Right).cloned();
+        if let (Some(l), Some(r)) = (left.clone(), right.clone()) {
+            return Ok((l, r));
+        }
+        let paths =
+            crate::hardcoded::media_paths().map_err(|e| WorkerError::Engine(e.to_string()))?;
+        Ok((
+            left.unwrap_or_else(|| paths.left.display().to_string()),
+            right.unwrap_or_else(|| paths.right.display().to_string()),
+        ))
+    }
+
+    /// Seed the manual preview's per-camera `CameraParams` (MANU-03).
+    ///
+    /// Prefers the loaded/current profile's intrinsics, then a lens override,
+    /// then a neutral pinhole for the frame size. Every branch yields a real
+    /// `CameraParams`, so the preview is always a GPU undistort under real
+    /// parameters.
+    fn manual_params(
+        &self,
+        left_frame: &reco_core::source::YuvFrame,
+        right_frame: &reco_core::source::YuvFrame,
+    ) -> (
+        reco_core::calibration::CameraParams,
+        reco_core::calibration::CameraParams,
+    ) {
+        if let Some(cal) = self
+            .current_calibration
+            .as_ref()
+            .or(self.calibration.as_ref())
+        {
+            return (cal.left.clone(), cal.right.clone());
+        }
+        let left = self.lens_overrides[0]
+            .clone()
+            .unwrap_or_else(|| default_camera_params(left_frame.width, left_frame.height));
+        let right = self.lens_overrides[1]
+            .clone()
+            .unwrap_or_else(|| default_camera_params(right_frame.width, right_frame.height));
+        (left, right)
+    }
+
+    /// Render both sides of the retained reference frame under real
+    /// `CameraParams` and emit one typed `ManualPreviewFrame` per camera
+    /// (MANU-03).
+    ///
+    /// The worker is the single GPU owner: the readback RGBA is what crosses to
+    /// the webview; no GPU handle ever does (T-04.1-04).
+    fn render_manual_preview(&self, events: &EventSink) -> Result<(), WorkerError> {
+        let Some(session) = self.manual.as_ref() else {
+            return Ok(());
+        };
+        let gpu = &self.gpu;
+        for (side, frame, params) in [
+            (
+                crate::events::ManualSide::Left,
+                &session.left_frame,
+                &session.left_params,
+            ),
+            (
+                crate::events::ManualSide::Right,
+                &session.right_frame,
+                &session.right_params,
+            ),
+        ] {
+            let (w, h) = (frame.width, frame.height);
+            if w == 0 || h == 0 {
+                return Err(WorkerError::Engine(
+                    "manual reference frame has zero dimensions".to_string(),
+                ));
+            }
+            let undistort =
+                reco_core::lens::undistort::GpuUndistort::new(gpu, w, h, w as f32 / h as f32);
+            let rgba = undistort.undistort(gpu, &frame.y, &frame.u, &frame.v, params);
+            events.manual_preview_frame(side, rgba, w, h);
+        }
+        Ok(())
+    }
 }
 
 impl GpuEngineBackend {
@@ -4002,6 +4292,32 @@ mod tests {
             Ok(())
         }
 
+        fn manual_begin(&mut self, frame: u64, events: &EventSink) -> Result<(), WorkerError> {
+            self.record("manual_begin");
+            // Mirror the real backend's protocol without a GPU or a file: emit
+            // the session-started payload plus one preview frame per camera with
+            // the correct RGBA geometry, so the protocol test can assert the
+            // `width * height * 4` invariant.
+            events.manual_session_started(frame, 30.0, 5);
+            // A 2×1 frame => `2 * 1 * 4 = 8` RGBA bytes.
+            events.manual_preview_frame(crate::events::ManualSide::Left, vec![0u8; 8], 2, 1);
+            events.manual_preview_frame(crate::events::ManualSide::Right, vec![0u8; 8], 2, 1);
+            events.manual_solve_state(false, false);
+            Ok(())
+        }
+
+        fn manual_set_frame(&mut self, _frame: u64, events: &EventSink) -> Result<(), WorkerError> {
+            self.record("manual_set_frame");
+            events.manual_preview_frame(crate::events::ManualSide::Left, vec![0u8; 8], 2, 1);
+            Ok(())
+        }
+
+        fn manual_exit(&mut self, events: &EventSink) -> Result<(), WorkerError> {
+            self.record("manual_exit");
+            events.manual_solve_state(false, false);
+            Ok(())
+        }
+
         fn begin_preview(&mut self, events: &EventSink) -> Result<(), WorkerError> {
             self.record("begin_preview");
             // Mirror the real backend exactly: the session transport is built
@@ -4488,6 +4804,85 @@ mod tests {
         assert!(
             !report.points_capped,
             "a small report must not be marked capped"
+        );
+    }
+
+    #[test]
+    fn manual_begin_emits_session_and_a_preview_frame_with_matching_rgba_length() {
+        // MANU-01 / MANU-03: opening a manual session must emit the typed
+        // session-started payload and one `ManualPreviewFrame` per camera, each
+        // with `rgba.len() == width * height * 4`.
+        let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (worker, events) = EngineWorker::spawn(MockBackend::new(Arc::clone(&ops)));
+        let handle = worker.handle();
+        handle
+            .send(WorkerCommand::ManualBegin { frame: 0 })
+            .unwrap();
+        handle.send(WorkerCommand::Shutdown).unwrap();
+
+        let seen = drain_until_shutdown(&events);
+        assert!(
+            seen.iter()
+                .any(|e| matches!(e, WorkerEvent::ManualSessionStarted { .. })),
+            "manual_begin must emit ManualSessionStarted: {seen:?}"
+        );
+        let previews: Vec<&WorkerEvent> = seen
+            .iter()
+            .filter(|e| matches!(e, WorkerEvent::ManualPreviewFrame { .. }))
+            .collect();
+        assert_eq!(
+            previews.len(),
+            2,
+            "manual_begin must emit one preview frame per camera: {seen:?}"
+        );
+        for event in previews {
+            match event {
+                WorkerEvent::ManualPreviewFrame {
+                    rgba,
+                    width,
+                    height,
+                    ..
+                } => assert_eq!(
+                    rgba.len() as u32,
+                    width * height * 4,
+                    "RGBA length must equal width * height * 4"
+                ),
+                other => panic!("expected ManualPreviewFrame, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn manual_exit_emits_the_session_ended_state() {
+        // MANU-01: exiting drops the session state and emits the reset solve
+        // state, so the flow can clear without losing a profile.
+        let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (evt_tx, evt_rx) = std::sync::mpsc::channel();
+        let events = EventSink { tx: evt_tx };
+        let interrupted = AtomicBool::new(false);
+        let mut mock = MockBackend::new(Arc::clone(&ops));
+
+        assert!(handle_command(
+            WorkerCommand::ManualBegin { frame: 0 },
+            &mut mock,
+            &events,
+            &interrupted,
+        ));
+        assert!(handle_command(
+            WorkerCommand::ManualExit,
+            &mut mock,
+            &events,
+            &interrupted,
+        ));
+        assert!(
+            evt_rx.try_iter().any(|e| matches!(
+                e,
+                WorkerEvent::ManualSolveState {
+                    busy: false,
+                    stale: false
+                }
+            )),
+            "manual_exit must emit the reset solve state"
         );
     }
 

@@ -565,6 +565,62 @@ pub async fn set_field_roi(
     state.send(WorkerCommand::SetFieldRoi { left, right })
 }
 
+/// Open a manual calibration session at `frame` (MANU-01 / MANU-03).
+///
+/// Thin, same contract as [`set_field_roi`]: post a typed
+/// `WorkerCommand::ManualBegin` and return. The worker extracts the reference
+/// frame pair, retains its YUV planes, and emits a typed
+/// `ManualSessionStarted` plus one `ManualPreviewFrame` per camera rendered
+/// under real `CameraParams`. Names no engine type.
+///
+/// # Why `rename_all = "snake_case"`
+///
+/// `frame` is a single word today, but the command is pinned to the crate's
+/// snake_case IPC protocol so a future argument rename cannot reintroduce the
+/// silent-never-fires bug recorded in `crates/reco-app/FRICTION.md` A7.
+///
+/// # Errors
+///
+/// Returns [`WorkerError::ChannelClosed`] if the worker has already exited.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn manual_begin(
+    state: tauri::State<'_, WorkerHandle>,
+    frame: u64,
+) -> Result<(), WorkerError> {
+    state.send(WorkerCommand::ManualBegin { frame })
+}
+
+/// Change the manual session's reference frame (MANU-03).
+///
+/// Thin, same contract as [`manual_begin`]: post `ManualSetFrame`; the worker
+/// clamps the index against the probed frame count (T-04.1-01), re-extracts
+/// only when the frame changed, and re-renders the preview.
+///
+/// # Errors
+///
+/// Returns [`WorkerError::ChannelClosed`] if the worker has already exited.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn manual_set_frame(
+    state: tauri::State<'_, WorkerHandle>,
+    frame: u64,
+) -> Result<(), WorkerError> {
+    state.send(WorkerCommand::ManualSetFrame { frame })
+}
+
+/// Close the manual calibration session (MANU-01).
+///
+/// Thin, same contract as [`manual_begin`]: post `ManualExit`; the worker drops
+/// the retained reference-frame planes (T-04.1-02) and emits the session-ended
+/// state. Exiting never touches an existing calibration profile.
+///
+/// # Errors
+///
+/// Returns [`WorkerError::ChannelClosed`] if the worker has already exited.
+#[tauri::command]
+pub async fn manual_exit(state: tauri::State<'_, WorkerHandle>) -> Result<(), WorkerError> {
+    state.send(WorkerCommand::ManualExit)
+}
+
 /// Cancel a running calibration (CALB-02 / D3-11).
 ///
 /// # The documented control-plane bypass
@@ -830,6 +886,35 @@ pub enum WorkerCommand {
         /// Right-camera polygon vertices, normalized `[0,1]`.
         right: Vec<[f64; 2]>,
     },
+
+    /// Open a manual calibration session at `frame` (MANU-01 / MANU-03).
+    ///
+    /// The worker extracts the reference frame for both clips, retains the YUV
+    /// planes for the session's duration, seeds the per-camera `CameraParams`
+    /// from the loaded profile (or a neutral default), and emits a typed
+    /// `ManualSessionStarted` plus one `ManualPreviewFrame` per camera. The
+    /// frame index is clamped against the probed frame count (T-04.1-01). No
+    /// calibration `.json` is required to begin.
+    ManualBegin {
+        /// The reference frame index (0-based; clamped by the worker).
+        frame: u64,
+    },
+
+    /// Change the manual session's reference frame (MANU-03).
+    ///
+    /// The worker clamps the index, re-extracts the frame pair only when the
+    /// index changed, and re-renders the preview under the current parameters.
+    ManualSetFrame {
+        /// The new reference frame index (0-based; clamped by the worker).
+        frame: u64,
+    },
+
+    /// Close the manual calibration session (MANU-01).
+    ///
+    /// The worker drops the retained reference-frame planes (T-04.1-02) and
+    /// emits the session-ended state. It never touches an existing calibration
+    /// profile, so exiting the flow is never a dead end.
+    ManualExit,
 
     /// Stop the worker loop and return.
     Shutdown,
@@ -1290,5 +1375,26 @@ mod tests {
                 right: vec![]
             }
         );
+    }
+
+    #[test]
+    fn manual_commands_round_trip_through_the_channel() {
+        // MANU-01 / MANU-03: the manual session protocol crosses the channel as
+        // typed commands, never strings.
+        let (tx, rx) = mpsc::channel();
+        let handle = WorkerHandle::new(tx);
+        handle
+            .send(WorkerCommand::ManualBegin { frame: 12 })
+            .unwrap();
+        handle
+            .send(WorkerCommand::ManualSetFrame { frame: 34 })
+            .unwrap();
+        handle.send(WorkerCommand::ManualExit).unwrap();
+        assert_eq!(rx.recv().unwrap(), WorkerCommand::ManualBegin { frame: 12 });
+        assert_eq!(
+            rx.recv().unwrap(),
+            WorkerCommand::ManualSetFrame { frame: 34 }
+        );
+        assert_eq!(rx.recv().unwrap(), WorkerCommand::ManualExit);
     }
 }

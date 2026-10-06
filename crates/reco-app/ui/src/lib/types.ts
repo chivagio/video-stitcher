@@ -59,6 +59,9 @@ export const WORKER_EVENT_TYPED = "worker-event-typed";
 /** Which camera input a selection or its metadata belongs to (IMPT-01). */
 export type InputRole = "left" | "right";
 
+/** Which camera a manual preview frame belongs to (mirror `events::ManualSide`, MANU-03). */
+export type ManualSide = "left" | "right";
+
 /** Whether a metadata value was probed directly or derived (IMPT-02). */
 export type Provenance = "probed" | "estimated";
 
@@ -297,6 +300,15 @@ export type WorkerEventTyped =
   | { kind: "field_roi_cleared"; data: null }
   | { kind: "profile_loaded"; data: { path: string } }
   | { kind: "profile_saved"; data: { path: string } }
+  | {
+      kind: "manual_session_started";
+      data: { frame: number; fps: number; frames_total: number };
+    }
+  | {
+      kind: "manual_preview_frame";
+      data: { side: ManualSide; rgba: number[]; width: number; height: number };
+    }
+  | { kind: "manual_solve_state"; data: { busy: boolean; stale: boolean } }
   | { kind: "result_invalidated"; data: null }
   | { kind: "log"; data: LogLine }
   | { kind: "failed"; data: unknown };

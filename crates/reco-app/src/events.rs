@@ -78,6 +78,21 @@ impl InputRole {
     }
 }
 
+/// Which camera's preview frame a manual-calibration payload belongs to
+/// (MANU-03).
+///
+/// Left/right is semantically load-bearing (each side renders under its own
+/// `CameraParams`), so the side is explicit and never inferred. Serializes
+/// snake_case (`"left"` / `"right"`) and mirrors into `ui/src/lib/types.ts`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManualSide {
+    /// The left camera's preview frame.
+    Left,
+    /// The right camera's preview frame.
+    Right,
+}
+
 /// Whether a metadata value was read directly from the source or derived
 /// (IMPT-02 / D-05 provenance-over-guessing).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -731,6 +746,50 @@ pub enum WorkerEvent {
         path: String,
     },
 
+    /// A manual calibration session was opened (MANU-01 / MANU-03).
+    ///
+    /// Carries the reference frame index, the source frame rate, and the total
+    /// frame count so the frontend's scrubber is bounded to the real clip.
+    /// Emitted once per `manual_begin`.
+    ManualSessionStarted {
+        /// The chosen reference frame index (0-based, clamped to the clip).
+        frame: u64,
+        /// The source frame rate in frames per second.
+        fps: f64,
+        /// Total frames in the reference clip.
+        frames_total: u64,
+    },
+
+    /// One camera's reference frame rendered under its real `CameraParams`
+    /// (MANU-03).
+    ///
+    /// `rgba` is `width * height * 4` bytes — the same RGBA-to-webview payload
+    /// convention as the CALB-08 debug thumbnails. Every pixel is produced by
+    /// the GPU undistort under real `CameraParams`; the frontend paints the
+    /// bytes and never touches the GPU (T-04.1-04).
+    ManualPreviewFrame {
+        /// Which camera this frame belongs to.
+        side: ManualSide,
+        /// RGBA bytes (`width * height * 4`).
+        rgba: Vec<u8>,
+        /// Frame width in pixels.
+        width: u32,
+        /// Frame height in pixels.
+        height: u32,
+    },
+
+    /// The manual solve's busy/stale state (MANU-03).
+    ///
+    /// `busy` is true while a background solve is in flight; `stale` marks that
+    /// the preview currently shows the last solved result rather than a fresh
+    /// one. No per-drag re-solve in v1 (UI-SPEC stale-vs-fresh contract).
+    ManualSolveState {
+        /// Whether a background solve is running.
+        busy: bool,
+        /// Whether the preview shows the last solved (stale) result.
+        stale: bool,
+    },
+
     /// The current result no longer matches the inputs or profile (D3-08).
     ///
     /// Emitted when an input or lens override changes after a run/load, so the
@@ -955,6 +1014,40 @@ impl WorkerEvent {
             WorkerEvent::ProfileSaved { path } => LogLine {
                 level: Level::Info,
                 message: format!("profile saved: {path}"),
+            },
+            WorkerEvent::ManualSessionStarted {
+                frame,
+                fps,
+                frames_total,
+            } => LogLine {
+                level: Level::Info,
+                message: format!(
+                    "manual session started: frame {frame}/{frames_total} @ {fps:.3} fps"
+                ),
+            },
+            // The RGBA payload is deliberately NOT logged: a log line carries a
+            // human-readable summary, never a megabyte of frame bytes.
+            WorkerEvent::ManualPreviewFrame {
+                side,
+                width,
+                height,
+                ..
+            } => LogLine {
+                level: Level::Info,
+                message: format!("manual preview frame: {side:?} {width}×{height}"),
+            },
+            WorkerEvent::ManualSolveState { busy, stale } => LogLine {
+                level: Level::Info,
+                message: format!(
+                    "manual solve: {}",
+                    if *busy {
+                        "solving…"
+                    } else if *stale {
+                        "preview shows last solved result"
+                    } else {
+                        "solved"
+                    }
+                ),
             },
             WorkerEvent::ResultInvalidated => LogLine {
                 level: Level::Warn,
@@ -1688,5 +1781,72 @@ mod tests {
         );
         assert_eq!(cleared.to_log_line().level, Level::Info);
         assert_eq!(cleared.to_log_line().message, "field ROI cleared");
+    }
+
+    #[test]
+    fn manual_preview_frame_roundtrips_and_projects_to_an_info_line() {
+        // MANU-03: the rendered RGBA crosses as a typed event whose length is
+        // exactly `width * height * 4`; the log projection carries the geometry,
+        // never the bytes.
+        let event = WorkerEvent::ManualPreviewFrame {
+            side: ManualSide::Left,
+            rgba: vec![0, 0, 0, 255, 255, 255, 255, 255],
+            width: 2,
+            height: 1,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(
+            json.contains("\"kind\":\"manual_preview_frame\""),
+            "unexpected json: {json}"
+        );
+        assert!(
+            json.contains("\"side\":\"left\""),
+            "unexpected json: {json}"
+        );
+        let back: WorkerEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(event, back);
+
+        let line = event.to_log_line();
+        assert_eq!(line.level, Level::Info);
+        assert_eq!(line.message, "manual preview frame: Left 2×1");
+        assert!(
+            !line.message.contains("255"),
+            "the log line must not carry frame bytes: {line:?}"
+        );
+    }
+
+    #[test]
+    fn manual_session_and_solve_state_events_roundtrip_and_project() {
+        let started = WorkerEvent::ManualSessionStarted {
+            frame: 3,
+            fps: 29.97,
+            frames_total: 300,
+        };
+        let json = serde_json::to_string(&started).unwrap();
+        assert!(
+            json.contains("\"kind\":\"manual_session_started\""),
+            "unexpected json: {json}"
+        );
+        assert_eq!(serde_json::from_str::<WorkerEvent>(&json).unwrap(), started);
+        assert_eq!(started.to_log_line().level, Level::Info);
+
+        let busy = WorkerEvent::ManualSolveState {
+            busy: true,
+            stale: false,
+        };
+        assert_eq!(busy.to_log_line().message, "manual solve: solving…");
+        let stale = WorkerEvent::ManualSolveState {
+            busy: false,
+            stale: true,
+        };
+        assert_eq!(
+            stale.to_log_line().message,
+            "manual solve: preview shows last solved result"
+        );
+        let fresh = WorkerEvent::ManualSolveState {
+            busy: false,
+            stale: false,
+        };
+        assert_eq!(fresh.to_log_line().message, "manual solve: solved");
     }
 }
