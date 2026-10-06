@@ -7,7 +7,19 @@
 //!    using the `inlier` crate's MAGSAC implementation
 
 use crate::features::{KeyPoint, RawMatch};
-use crate::types::CalibrationConfig;
+use crate::types::{CalibrationConfig, MatchConfig};
+
+/// Row-dependent maximum allowed vertical disparity, in pixels (CALB-07).
+///
+/// (RED stub — implementation added in the GREEN step.)
+pub fn max_y_disparity_for_row(
+    cfg: &MatchConfig,
+    _row_frac: f64,
+    _fps: f64,
+    avg_h: f64,
+) -> f64 {
+    cfg.max_y_disparity * avg_h
+}
 
 /// Apply spatial overlap filter to raw matches.
 ///
@@ -222,5 +234,63 @@ mod tests {
 
         // No fallback: out-of-region match is rejected, result is empty
         assert!(result.is_empty());
+    }
+
+    fn rolling_shutter_config() -> MatchConfig {
+        MatchConfig {
+            rolling_shutter: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn rolling_shutter_off_matches_fixed_bound_for_every_row() {
+        let cfg = MatchConfig::default(); // rolling_shutter == false
+        let avg_h = 1080.0;
+        let base = cfg.max_y_disparity * avg_h;
+        for row in [0.0, 0.25, 0.5, 0.75, 1.0] {
+            let bound = max_y_disparity_for_row(&cfg, row, 30.0, avg_h);
+            assert_eq!(bound, base, "row {row} must use the fixed bound");
+        }
+    }
+
+    #[test]
+    fn rolling_shutter_on_bound_is_monotonic_in_row() {
+        let cfg = rolling_shutter_config();
+        let avg_h = 1080.0;
+        let rows = [0.0, 0.25, 0.5, 0.75, 1.0];
+        let bounds: Vec<f64> = rows
+            .iter()
+            .map(|&r| max_y_disparity_for_row(&cfg, r, 30.0, avg_h))
+            .collect();
+        for w in bounds.windows(2) {
+            assert!(w[0] < w[1], "bound must increase with row: {bounds:?}");
+        }
+    }
+
+    #[test]
+    fn rolling_shutter_top_and_bottom_differ_midpoint_is_base() {
+        let cfg = rolling_shutter_config();
+        let avg_h = 1080.0;
+        let base = cfg.max_y_disparity * avg_h;
+        let top = max_y_disparity_for_row(&cfg, 0.0, 30.0, avg_h);
+        let mid = max_y_disparity_for_row(&cfg, 0.5, 30.0, avg_h);
+        let bottom = max_y_disparity_for_row(&cfg, 1.0, 30.0, avg_h);
+        assert!(top < bottom, "top {top} should be tighter than bottom {bottom}");
+        assert!((mid - base).abs() < 1e-9, "midpoint {mid} must equal base {base}");
+    }
+
+    #[test]
+    fn rolling_shutter_higher_fps_yields_smaller_slope() {
+        let cfg = rolling_shutter_config();
+        let avg_h = 1080.0;
+        let base = cfg.max_y_disparity * avg_h;
+        let slope_30 = max_y_disparity_for_row(&cfg, 1.0, 30.0, avg_h) - base;
+        let slope_60 = max_y_disparity_for_row(&cfg, 1.0, 60.0, avg_h) - base;
+        assert!(slope_30 > 0.0 && slope_60 > 0.0);
+        assert!(
+            slope_60 < slope_30,
+            "higher fps should shrink the slope: 60fps={slope_60}, 30fps={slope_30}"
+        );
     }
 }

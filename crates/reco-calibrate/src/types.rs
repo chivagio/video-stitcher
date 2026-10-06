@@ -175,6 +175,18 @@ pub struct MatchConfig {
     /// single-scale cross-checked matcher. Default `true`.
     #[serde(default = "default_true")]
     pub multi_scale: bool,
+    /// Whether the source exhibits rolling-shutter readout (CALB-07).
+    ///
+    /// Inert by default: never enabled silently. Only set from an explicit
+    /// option or camera metadata. When `false`, the vertical-disparity bound
+    /// is the fixed historical value, byte-for-byte.
+    #[serde(default)]
+    pub rolling_shutter: bool,
+    /// Strength of the rolling-shutter row-dependent vertical-disparity slope.
+    /// Larger values widen the bound further toward the bottom of the frame.
+    /// Default `0.5`. Ignored when [`Self::rolling_shutter`] is `false`.
+    #[serde(default = "default_rolling_shutter_slope")]
+    pub rolling_shutter_slope: f64,
 }
 
 /// Serde default helper: `true`.
@@ -197,6 +209,11 @@ fn default_ratio_max() -> f64 {
     0.85
 }
 
+/// Serde default helper: rolling-shutter slope strength.
+fn default_rolling_shutter_slope() -> f64 {
+    0.5
+}
+
 impl Default for MatchConfig {
     fn default() -> Self {
         Self {
@@ -214,6 +231,8 @@ impl Default for MatchConfig {
             ratio_min: 0.65,
             ratio_max: 0.85,
             multi_scale: true,
+            rolling_shutter: false,
+            rolling_shutter_slope: 0.5,
         }
     }
 }
@@ -416,6 +435,12 @@ impl CalibrationConfig {
             return Err(CalibrateError::InvalidConfig(format!(
                 "ratio_min ({}) must be <= ratio_max ({})",
                 self.matching.ratio_min, self.matching.ratio_max
+            )));
+        }
+        if !(self.matching.rolling_shutter_slope >= 0.0) {
+            return Err(CalibrateError::InvalidConfig(format!(
+                "rolling_shutter_slope must be >= 0, got {}",
+                self.matching.rolling_shutter_slope
             )));
         }
         Ok(())
