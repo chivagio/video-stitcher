@@ -452,3 +452,28 @@ the pose to 50.87° for the shipped clip. The CLI logged `max FOV =
 … (coverage-limited)`; the app surfaced nothing. Bound the control to the value
 the engine reports rather than to a constant chosen by the UI — a range the
 engine will never accept is indistinguishable from a broken control.
+
+### A13. `calibrate_videos` created its own GPU device, breaking the single-owner invariant
+
+**Impact:** High (FOUND-03 / D-03), and it blocked the wizard. The one-call
+file-to-calibration entry `reco_calibrate::video::calibrate_videos` opened with
+`let gpu = GpuContext::new_blocking()?`, so every calibration created a **second**
+`wgpu` device alongside the worker's own. The single-device-owner contract
+(D-03/FOUND-03) says all engine work runs on the worker's device; a second device
+means a second adapter, duplicated VRAM pools, and the native-surface presenter's
+shared-device assumptions no longer hold. There was no way for a consumer that
+already owns a device to pass it in — the only entry point insisted on making one.
+
+**Resolution (Phase 3, plan 03-02):** `reco-calibrate` gained an additive
+`calibrate_videos_with_gpu(gpu: &GpuContext, …)` that runs the identical
+orchestration on the caller's context. `calibrate_videos` is now a thin wrapper
+that creates a context and delegates, so no public API or existing caller (CLI,
+OBS) changed. The wizard's worker calls `calibrate_videos_with_gpu` with its own
+`GpuContext`.
+
+**Residual gap:** nothing *forces* a consumer onto the GPU-aware entry — a caller
+can still call the self-creating `calibrate_videos` and quietly make a second
+device. The additive choice was deliberate (it keeps the CLI and OBS untouched),
+but it means the invariant is upheld by convention at the call site, not by the
+type system. A future pass could make the device an explicit parameter
+everywhere and delete the self-creating wrapper once no consumer needs it.

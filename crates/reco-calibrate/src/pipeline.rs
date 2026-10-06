@@ -42,7 +42,8 @@ use reco_core::gpu::GpuContext;
 use crate::error::CalibrateError;
 use crate::telemetry::TelemetryData;
 use crate::types::{
-    CalibrationConfig, CalibrationResult, LensProfileInfo, SyncInfo, SyncMethod, YuvFrame,
+    CalibrationConfig, CalibrationProgress, CalibrationResult, LensProfileInfo, SyncInfo,
+    SyncMethod, YuvFrame,
 };
 use crate::{audio_sync, lens_database, sampling, telemetry};
 
@@ -472,10 +473,28 @@ impl CalibrationPipeline {
     ///
     /// The app must extract frames at the indices returned by
     /// [`CalibrationPipeline::frame_indices`] and pass them here as `(left, right)` pairs.
+    ///
+    /// Equivalent to [`Self::calibrate_with_progress`] with a no-op callback.
     pub fn calibrate(
         &self,
         gpu: &GpuContext,
         frames: &[(YuvFrame, YuvFrame)],
+    ) -> Result<CalibrationResult, CalibrateError> {
+        self.calibrate_with_progress(gpu, frames, &mut |_| {})
+    }
+
+    /// Run the calibration pipeline on extracted frame pairs, reporting
+    /// progress through `on_progress` (CALB-01 / D3-09).
+    ///
+    /// Forwards to [`crate::calibrate_with_progress`], which emits
+    /// [`crate::CalibrationStep::Undistorting`] per frame and
+    /// [`crate::CalibrationStep::Optimizing`] before the solver, and then
+    /// attaches this pipeline's sync provenance to the result.
+    pub fn calibrate_with_progress(
+        &self,
+        gpu: &GpuContext,
+        frames: &[(YuvFrame, YuvFrame)],
+        on_progress: &mut dyn FnMut(&CalibrationProgress),
     ) -> Result<CalibrationResult, CalibrateError> {
         let left_params = self.left_params.as_ref().ok_or_else(|| {
             CalibrateError::InvalidConfig(
@@ -508,7 +527,14 @@ impl CalibrationPipeline {
             }
         }
 
-        let mut result = crate::calibrate(gpu, frames, left_params, right_params, &config)?;
+        let mut result = crate::calibrate_with_progress(
+            gpu,
+            frames,
+            left_params,
+            right_params,
+            &config,
+            on_progress,
+        )?;
         result.calibration.rig_tilt = self.rig_tilt;
         result.calibration.rig_roll = self.rig_roll;
         result.calibration.sync_offset = self.sync_offset_frames;

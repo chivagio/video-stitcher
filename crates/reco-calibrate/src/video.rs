@@ -174,11 +174,45 @@ fn emit_progress(
 /// before each step and returns [`CalibrateVideosError::Cancelled`]
 /// if set.
 ///
+/// This wrapper creates its own [`GpuContext`] with a blocking device
+/// request. Callers that already own a device
+/// (e.g. a single-owner engine worker — FOUND-03/D-03) must use
+/// [`calibrate_videos_with_gpu`] instead so calibration runs on the
+/// shared device.
+///
 /// For advanced use cases (custom sync, debug output), use
 /// [`CalibrationPipeline`] directly. For live/in-memory frames
 /// (Jetson cameras, mobile streams), use
 /// [`calibrate()`](crate::calibrate) directly.
 pub fn calibrate_videos(
+    left_video: &Path,
+    right_video: &Path,
+    options: CalibrateVideosOptions,
+    on_progress: &mut dyn FnMut(&CalibrationProgress),
+    interrupted: &AtomicBool,
+) -> Result<CalibrationResult, CalibrateVideosError> {
+    let gpu = GpuContext::new_blocking()?;
+    calibrate_videos_with_gpu(
+        &gpu,
+        left_video,
+        right_video,
+        options,
+        on_progress,
+        interrupted,
+    )
+}
+
+/// Calibrate two video files on a caller-supplied [`GpuContext`] (E1 / FOUND-03).
+///
+/// Identical orchestration to [`calibrate_videos`], but never creates its
+/// own device: calibration runs on the caller's context, preserving the
+/// single-device-owner invariant (D-03). Emits all seven
+/// [`CalibrationStep`] variants through `on_progress`:
+/// `Probing`, `DetectingProfiles`, `AudioSync`, `ExtractingFrames`,
+/// `FeatureMatching` (this function) and `Undistorting`, `Optimizing`
+/// (via [`CalibrationPipeline::calibrate_with_progress`]).
+pub fn calibrate_videos_with_gpu(
+    gpu: &GpuContext,
     left_video: &Path,
     right_video: &Path,
     options: CalibrateVideosOptions,
@@ -310,9 +344,39 @@ pub fn calibrate_videos(
         CalibrationStep::FeatureMatching,
         "GPU init and feature matching",
     );
-    let gpu = GpuContext::new_blocking()?;
     log::info!("GPU: {}", gpu.gpu_name());
 
-    let result = pipeline.calibrate(&gpu, &frame_pairs)?;
+    let result = pipeline.calibrate_with_progress(gpu, &frame_pairs, on_progress)?;
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Compile-time proof that both entry points exist with the expected
+    /// signatures: `calibrate_videos_with_gpu` takes `&GpuContext`, and
+    /// `calibrate_videos` remains the self-creating wrapper (public API
+    /// unchanged). Casting each item to an explicit `fn` pointer type fails
+    /// to compile if either signature drifts.
+    #[test]
+    fn entry_point_signatures_compile() {
+        let _gpu_aware = calibrate_videos_with_gpu
+            as fn(
+                &GpuContext,
+                &Path,
+                &Path,
+                CalibrateVideosOptions,
+                &mut dyn FnMut(&CalibrationProgress),
+                &AtomicBool,
+            ) -> Result<CalibrationResult, CalibrateVideosError>;
+        let _wrapper = calibrate_videos
+            as fn(
+                &Path,
+                &Path,
+                CalibrateVideosOptions,
+                &mut dyn FnMut(&CalibrationProgress),
+                &AtomicBool,
+            ) -> Result<CalibrationResult, CalibrateVideosError>;
+    }
 }

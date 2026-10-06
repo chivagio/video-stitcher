@@ -282,10 +282,29 @@ pub fn calibrate(
     right_params: &CameraParams,
     config: &CalibrationConfig,
 ) -> Result<CalibrationResult, CalibrateError> {
+    calibrate_with_progress(gpu, frames, left_params, right_params, config, &mut |_| {})
+}
+
+/// Run the full calibration pipeline with default stages, reporting
+/// progress (CALB-01 / D3-09).
+///
+/// Like [`calibrate`], but invokes `on_progress` before each frame's GPU
+/// undistort ([`CalibrationStep::Undistorting`]) and before the optimizer
+/// solves ([`CalibrationStep::Optimizing`]). Together with the stages the
+/// caller emits around frame extraction and matching, this makes all seven
+/// [`CalibrationStep`] variants reachable from one file-to-calibration run.
+pub fn calibrate_with_progress(
+    gpu: &GpuContext,
+    frames: &[(YuvFrame, YuvFrame)],
+    left_params: &CameraParams,
+    right_params: &CameraParams,
+    config: &CalibrationConfig,
+    on_progress: &mut dyn FnMut(&CalibrationProgress),
+) -> Result<CalibrationResult, CalibrateError> {
     let detector = defaults::AkazeDetector::new(config.akaze.threshold);
     let matcher = defaults::HammingMatcher::new(config.matching.lowe_ratio);
     let filter = defaults::NoOpFilter;
-    calibrate_with(
+    calibrate_impl(
         gpu,
         frames,
         left_params,
@@ -294,6 +313,7 @@ pub fn calibrate(
         &detector,
         &matcher,
         &filter,
+        on_progress,
     )
 }
 
@@ -326,6 +346,37 @@ pub fn calibrate_with(
     detector: &dyn traits::FeatureDetector,
     matcher: &dyn traits::FeatureMatcher,
     point_filter: &dyn traits::PointFilter,
+) -> Result<CalibrationResult, CalibrateError> {
+    calibrate_impl(
+        gpu,
+        frames,
+        left_params,
+        right_params,
+        config,
+        detector,
+        matcher,
+        point_filter,
+        &mut |_| {},
+    )
+}
+
+/// Shared implementation behind [`calibrate`], [`calibrate_with`], and
+/// [`calibrate_with_progress`].
+///
+/// Emits [`CalibrationStep::Undistorting`] before each frame's GPU
+/// undistort and [`CalibrationStep::Optimizing`] before the optimizer
+/// solves through `on_progress`.
+#[allow(clippy::too_many_arguments)]
+fn calibrate_impl(
+    gpu: &GpuContext,
+    frames: &[(YuvFrame, YuvFrame)],
+    left_params: &CameraParams,
+    right_params: &CameraParams,
+    config: &CalibrationConfig,
+    detector: &dyn traits::FeatureDetector,
+    matcher: &dyn traits::FeatureMatcher,
+    point_filter: &dyn traits::PointFilter,
+    on_progress: &mut dyn FnMut(&CalibrationProgress),
 ) -> Result<CalibrationResult, CalibrateError> {
     config.validate()?;
 
@@ -364,6 +415,10 @@ pub fn calibrate_with(
     // pairs (~1 GB for 8 pairs at 4K).
     let mut successful_frames: Vec<FrameMatches> = Vec::new();
     for (i, (left, right)) in frames.iter().enumerate() {
+        on_progress(&CalibrationProgress {
+            step: CalibrationStep::Undistorting,
+            detail: format!("Undistorting frame {}/{}", i + 1, frames.len()),
+        });
         let (left_rgba, right_rgba) = {
             profile_scope!("gpu_undistort");
             let l = left_undistort.undistort(gpu, &left.y, &left.u, &left.v, left_params);
@@ -440,6 +495,10 @@ pub fn calibrate_with(
     }
 
     // Single-pass optimization on all points with trimmed cost.
+    on_progress(&CalibrationProgress {
+        step: CalibrationStep::Optimizing,
+        detail: "Optimizing camera parameters".to_string(),
+    });
     let (best_layout, best_residual) = {
         profile_scope!("optimizer");
         optimizer::optimize(&all_points, config)
