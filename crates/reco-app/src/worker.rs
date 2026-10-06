@@ -7103,6 +7103,52 @@ mod tests {
     }
 
     #[test]
+    fn manual_save_preserves_field_roi_and_the_carried_profile_fields() {
+        // MANU-07 / T-04.1-18: the profile the manual save assembles keeps the
+        // base profile's field_roi (and the other carried fields) verbatim.
+        let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut mock = MockBackend::new(ops);
+        let mut base = sample_mock_calibration();
+        base.field_roi = Some(reco_core::calibration::FieldRoi {
+            left: vec![[0.1, 0.9], [0.3, 0.7], [0.5, 0.6]],
+            right: vec![[0.6, 0.9], [0.8, 0.7], [0.7, 0.6]],
+        });
+        base.lens_correction_amount = 0.7;
+        base.blend_width = 0.12;
+        mock.current_calibration = Some(base.clone());
+        mock.has_result = true;
+        let (evt_tx, _evt_rx) = std::sync::mpsc::channel();
+        let events = EventSink { tx: evt_tx };
+        let interrupted = AtomicBool::new(false);
+
+        let _ = handle_command(
+            WorkerCommand::ManualBegin { frame: 0 },
+            &mut mock,
+            &events,
+            &interrupted,
+        );
+        let _ = handle_command(
+            WorkerCommand::ManualSave {
+                path: "/media/manual.json".to_string(),
+            },
+            &mut mock,
+            &events,
+            &interrupted,
+        );
+
+        let saved = mock
+            .current_calibration
+            .as_ref()
+            .expect("the save must adopt a calibration");
+        assert_eq!(
+            saved.field_roi, base.field_roi,
+            "field_roi must survive the manual save (T-04.1-18)"
+        );
+        assert!((saved.lens_correction_amount - 0.7).abs() < 1e-6);
+        assert!((saved.blend_width - 0.12).abs() < 1e-6);
+    }
+
+    #[test]
     fn normalize_field_roi_clears_degenerate_polygons() {
         // CALB-09: fewer than three vertices is not a polygon; it clears.
         for n in 0..3 {

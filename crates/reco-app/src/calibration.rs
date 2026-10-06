@@ -1507,4 +1507,132 @@ mod tests {
         assert_eq!(m.keypoints_left, 80);
         assert_eq!(m.keypoints_right, 90);
     }
+
+    fn sample_field_roi() -> reco_core::calibration::FieldRoi {
+        reco_core::calibration::FieldRoi {
+            left: vec![[0.1, 0.9], [0.3, 0.7], [0.5, 0.6]],
+            right: vec![[0.6, 0.9], [0.8, 0.7], [0.7, 0.6]],
+        }
+    }
+
+    #[test]
+    fn build_manual_match_calibration_preserves_the_carried_fields() {
+        // MANU-07 / T-04.1-18: every carried profile field survives the manual
+        // assembly verbatim — never dropped, never re-derived.
+        let mut base = sample_calibration();
+        base.field_roi = Some(sample_field_roi());
+        base.lens_correction_amount = 0.6;
+        base.blend_width = 0.11;
+        base.rig_tilt = 0.05;
+        base.rig_roll = -0.02;
+
+        let cal = build_manual_match_calibration(
+            &base,
+            camera(1920, 1080),
+            camera(1920, 1080),
+            base.layout.clone(),
+            7,
+        );
+        assert_eq!(
+            cal.field_roi, base.field_roi,
+            "field_roi must survive the manual assembly (T-04.1-18)"
+        );
+        assert!((cal.lens_correction_amount - 0.6).abs() < 1e-9);
+        assert!((cal.blend_width - 0.11).abs() < 1e-9);
+        assert!((cal.rig_tilt - 0.05).abs() < 1e-9);
+        assert!((cal.rig_roll + 0.02).abs() < 1e-9);
+        assert_eq!(cal.sync_offset, 7, "the chosen offset must be carried");
+        cal.validate()
+            .expect("a sane manual assembly must pass MatchCalibration::validate");
+    }
+
+    #[test]
+    fn build_manual_match_calibration_fails_validation_for_a_non_finite_k1() {
+        // MANU-07 / T-04.1-16: an invalid profile must fail `validate` so the
+        // save gate can refuse to write it. `validate` enforces finiteness (not
+        // magnitude) for the distortion coefficients, so a NaN k1 is the
+        // out-of-range case that trips it.
+        let base = sample_calibration();
+        let mut left = camera(1920, 1080);
+        left.d[0] = f64::NAN;
+        let cal =
+            build_manual_match_calibration(&base, left, camera(1920, 1080), base.layout.clone(), 0);
+        assert!(
+            cal.validate().is_err(),
+            "a non-finite k1 must fail MatchCalibration::validate"
+        );
+    }
+
+    #[test]
+    fn validation_verdict_passes_on_agreement_and_flags_a_disagreement() {
+        // MANU-07: the verdict is advisory — LooksGood only when the layouts
+        // agree within tolerance AND the residual is low; otherwise CheckSeam.
+        let layout = sample_calibration().layout;
+        assert_eq!(
+            validation_verdict(&layout, &layout, 0.25),
+            ValidationVerdict::LooksGood
+        );
+        assert_eq!(
+            validation_verdict(&layout, &layout, 0.9),
+            ValidationVerdict::CheckSeam,
+            "a high residual must flag CheckSeam"
+        );
+
+        let mut other = layout.clone();
+        other.camera_axis_offset += 0.2;
+        assert_eq!(
+            validation_verdict(&layout, &other, 0.1),
+            ValidationVerdict::CheckSeam,
+            "a layout disagreement must flag CheckSeam"
+        );
+        assert_eq!(
+            validation_verdict(&layout, &layout, f64::NAN),
+            ValidationVerdict::CheckSeam,
+            "a non-finite residual can never pass"
+        );
+    }
+
+    #[test]
+    fn saving_the_manual_profile_twice_overwrites_the_target() {
+        // MANU-07 idempotency: a repeated save overwrites the target profile; it
+        // never accumulates.
+        let base = sample_calibration();
+        let first = build_manual_match_calibration(
+            &base,
+            camera(1920, 1080),
+            camera(1920, 1080),
+            base.layout.clone(),
+            1,
+        );
+        let mut second = build_manual_match_calibration(
+            &base,
+            camera(1920, 1080),
+            camera(1920, 1080),
+            base.layout.clone(),
+            2,
+        );
+        second.layout.intersect = 0.42;
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = std::env::temp_dir().join(format!(
+            "reco-manual-save-{}-{nanos}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        first.to_file(&path).expect("the first save must write");
+        second
+            .to_file(&path)
+            .expect("the second save must overwrite");
+        let loaded = MatchCalibration::from_file(&path).expect("the overwritten profile must load");
+        assert_eq!(
+            loaded.sync_offset, 2,
+            "the second save must win, not accumulate"
+        );
+        assert!((loaded.layout.intersect - 0.42).abs() < 1e-9);
+        let _ = std::fs::remove_file(&path);
+    }
 }
