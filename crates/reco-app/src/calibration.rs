@@ -313,7 +313,8 @@ mod tests {
     use super::*;
     use crate::events::{MetadataField, Provenance};
     use reco_calibrate::types::{
-        CalibrationConfig, CalibrationResult, LensProfileInfo, ProfileSource, SyncInfo,
+        CalibrationConfig, CalibrationResult, FrameMatches, LensProfileInfo, MatchedPoint,
+        ProfileSource, SyncInfo,
     };
     use reco_core::calibration::{CameraParams, MatchCalibration, PlaneLayout};
 
@@ -569,5 +570,181 @@ mod tests {
             diagnosis.raw_error,
             "no usable frame pairs (all frames failed matching)"
         );
+    }
+
+    /// A synthetic `FrameMatches` with the given counters and point count.
+    fn frame_matches(
+        points: usize,
+        keypoints_left: usize,
+        keypoints_right: usize,
+        post_ratio_test: usize,
+        post_spatial_filter: usize,
+        post_ransac: usize,
+    ) -> FrameMatches {
+        FrameMatches {
+            points: (0..points)
+                .map(|_| MatchedPoint::from_planes([0.0, 0.0], [0.0, 0.0]))
+                .collect(),
+            keypoints_left,
+            keypoints_right,
+            min_descriptors: 0,
+            post_ratio_test,
+            post_spatial_filter,
+            post_ransac,
+        }
+    }
+
+    #[test]
+    fn no_keypoints_cause_names_the_camera_and_frame_with_an_exposure_fix() {
+        let diagnosis = diagnose_calibration_failure(
+            &CalibrateError::NoKeypoints {
+                camera: "right",
+                frame_idx: 7,
+            },
+            CalibrationStage::FeatureMatching,
+            &[],
+        );
+        assert!(
+            diagnosis.cause.contains("right"),
+            "cause must name the camera: {}",
+            diagnosis.cause
+        );
+        assert!(
+            diagnosis.cause.contains('7'),
+            "cause must name the frame: {}",
+            diagnosis.cause
+        );
+        let fix = diagnosis.fix.to_lowercase();
+        assert!(
+            fix.contains("exposure") || fix.contains("texture") || fix.contains("light"),
+            "fix must point at exposure / feature texture: {}",
+            diagnosis.fix
+        );
+        assert!(!diagnosis.cause.is_empty() && !diagnosis.fix.is_empty());
+    }
+
+    #[test]
+    fn insufficient_matches_cause_includes_the_numbers_and_the_fix_names_the_causes() {
+        let diagnosis = diagnose_calibration_failure(
+            &CalibrateError::InsufficientMatches { got: 3, min: 20 },
+            CalibrationStage::FeatureMatching,
+            &[],
+        );
+        assert!(
+            diagnosis.cause.contains('3') && diagnosis.cause.contains("20"),
+            "cause must include got/min: {}",
+            diagnosis.cause
+        );
+        let fix = diagnosis.fix.to_lowercase();
+        assert!(
+            fix.contains("overlap") || fix.contains("exposure") || fix.contains("rolling"),
+            "fix must mention overlap / exposure / rolling shutter: {}",
+            diagnosis.fix
+        );
+    }
+
+    #[test]
+    fn ransac_failed_names_geometric_verification_and_suggests_reducing_mismatched_regions() {
+        let diagnosis = diagnose_calibration_failure(
+            &CalibrateError::RansacFailed,
+            CalibrationStage::Optimizing,
+            &[],
+        );
+        assert!(
+            diagnosis.cause.to_lowercase().contains("geometric"),
+            "cause must name geometric verification: {}",
+            diagnosis.cause
+        );
+        let fix = diagnosis.fix.to_lowercase();
+        assert!(
+            fix.contains("mismatch") || fix.contains("region") || fix.contains("roi"),
+            "fix must suggest reducing mismatched regions / ROI: {}",
+            diagnosis.fix
+        );
+    }
+
+    #[test]
+    fn optimizer_failed_names_convergence_and_suggests_sync_or_imu_seeds() {
+        let diagnosis = diagnose_calibration_failure(
+            &CalibrateError::OptimizerFailed { max_evals: 200 },
+            CalibrationStage::Optimizing,
+            &[],
+        );
+        assert!(
+            diagnosis.cause.to_lowercase().contains("converge"),
+            "cause must name convergence: {}",
+            diagnosis.cause
+        );
+        let fix = diagnosis.fix.to_lowercase();
+        assert!(
+            fix.contains("sync") || fix.contains("imu"),
+            "fix must suggest checking sync / IMU seeds: {}",
+            diagnosis.fix
+        );
+    }
+
+    #[test]
+    fn no_usable_frames_names_the_cause_and_the_fix_mentions_overlap_or_lens_profile() {
+        let diagnosis = diagnose_calibration_failure(
+            &CalibrateError::NoUsableFrames,
+            CalibrationStage::Undistorting,
+            &[],
+        );
+        assert!(
+            diagnosis
+                .cause
+                .to_lowercase()
+                .contains("no frame pair produced usable matches"),
+            "cause must name the run-level failure: {}",
+            diagnosis.cause
+        );
+        let fix = diagnosis.fix.to_lowercase();
+        assert!(
+            fix.contains("overlap") || fix.contains("lens profile") || fix.contains("lens"),
+            "fix must mention overlap / lens profile: {}",
+            diagnosis.fix
+        );
+    }
+
+    #[test]
+    fn an_unmapped_variant_falls_back_to_the_typed_display_text_never_an_empty_cause() {
+        let source = CalibrateError::InvalidConfig("seam_sigma must be > 0".to_string());
+        let diagnosis = diagnose_calibration_failure(&source, CalibrationStage::Probing, &[]);
+        assert_eq!(
+            diagnosis.cause,
+            source.to_string(),
+            "an unmapped variant must surface the typed Display text verbatim"
+        );
+        assert!(
+            diagnosis.cause.contains("seam_sigma"),
+            "the raw reason must survive: {}",
+            diagnosis.cause
+        );
+        assert!(
+            !diagnosis.fix.is_empty(),
+            "the fallback must still offer a generic next step"
+        );
+    }
+
+    #[test]
+    fn diagnosis_metrics_aggregate_exactly_over_a_known_frame_set() {
+        let frames = [
+            frame_matches(5, 100, 90, 40, 20, 5),
+            frame_matches(3, 80, 120, 30, 15, 3),
+        ];
+        let diagnosis = diagnose_calibration_failure(
+            &CalibrateError::NoUsableFrames,
+            CalibrationStage::Undistorting,
+            &frames,
+        );
+        let m = diagnosis.metrics;
+        assert_eq!(m.frames_used, 2);
+        assert_eq!(m.total_matches, 8);
+        assert_eq!(m.post_ratio_test, 70);
+        assert_eq!(m.post_spatial_filter, 35);
+        assert_eq!(m.post_ransac, 8);
+        // Keypoint figures are the minimum across the frames.
+        assert_eq!(m.keypoints_left, 80);
+        assert_eq!(m.keypoints_right, 90);
     }
 }
