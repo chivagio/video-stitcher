@@ -20,6 +20,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type {
+  CalibrationDiagnosis,
   CalibrationOptions,
   CalibrationStage,
   Scorecard,
@@ -135,6 +136,8 @@ class CalibrationStore {
   result = $state<Scorecard | null>(null);
   /** The typed failure text when `status === "failed"`. */
   error = $state<string | null>(null);
+  /** The plain-language failure diagnosis (CALB-04) when `status === "failed"`. */
+  diagnosis = $state<CalibrationDiagnosis | null>(null);
 
   /** Wall-clock time of the last heartbeat tick (for the "last update" line). */
   #lastHeartbeatAt: number | null = null;
@@ -192,6 +195,16 @@ class CalibrationStore {
         this.fraction = 1;
         this.status = "done";
         this.error = null;
+        this.diagnosis = null;
+        this.#stopClock();
+        break;
+      }
+      case "calibration_failed": {
+        // CALB-04: the worker authors the plain-language cause/fix in Rust; the
+        // store only stores the typed diagnosis and marks the run failed.
+        this.diagnosis = event.data.diagnosis;
+        this.error = event.data.diagnosis.cause;
+        this.status = "failed";
         this.#stopClock();
         break;
       }
@@ -276,6 +289,7 @@ class CalibrationStore {
     this.activeStage = null;
     this.result = null;
     this.error = null;
+    this.diagnosis = null;
     this.#lastHeartbeatAt = null;
   }
 

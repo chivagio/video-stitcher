@@ -30,7 +30,7 @@ use reco_core::calibration::CameraParams;
 use reco_core::gpu::{GpuContext, GpuError};
 use reco_io::ffmpeg::calibration_io::{self, CalibrationIoError};
 
-use crate::error::CalibrateError;
+use crate::error::{CalibrateError, CalibrationFailure};
 use crate::pipeline::{CalibrationPipeline, VideoInfo};
 use crate::types::{CalibrationConfig, CalibrationProgress, CalibrationResult, CalibrationStep};
 
@@ -79,6 +79,15 @@ pub enum CalibrateVideosError {
     #[error("calibration: {0}")]
     Calibrate(#[from] CalibrateError),
 
+    /// Calibration failed with a typed diagnostic (CALB-04).
+    ///
+    /// Carries the failing [`CalibrationFailure`]: the source error, the active
+    /// step, and the partial per-frame metrics accumulated before failure. The
+    /// host maps this to a plain-language diagnosis; the structure is preserved
+    /// rather than flattened at this boundary.
+    #[error("calibration: {}", .0.error)]
+    Diagnostic(CalibrationFailure),
+
     /// No frames could be extracted from the videos.
     #[error("no frames extracted from videos")]
     NoFrames,
@@ -95,6 +104,7 @@ const _: fn() = || {
     fn assert_clone_send_sync<T: Clone + Send + Sync + 'static>() {}
     assert_clone_send_sync::<CalibrateVideosError>();
     assert_clone_send_sync::<crate::error::CalibrateError>();
+    assert_clone_send_sync::<crate::error::CalibrationFailure>();
 };
 
 /// Check the interrupted flag and return `Cancelled` if set.
@@ -346,7 +356,9 @@ pub fn calibrate_videos_with_gpu(
     );
     log::info!("GPU: {}", gpu.gpu_name());
 
-    let result = pipeline.calibrate_with_progress(gpu, &frame_pairs, on_progress)?;
+    let result = pipeline
+        .calibrate_with_progress(gpu, &frame_pairs, on_progress)
+        .map_err(CalibrateVideosError::Diagnostic)?;
     Ok(result)
 }
 

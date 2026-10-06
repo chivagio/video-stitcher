@@ -260,6 +260,16 @@ impl EventSink {
         let _ = self.tx.send(WorkerEvent::CalibrationResult { scorecard });
     }
 
+    /// Emit a typed calibration failure with a plain-language diagnosis (CALB-04).
+    ///
+    /// Mirrored to the process log at ERROR so a headless run shows the same
+    /// cause the webview panel renders; the typed event carries the full
+    /// cause/fix/metrics for the `worker-event-typed` channel.
+    fn failed_diagnosis(&self, diagnosis: crate::events::CalibrationDiagnosis) {
+        log::error!("calibration failed: {}", diagnosis.cause);
+        let _ = self.tx.send(WorkerEvent::CalibrationFailed { diagnosis });
+    }
+
     /// Emit that a profile was loaded (IMPT-05).
     fn profile_loaded(&self, path: impl Into<String>) {
         let _ = self
@@ -2122,12 +2132,49 @@ impl EngineBackend for GpuEngineBackend {
                 Ok(())
             }
             Err(e) => {
+                // Map the typed failure to a plain-language diagnosis BEFORE it
+                // could be flattened to a string (RESEARCH Pitfall 2 / CALB-04).
+                use crate::events::{CalibrationDiagnosis, StageStatus};
+                use reco_calibrate::video::CalibrateVideosError;
+
+                let last_stage = detail
+                    .lock()
+                    .map(|guard| guard.0)
+                    .unwrap_or(crate::events::CalibrationStage::Probing);
+
+                let diagnosis = match &e {
+                    CalibrateVideosError::Diagnostic(failure) => {
+                        crate::calibration::diagnose_calibration_failure(
+                            &failure.error,
+                            crate::calibration::stage_from_step(failure.step),
+                            &failure.frames,
+                        )
+                    }
+                    CalibrateVideosError::Calibrate(error) => {
+                        crate::calibration::diagnose_calibration_failure(error, last_stage, &[])
+                    }
+                    // I/O, GPU, or no-frames: the raw typed Display text plus a
+                    // generic next step — never a fabricated cause.
+                    other => {
+                        let raw = other.to_string();
+                        CalibrationDiagnosis {
+                            cause: raw.clone(),
+                            fix: "Check that both clips import and decode cleanly, then try again."
+                                .to_string(),
+                            raw_error: raw,
+                            stage: last_stage,
+                            metrics: crate::events::DiagnosisMetrics::default(),
+                        }
+                    }
+                };
+
                 events.stage(
-                    crate::events::CalibrationStage::Probing,
-                    crate::events::StageStatus::Failed,
-                    e.to_string(),
+                    diagnosis.stage,
+                    StageStatus::Failed,
+                    diagnosis.cause.clone(),
                 );
-                Err(WorkerError::Engine(e.to_string()))
+                events.failed_diagnosis(diagnosis);
+                Ok(())
             }
         }
     }

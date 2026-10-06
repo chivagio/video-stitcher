@@ -39,11 +39,11 @@ use std::path::Path;
 use reco_core::calibration::CameraParams;
 use reco_core::gpu::GpuContext;
 
-use crate::error::CalibrateError;
+use crate::error::{CalibrateError, CalibrationFailure};
 use crate::telemetry::TelemetryData;
 use crate::types::{
-    CalibrationConfig, CalibrationProgress, CalibrationResult, LensProfileInfo, SyncInfo,
-    SyncMethod, YuvFrame,
+    CalibrationConfig, CalibrationProgress, CalibrationResult, CalibrationStep, LensProfileInfo,
+    SyncInfo, SyncMethod, YuvFrame,
 };
 use crate::{audio_sync, lens_database, sampling, telemetry};
 
@@ -481,29 +481,39 @@ impl CalibrationPipeline {
         frames: &[(YuvFrame, YuvFrame)],
     ) -> Result<CalibrationResult, CalibrateError> {
         self.calibrate_with_progress(gpu, frames, &mut |_| {})
+            .map_err(|failure| failure.error)
     }
 
     /// Run the calibration pipeline on extracted frame pairs, reporting
     /// progress through `on_progress` (CALB-01 / D3-09).
     ///
-    /// Forwards to [`crate::calibrate_with_progress`], which emits
+    /// Forwards to [`crate::calibrate_with_progress_diagnostic`], which emits
     /// [`crate::CalibrationStep::Undistorting`] per frame and
     /// [`crate::CalibrationStep::Optimizing`] before the solver, and then
     /// attaches this pipeline's sync provenance to the result.
+    ///
+    /// On failure the returned [`CalibrationFailure`] carries the failing step
+    /// and the partial `FrameMatches` accumulated before it (CALB-04).
     pub fn calibrate_with_progress(
         &self,
         gpu: &GpuContext,
         frames: &[(YuvFrame, YuvFrame)],
         on_progress: &mut dyn FnMut(&CalibrationProgress),
-    ) -> Result<CalibrationResult, CalibrateError> {
+    ) -> Result<CalibrationResult, CalibrationFailure> {
         let left_params = self.left_params.as_ref().ok_or_else(|| {
-            CalibrateError::InvalidConfig(
-                "lens profiles not set - call detect_profiles() or set_profiles() first".into(),
+            CalibrationFailure::at_step(
+                CalibrateError::InvalidConfig(
+                    "lens profiles not set - call detect_profiles() or set_profiles() first".into(),
+                ),
+                CalibrationStep::FeatureMatching,
             )
         })?;
         let right_params = self.right_params.as_ref().ok_or_else(|| {
-            CalibrateError::InvalidConfig(
-                "lens profiles not set - call detect_profiles() or set_profiles() first".into(),
+            CalibrationFailure::at_step(
+                CalibrateError::InvalidConfig(
+                    "lens profiles not set - call detect_profiles() or set_profiles() first".into(),
+                ),
+                CalibrationStep::FeatureMatching,
             )
         })?;
 
@@ -527,7 +537,7 @@ impl CalibrationPipeline {
             }
         }
 
-        let mut result = crate::calibrate_with_progress(
+        let mut result = crate::calibrate_with_progress_diagnostic(
             gpu,
             frames,
             left_params,

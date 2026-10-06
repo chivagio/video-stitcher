@@ -86,7 +86,7 @@ pub use defaults::{
     AkazeDetector, HammingMatcher, NoOpFilter, RawReprojectionCost, SeamWeightedCost,
     YDisparityFilter,
 };
-pub use error::CalibrateError;
+pub use error::{CalibrateError, CalibrationFailure};
 pub use traits::{CostFunction, FeatureDetector, FeatureMatcher, PointFilter};
 pub use types::{
     AkazeConfig, CalibrationConfig, CalibrationProgress, CalibrationQuality, CalibrationResult,
@@ -301,6 +301,26 @@ pub fn calibrate_with_progress(
     config: &CalibrationConfig,
     on_progress: &mut dyn FnMut(&CalibrationProgress),
 ) -> Result<CalibrationResult, CalibrateError> {
+    calibrate_with_progress_diagnostic(gpu, frames, left_params, right_params, config, on_progress)
+        .map_err(|failure| failure.error)
+}
+
+/// Run the full calibration pipeline, returning a typed [`CalibrationFailure`]
+/// on error (CALB-04).
+///
+/// Identical to [`calibrate_with_progress`], but the error carries the failing
+/// [`CalibrationStep`] and the partial `FrameMatches` accumulated before the
+/// failure instead of a bare [`CalibrateError`]. The host maps it to a
+/// plain-language diagnosis; callers that only want the error use
+/// [`calibrate_with_progress`].
+pub fn calibrate_with_progress_diagnostic(
+    gpu: &GpuContext,
+    frames: &[(YuvFrame, YuvFrame)],
+    left_params: &CameraParams,
+    right_params: &CameraParams,
+    config: &CalibrationConfig,
+    on_progress: &mut dyn FnMut(&CalibrationProgress),
+) -> Result<CalibrationResult, CalibrationFailure> {
     let detector = defaults::AkazeDetector::new(config.akaze.threshold);
     let matcher = defaults::HammingMatcher::new(config.matching.lowe_ratio);
     let filter = defaults::NoOpFilter;
@@ -358,6 +378,7 @@ pub fn calibrate_with(
         point_filter,
         &mut |_| {},
     )
+    .map_err(|failure| failure.error)
 }
 
 /// Shared implementation behind [`calibrate`], [`calibrate_with`], and
@@ -366,6 +387,9 @@ pub fn calibrate_with(
 /// Emits [`CalibrationStep::Undistorting`] before each frame's GPU
 /// undistort and [`CalibrationStep::Optimizing`] before the optimizer
 /// solves through `on_progress`.
+///
+/// On failure it returns a [`CalibrationFailure`] carrying the failing step and
+/// the partial `FrameMatches` so the host can explain the failure (CALB-04).
 #[allow(clippy::too_many_arguments)]
 fn calibrate_impl(
     gpu: &GpuContext,
@@ -377,19 +401,27 @@ fn calibrate_impl(
     matcher: &dyn traits::FeatureMatcher,
     point_filter: &dyn traits::PointFilter,
     on_progress: &mut dyn FnMut(&CalibrationProgress),
-) -> Result<CalibrationResult, CalibrateError> {
-    config.validate()?;
+) -> Result<CalibrationResult, CalibrationFailure> {
+    config
+        .validate()
+        .map_err(|e| CalibrationFailure::at_step(e, CalibrationStep::FeatureMatching))?;
 
     // Create GPU undistort pipelines for each camera's resolution
     let (lw, lh) = if let Some((left, _)) = frames.first() {
         (left.width, left.height)
     } else {
-        return Err(CalibrateError::NoUsableFrames);
+        return Err(CalibrationFailure::at_step(
+            CalibrateError::NoUsableFrames,
+            CalibrationStep::FeatureMatching,
+        ));
     };
     let (rw, rh) = if let Some((_, right)) = frames.first() {
         (right.width, right.height)
     } else {
-        return Err(CalibrateError::NoUsableFrames);
+        return Err(CalibrationFailure::at_step(
+            CalibrateError::NoUsableFrames,
+            CalibrationStep::FeatureMatching,
+        ));
     };
 
     // Validate that frame dimensions are nonzero to prevent division-by-zero
@@ -402,7 +434,10 @@ fn calibrate_impl(
             rw,
             rh
         );
-        return Err(CalibrateError::NoUsableFrames);
+        return Err(CalibrationFailure::at_step(
+            CalibrateError::NoUsableFrames,
+            CalibrationStep::Undistorting,
+        ));
     }
     let left_aspect = lw as f32 / lh as f32;
     let right_aspect = rw as f32 / rh as f32;
@@ -447,7 +482,11 @@ fn calibrate_impl(
     }
 
     if successful_frames.is_empty() {
-        return Err(CalibrateError::NoUsableFrames);
+        return Err(CalibrationFailure::new(
+            CalibrateError::NoUsableFrames,
+            CalibrationStep::Undistorting,
+            successful_frames,
+        ));
     }
 
     let frames_used = successful_frames.len();
@@ -488,10 +527,14 @@ fn calibrate_impl(
     }
 
     if total_matches < config.matching.min_matches {
-        return Err(CalibrateError::InsufficientMatches {
-            got: total_matches,
-            min: config.matching.min_matches,
-        });
+        return Err(CalibrationFailure::new(
+            CalibrateError::InsufficientMatches {
+                got: total_matches,
+                min: config.matching.min_matches,
+            },
+            CalibrationStep::Undistorting,
+            successful_frames,
+        ));
     }
 
     // Single-pass optimization on all points with trimmed cost.
@@ -505,7 +548,7 @@ fn calibrate_impl(
     }
     .map_err(|e| {
         log::error!("optimization failed: {e}");
-        e
+        CalibrationFailure::new(e, CalibrationStep::Optimizing, successful_frames.clone())
     })?;
 
     let confidence = (total_matches as f64 / FULL_CONFIDENCE_MATCHES).min(1.0);

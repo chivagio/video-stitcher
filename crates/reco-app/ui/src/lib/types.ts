@@ -145,6 +145,26 @@ export interface Scorecard {
   sync: SyncView;
 }
 
+/** Aggregated per-frame match metrics on a failure diagnosis (mirror `events::DiagnosisMetrics`). */
+export interface DiagnosisMetrics {
+  frames_used: number;
+  total_matches: number;
+  post_ratio_test: number;
+  post_spatial_filter: number;
+  post_ransac: number;
+  keypoints_left: number;
+  keypoints_right: number;
+}
+
+/** A plain-language calibration failure diagnosis (mirror `events::CalibrationDiagnosis`). */
+export interface CalibrationDiagnosis {
+  cause: string;
+  fix: string;
+  raw_error: string;
+  stage: CalibrationStage;
+  metrics: DiagnosisMetrics;
+}
+
 /** Advanced calibration options (mirror `events::CalibrationOptions`). */
 export interface CalibrationOptions {
   num_frames: number | null;
@@ -179,6 +199,7 @@ export type WorkerEventTyped =
       data: { elapsed_ms: number; step: CalibrationStage; last_detail: string };
     }
   | { kind: "calibration_result"; data: { scorecard: Scorecard } }
+  | { kind: "calibration_failed"; data: { diagnosis: CalibrationDiagnosis } }
   | { kind: "profile_loaded"; data: { path: string } }
   | { kind: "profile_saved"; data: { path: string } }
   | { kind: "result_invalidated"; data: null }

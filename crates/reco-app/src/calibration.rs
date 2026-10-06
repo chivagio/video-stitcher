@@ -9,15 +9,17 @@
 //!
 //! Typed `thiserror` errors only; this module deliberately imports no `anyhow`.
 
+use reco_calibrate::error::CalibrateError;
 use reco_calibrate::types::{
-    CalibrationConfig, CalibrationResult, CalibrationStep, LensProfileInfo, ProfileSource,
-    SyncMethod as EngineSyncMethod,
+    CalibrationConfig, CalibrationResult, CalibrationStep, FrameMatches, LensProfileInfo,
+    ProfileSource, SyncMethod as EngineSyncMethod,
 };
 use reco_core::calibration::CameraParams;
 
 use crate::events::{
-    CalibrationOptions, CalibrationStage, CompatibilityCode, CompatibilityIssue, ConfidenceBand,
-    InputMetadata, LensProfileView, Scorecard, SyncMethod, SyncView,
+    CalibrationDiagnosis, CalibrationOptions, CalibrationStage, CompatibilityCode,
+    CompatibilityIssue, ConfidenceBand, DiagnosisMetrics, InputMetadata, LensProfileView,
+    Scorecard, SyncMethod, SyncView,
 };
 
 /// The advisory compatibility findings for the two selected inputs (IMPT-03).
@@ -125,6 +127,62 @@ pub fn stage_from_step(step: CalibrationStep) -> CalibrationStage {
         CalibrationStep::Undistorting => CalibrationStage::Undistorting,
         CalibrationStep::FeatureMatching => CalibrationStage::FeatureMatching,
         CalibrationStep::Optimizing => CalibrationStage::Optimizing,
+    }
+}
+
+/// Aggregate per-frame match metrics for a failure diagnosis (CALB-04 / T-04-03).
+///
+/// Only counters cross the channel — never the raw match points — so a large
+/// partial `FrameMatches` set cannot bloat the worker event (T-04-03). The
+/// `keypoints_*` figures are the **minimum** across the frames that produced
+/// matches (the weakest frame bounds the run); the other counters are sums;
+/// `frames_used` is the frame count. Everything is zero when `frames` is empty.
+fn aggregate_diagnosis_metrics(frames: &[FrameMatches]) -> DiagnosisMetrics {
+    let sum = |f: fn(&FrameMatches) -> usize| frames.iter().map(f).sum::<usize>();
+    DiagnosisMetrics {
+        frames_used: frames.len(),
+        total_matches: sum(|fm| fm.points.len()),
+        post_ratio_test: sum(|fm| fm.post_ratio_test),
+        post_spatial_filter: sum(|fm| fm.post_spatial_filter),
+        post_ransac: sum(|fm| fm.post_ransac),
+        keypoints_left: frames.iter().map(|fm| fm.keypoints_left).min().unwrap_or(0),
+        keypoints_right: frames
+            .iter()
+            .map(|fm| fm.keypoints_right)
+            .min()
+            .unwrap_or(0),
+    }
+}
+
+/// Map a typed engine failure to a plain-language cause and suggested fix
+/// (CALB-04).
+///
+/// Pure (no device/file/channel): the worker calls this before the diagnosis
+/// crosses the event channel, and the frontend only renders the result. Every
+/// error variant gets a specific cause; the fallback variants use the typed
+/// `Display` text plus a generic next step, never a fabricated cause.
+pub fn diagnose_calibration_failure(
+    source: &CalibrateError,
+    stage: CalibrationStage,
+    frames: &[FrameMatches],
+) -> CalibrationDiagnosis {
+    let metrics = aggregate_diagnosis_metrics(frames);
+    let (cause, fix) = match source {
+        CalibrateError::NoUsableFrames => (
+            "No frame pair produced usable matches.".to_string(),
+            "Increase overlap between the cameras and set the lens profile.".to_string(),
+        ),
+        other => (
+            other.to_string(),
+            "Check the clips and settings, then try again.".to_string(),
+        ),
+    };
+    CalibrationDiagnosis {
+        cause,
+        fix,
+        raw_error: source.to_string(),
+        stage,
+        metrics,
     }
 }
 
@@ -491,6 +549,25 @@ mod tests {
         assert_eq!(
             defaults.config.unwrap().num_frames,
             default_config.num_frames
+        );
+    }
+
+    #[test]
+    fn diagnose_calibration_failure_produces_a_non_empty_cause_and_fix() {
+        // CALB-04: a failed run yields a non-empty plain-language cause and fix,
+        // never a bare code and never a blank.
+        let diagnosis = diagnose_calibration_failure(
+            &CalibrateError::NoUsableFrames,
+            CalibrationStage::FeatureMatching,
+            &[],
+        );
+        assert!(!diagnosis.cause.is_empty(), "cause must not be empty");
+        assert!(!diagnosis.fix.is_empty(), "fix must not be empty");
+        assert_eq!(diagnosis.stage, CalibrationStage::FeatureMatching);
+        assert_eq!(diagnosis.metrics.frames_used, 0);
+        assert_eq!(
+            diagnosis.raw_error,
+            "no usable frame pairs (all frames failed matching)"
         );
     }
 }

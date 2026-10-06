@@ -17,6 +17,7 @@
   import CalibrationProgress from "./CalibrationProgress.svelte";
   import AdvancedDisclosure from "./AdvancedDisclosure.svelte";
   import Scorecard from "./Scorecard.svelte";
+  import FailurePanel from "./FailurePanel.svelte";
 
   let {
     onRequestCancel,
@@ -58,18 +59,11 @@
       <header class="screen-header">
         <h2 class="screen-title">Calibration failed</h2>
       </header>
-      <p class="failure-body">
-        {calibration.error ?? "Unknown error"}. Try again, or go back to Import to
-        change the clips.
-      </p>
-      <div class="actions">
-        <ActionButton variant="primary" onClick={handleStart}>
-          Try again
-        </ActionButton>
-        <ActionButton variant="secondary" onClick={onBackToImport}>
-          Back to import
-        </ActionButton>
-      </div>
+      <FailurePanel
+        diagnosis={calibration.diagnosis}
+        onTryAgain={handleStart}
+        onBackToImport={onBackToImport}
+      />
     {:else}
       <header class="screen-header">
         <h2 class="screen-title">
@@ -152,13 +146,6 @@
     margin: var(--space-sm) 0 0;
     color: var(--color-log-info);
     max-width: 60ch;
-  }
-
-  .failure-body {
-    margin: 0;
-    color: var(--color-log-error);
-    overflow-wrap: anywhere;
-    max-width: 72ch;
   }
 
   .disabled-hint {

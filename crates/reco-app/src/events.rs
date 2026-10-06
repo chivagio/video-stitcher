@@ -231,6 +231,51 @@ pub enum StageStatus {
     Skipped,
 }
 
+/// Aggregated per-frame match metrics attached to a failure diagnosis (CALB-04).
+///
+/// Counters are summed across the frames that produced matches before the
+/// failure; `keypoints_left` / `keypoints_right` are the minimum across those
+/// frames (the weakest frame bounds the run). `frames_used` is the number of
+/// frame pairs that produced matches. Everything is zero when the run failed
+/// before any frame matched — an honest zero, never a fabricated number.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DiagnosisMetrics {
+    /// Frame pairs that produced matches before the failure.
+    pub frames_used: usize,
+    /// Matched point pairs summed across those frames.
+    pub total_matches: usize,
+    /// Matches summed across frames that survived the ratio test.
+    pub post_ratio_test: usize,
+    /// Matches summed across frames that survived the spatial filter.
+    pub post_spatial_filter: usize,
+    /// Matches summed across frames that survived RANSAC.
+    pub post_ransac: usize,
+    /// Minimum keypoints detected in the left image across those frames.
+    pub keypoints_left: usize,
+    /// Minimum keypoints detected in the right image across those frames.
+    pub keypoints_right: usize,
+}
+
+/// A plain-language explanation of a calibration failure (CALB-04).
+///
+/// Authored in Rust on the host (`calibration::diagnose_calibration_failure`)
+/// from the typed engine error and stage metrics. The frontend renders `cause`
+/// and `fix` verbatim and never invents a cause; `raw_error` and `metrics`
+/// populate the collapsed Technical detail (RESEARCH Pattern 1 / D-06).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CalibrationDiagnosis {
+    /// Plain-language cause (`What happened`).
+    pub cause: String,
+    /// Suggested next step (`What to try`).
+    pub fix: String,
+    /// The raw typed error's `Display` text for the technical disclosure.
+    pub raw_error: String,
+    /// The pipeline stage that was active when the failure occurred.
+    pub stage: CalibrationStage,
+    /// Aggregated per-frame match metrics (all zero when none were collected).
+    pub metrics: DiagnosisMetrics,
+}
+
 /// Which path produced a calibration's temporal offset (CALB-03 / D3-14).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -486,6 +531,17 @@ pub enum WorkerEvent {
         scorecard: Scorecard,
     },
 
+    /// A calibration run failed with a plain-language diagnosis (CALB-04).
+    ///
+    /// Carries the typed [`CalibrationDiagnosis`] so the Calibrate screen can
+    /// render a cause/fix panel plus a collapsed technical detail — never a bare
+    /// error code. Also projected to an ERROR [`LogLine`] whose message is the
+    /// diagnosis cause.
+    CalibrationFailed {
+        /// The plain-language cause/fix plus the raw error and metrics.
+        diagnosis: CalibrationDiagnosis,
+    },
+
     /// A profile was loaded from disk (IMPT-05).
     ProfileLoaded {
         /// The path that was loaded.
@@ -673,6 +729,12 @@ impl WorkerEvent {
                     "calibration result: confidence {:.0}%",
                     scorecard.confidence * 100.0
                 ),
+            },
+            WorkerEvent::CalibrationFailed { diagnosis } => LogLine {
+                level: Level::Error,
+                // The cause is already user-facing (authored in Rust on the
+                // diagnosis) — the frontend renders it verbatim (CALB-04).
+                message: diagnosis.cause.clone(),
             },
             WorkerEvent::ProfileLoaded { path } => LogLine {
                 level: Level::Info,
@@ -1218,5 +1280,48 @@ mod tests {
             WorkerEvent::ResultInvalidated.to_log_line().level,
             Level::Warn
         );
+    }
+
+    #[test]
+    fn calibration_failed_roundtrips_and_projects_to_an_error_line() {
+        // CALB-04: a failed calibration crosses as a typed diagnosis whose cause
+        // and fix are already user-facing, plus the raw error and metrics for the
+        // technical disclosure. The frontend renders it; it never invents a cause.
+        let diagnosis = CalibrationDiagnosis {
+            cause: "No frame pair produced usable matches.".to_string(),
+            fix: "Increase overlap between the cameras and set the lens profile.".to_string(),
+            raw_error: "no usable frame pairs (all frames failed matching)".to_string(),
+            stage: CalibrationStage::Undistorting,
+            metrics: DiagnosisMetrics {
+                frames_used: 0,
+                total_matches: 0,
+                post_ratio_test: 0,
+                post_spatial_filter: 0,
+                post_ransac: 0,
+                keypoints_left: 0,
+                keypoints_right: 0,
+            },
+        };
+        let event = WorkerEvent::CalibrationFailed {
+            diagnosis: diagnosis.clone(),
+        };
+
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(
+            json.contains("\"kind\":\"calibration_failed\""),
+            "unexpected json: {json}"
+        );
+        assert!(
+            json.contains("\"diagnosis\""),
+            "the diagnosis must ride under `data.diagnosis`: {json}"
+        );
+        let back: WorkerEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(event, back);
+        assert_eq!(back, WorkerEvent::CalibrationFailed { diagnosis });
+
+        // The log projection is an ERROR line whose message is the cause text.
+        let line = event.to_log_line();
+        assert_eq!(line.level, Level::Error);
+        assert_eq!(line.message, "No frame pair produced usable matches.");
     }
 }
