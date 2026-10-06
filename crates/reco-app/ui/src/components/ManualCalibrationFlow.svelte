@@ -12,6 +12,7 @@
   import FramePickStep from "./FramePickStep.svelte";
   import PinEditorStep from "./PinEditorStep.svelte";
   import BendStep from "./BendStep.svelte";
+  import ValidateStep from "./ValidateStep.svelte";
   import SolveStatus from "./SolveStatus.svelte";
   import ActionButton from "./ActionButton.svelte";
   import InlineNotice from "./InlineNotice.svelte";
@@ -84,6 +85,8 @@
       <PinEditorStep />
     {:else if manual.step === "bend"}
       <BendStep />
+    {:else if manual.step === "validate"}
+      <ValidateStep />
     {:else}
       <div class="step-placeholder">
         <p class="placeholder-text">
