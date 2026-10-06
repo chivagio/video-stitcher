@@ -109,6 +109,21 @@ use types::{FrameMatches, MatchedPoint};
 /// reliably produce sub-pixel calibration.
 const FULL_CONFIDENCE_MATCHES: f64 = 50.0;
 
+/// Exposure-normalize an undistorted RGBA frame pair in linear light.
+///
+/// (RED stub — implementation added in the GREEN step.)
+#[allow(clippy::too_many_arguments)]
+fn normalize_exposure(
+    _left: &mut [u8],
+    _right: &mut [u8],
+    _lw: u32,
+    _lh: u32,
+    _rw: u32,
+    _rh: u32,
+    _cfg: &MatchConfig,
+) {
+}
+
 /// Process an undistorted RGBA frame pair through the feature matching pipeline.
 ///
 /// Takes pre-undistorted RGBA data (from GPU phase) and runs feature
@@ -607,4 +622,90 @@ fn calibrate_impl(
             offset_frames: 0,
         },
     })
+}
+
+#[cfg(test)]
+mod exposure_tests {
+    use super::*;
+
+    /// Build a tightly-packed RGBA buffer filled with one gray level.
+    fn uniform_rgba(w: u32, h: u32, gray: u8) -> Vec<u8> {
+        (0..w as usize * h as usize)
+            .flat_map(|_| [gray, gray, gray, 255u8])
+            .collect()
+    }
+
+    /// Mean linear luminance of an RGBA buffer, for assertions.
+    fn mean_linear(rgba: &[u8]) -> f64 {
+        let n = rgba.len() / 4;
+        let sum: f64 = (0..n)
+            .map(|i| (rgba[i * 4] as f64 / 255.0).powf(2.2))
+            .sum();
+        sum / n as f64
+    }
+
+    #[test]
+    fn normalizes_two_frames_toward_a_comparable_mean() {
+        let (w, h) = (64u32, 64u32);
+        let mut left = uniform_rgba(w, h, 100);
+        let mut right = uniform_rgba(w, h, 200);
+        let before = (mean_linear(&left) - mean_linear(&right)).abs();
+
+        normalize_exposure(&mut left, &mut right, w, h, w, h, &MatchConfig::default());
+
+        let after = (mean_linear(&left) - mean_linear(&right)).abs();
+        assert!(
+            after < before * 0.1,
+            "means should converge: before={before:.4}, after={after:.4}"
+        );
+    }
+
+    #[test]
+    fn identical_frames_are_unchanged() {
+        let (w, h) = (32u32, 32u32);
+        let original = uniform_rgba(w, h, 128);
+        let mut left = original.clone();
+        let mut right = original.clone();
+
+        normalize_exposure(&mut left, &mut right, w, h, w, h, &MatchConfig::default());
+
+        assert_eq!(left, original, "unit gain must leave the left frame unchanged");
+        assert_eq!(right, original, "unit gain must leave the right frame unchanged");
+    }
+
+    #[test]
+    fn uniform_black_frame_is_passed_through() {
+        let (w, h) = (32u32, 32u32);
+        let mut left = uniform_rgba(w, h, 0);
+        let mut right = uniform_rgba(w, h, 180);
+        let left_before = left.clone();
+        let right_before = right.clone();
+
+        // Must not divide by zero; the black frame stays black.
+        normalize_exposure(&mut left, &mut right, w, h, w, h, &MatchConfig::default());
+
+        assert_eq!(left, left_before, "black frame must pass through unchanged");
+        assert_eq!(
+            right, right_before,
+            "no normalization when a frame is too dark to trust"
+        );
+    }
+
+    #[test]
+    fn disabled_normalization_leaves_frames_untouched() {
+        let (w, h) = (32u32, 32u32);
+        let mut left = uniform_rgba(w, h, 40);
+        let mut right = uniform_rgba(w, h, 220);
+        let left_before = left.clone();
+        let right_before = right.clone();
+        let cfg = MatchConfig {
+            exposure_normalize: false,
+            ..Default::default()
+        };
+
+        normalize_exposure(&mut left, &mut right, w, h, w, h, &cfg);
+
+        assert_eq!(left, left_before);
+        assert_eq!(right, right_before);
+    }
 }

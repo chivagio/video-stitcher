@@ -149,6 +149,27 @@ pub struct MatchConfig {
     pub max_y_disparity: f64,
     /// RANSAC inlier threshold (Sampson error).
     pub ransac_threshold: f64,
+    /// Exposure-normalize the undistorted frame pair before feature
+    /// detection (CALB-07). Computed in linear light from downsampled
+    /// statistics; no new dependency. Default `true`.
+    #[serde(default = "default_true")]
+    pub exposure_normalize: bool,
+    /// Nominal mid-tone target for exposure normalization, in linear light
+    /// (`0.0..=1.0`). Frames whose mean linear luminance is below a small
+    /// fraction of this are treated as too dark to normalize and are passed
+    /// through unchanged. Default `0.5`.
+    #[serde(default = "default_exposure_target")]
+    pub exposure_target: f64,
+}
+
+/// Serde default helper: `true`.
+fn default_true() -> bool {
+    true
+}
+
+/// Serde default helper: the linear-light exposure target.
+fn default_exposure_target() -> f64 {
+    0.5
 }
 
 impl Default for MatchConfig {
@@ -162,6 +183,8 @@ impl Default for MatchConfig {
             spatial_y_high: 0.8,
             max_y_disparity: 0.08,
             ransac_threshold: 1.0,
+            exposure_normalize: true,
+            exposure_target: 0.5,
         }
     }
 }
@@ -340,6 +363,12 @@ impl CalibrationConfig {
             return Err(CalibrateError::InvalidConfig(format!(
                 "seam_sigma must be > 0, got {}",
                 self.optimizer.seam_sigma
+            )));
+        }
+        if !(self.matching.exposure_target > 0.0 && self.matching.exposure_target <= 1.0) {
+            return Err(CalibrateError::InvalidConfig(format!(
+                "exposure_target must be in (0, 1], got {}",
+                self.matching.exposure_target
             )));
         }
         Ok(())
