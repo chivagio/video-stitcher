@@ -419,6 +419,10 @@ pub fn optimize_intrinsics(
         trim_fraction: cfg.trim_fraction,
         k1_bounds: (lo, hi),
     };
+    // Kept to report the true (unpenalized) reprojection error at the optimum:
+    // Nelder-Mead's best cost includes the bounds penalty, which inflates the
+    // value whenever a solution lands on a bound (IN-01).
+    let residual_cost = cost.clone();
 
     // 1-D simplex: two vertices around the profile's current k1.
     let start = left_base.d[0].clamp(lo, hi);
@@ -450,14 +454,18 @@ pub fn optimize_intrinsics(
     // held-out guard fields are populated by [`refine_intrinsics`]. There is no
     // fit/held-out split here, so the two held-out fields mirror the fit
     // residual and the result is reported as accepted.
-    let best_cost = result.state().get_best_cost();
+    //
+    // Report the *unpenalized* reprojection error: `get_best_cost()` includes
+    // the bounds penalty, which inflates the value when the optimum sits on a
+    // bound (IN-01).
+    let residual = residual_cost.error(best[0]);
     Ok(IntrinsicsRefinement {
         k1: best[0],
-        residual: best_cost,
+        residual,
         accepted: true,
         reason: RefinementReason::Accepted,
-        heldout_baseline: best_cost,
-        heldout_refined: best_cost,
+        heldout_baseline: residual,
+        heldout_refined: residual,
     })
 }
 
@@ -1324,6 +1332,51 @@ mod tests {
         assert_eq!(base.d[3], base_before.d[3]);
         // The refined k1 stays inside the configured bound.
         assert!((refinement.k1 - base.d[0]).abs() <= IntrinsicsConfig::default().k1_bound + 1e-9);
+    }
+
+    /// IN-01: `IntrinsicsCost::cost` adds the bounds penalty while `error`
+    /// reports the true reprojection error, so `optimize_intrinsics` can report
+    /// an unpenalized `residual`.
+    #[test]
+    fn cost_penalizes_out_of_bounds_but_error_does_not() {
+        let t = truth();
+        let base = camera_params(0.0);
+        let raw = observation_pool(&t, 0.15, 60, 1, 0.0);
+        let layout = layout_from(&t);
+        let layout_params = OptParams::from_5param(&[
+            layout.x_ty,
+            layout.intersect,
+            layout.camera_axis_offset,
+            layout.x_rz,
+            layout.z_rx,
+        ]);
+        let bounds = (-0.1_f64, 0.1_f64);
+        let cost = IntrinsicsCost {
+            points: &raw,
+            left_base: &base,
+            right_base: &base,
+            layout: layout_params,
+            left_wh: (LW, LH),
+            right_wh: (RW, RH),
+            sigma: 0.08,
+            trim_fraction: 0.0,
+            k1_bounds: bounds,
+        };
+
+        let inside = 0.05_f64;
+        assert!(
+            (cost.error(inside) - cost.cost(&vec![inside]).unwrap()).abs() < 1e-12,
+            "inside the bound the penalty must be zero"
+        );
+
+        let outside = 0.2_f64;
+        let penalized = cost.cost(&vec![outside]).unwrap();
+        let unpenalized = cost.error(outside);
+        let expected = BOUNDS_PENALTY_SCALE * (outside - bounds.1).powi(2);
+        assert!(
+            (penalized - unpenalized - expected).abs() < 1e-6,
+            "cost must add exactly the quadratic penalty: {penalized} vs {unpenalized} + {expected}"
+        );
     }
 
     /// WR-02: `raw_to_matched_point` maps each camera's raw pixel with its OWN
