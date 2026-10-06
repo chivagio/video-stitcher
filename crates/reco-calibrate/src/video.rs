@@ -493,5 +493,14 @@ mod tests {
             estimate.confidence.is_finite(),
             "a real estimate must carry a finite confidence: {estimate:?}"
         );
+        assert!(
+            (0.0..=1.0).contains(&estimate.confidence),
+            "the confidence must be a normalized coefficient in [0, 1], got {}",
+            estimate.confidence
+        );
+        eprintln!(
+            "real audio sync: offset_frames={} confidence={:.3}",
+            estimate.offset_frames, estimate.confidence
+        );
     }
 }

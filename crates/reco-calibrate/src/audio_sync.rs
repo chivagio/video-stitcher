@@ -28,7 +28,14 @@ pub struct SyncResult {
     /// Offset in seconds. Positive means right recording started later
     /// (right needs to advance more to sync with left).
     pub offset_secs: f64,
-    /// Peak cross-correlation value (higher = more confident).
+    /// Peak cross-correlation confidence in `[0, 1]`.
+    ///
+    /// This is the normalized cross-correlation coefficient at the best lag
+    /// (the raw correlation peak divided by the number of overlapping
+    /// samples), so callers can treat it as a probability-like confidence:
+    /// `1.0` = identical signals at this lag, `0.0` = no correlation. Earlier
+    /// revisions returned the raw, unnormalized peak (order 1e5), which no
+    /// consumer could interpret as a confidence.
     pub confidence: f64,
 }
 
@@ -115,14 +122,23 @@ pub fn correlate(
     let offset_samples = match_in_right - tpl_start as i64;
     let offset_secs = offset_samples as f64 / sr;
 
-    log::info!(
-        "audio sync: offset = {offset_secs:.4}s (confidence={:.0})",
-        peak_val,
-    );
+    // Normalize the raw correlation peak by the number of overlapping samples
+    // so `confidence` is a correlation coefficient in [0, 1]. Both signals were
+    // z-normalized above, so the correlation sum at the best lag is
+    // approximately `overlap * coefficient`; dividing by the overlap recovers
+    // the coefficient. Clamp so an anti-correlated or empty-overlap lag reads 0.
+    let overlap = {
+        let start = match_in_right.max(0);
+        let end = (match_in_right + template.len() as i64).min(signal.len() as i64);
+        (end - start).max(1) as f64
+    };
+    let confidence = (*peak_val / overlap).clamp(0.0, 1.0);
+
+    log::info!("audio sync: offset = {offset_secs:.4}s (confidence={confidence:.3})",);
 
     Ok(SyncResult {
         offset_secs,
-        confidence: *peak_val,
+        confidence,
     })
 }
 
@@ -197,4 +213,44 @@ fn fft_cross_correlate(signal: &[f64], template: &[f64]) -> Result<Vec<f64>, Syn
     result.iter_mut().for_each(|v| *v *= scale);
     result.truncate(n);
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Deterministic broadband-ish signal (not a pure tone) for correlation tests.
+    fn pseudo_signal(n: usize) -> Vec<i16> {
+        (0..n)
+            .map(|i| (((i.wrapping_mul(2654435761)) >> 11) as i16) ^ ((i as i16) << 3))
+            .collect()
+    }
+
+    #[test]
+    fn identical_signals_have_high_confidence_and_zero_offset() {
+        let signal = pseudo_signal(44_100 * 4);
+        let result = correlate(&signal, &signal, 44_100, 2.0).expect("correlate");
+        assert!(
+            result.confidence > 0.9,
+            "identical signals must correlate strongly, got {}",
+            result.confidence
+        );
+        assert!(
+            result.offset_secs.abs() < 0.01,
+            "identical signals must be zero-lag, got {}",
+            result.offset_secs
+        );
+    }
+
+    #[test]
+    fn confidence_is_normalized_to_unit_range() {
+        let left = pseudo_signal(44_100 * 3);
+        let right = pseudo_signal(44_100 * 3);
+        let result = correlate(&left, &right, 44_100, 1.0).expect("correlate");
+        assert!(
+            (0.0..=1.0).contains(&result.confidence),
+            "confidence must be a normalized coefficient in [0, 1], got {}",
+            result.confidence
+        );
+    }
 }
