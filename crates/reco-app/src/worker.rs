@@ -2101,8 +2101,9 @@ impl EngineBackend for GpuEngineBackend {
         match result {
             Ok(calibration_result) => {
                 let scorecard = crate::calibration::project_scorecard(&calibration_result);
-                self.current_calibration = Some(calibration_result.calibration.clone());
-                self.has_result = true;
+                // Adopt the result as the preview source too (D3-15 / WR-05),
+                // so the scorecard and the rendered stitch describe one profile.
+                self.adopt_calibration(calibration_result.calibration.clone());
                 events.stage(
                     crate::events::CalibrationStage::Optimizing,
                     crate::events::StageStatus::Done,
@@ -2137,8 +2138,9 @@ impl EngineBackend for GpuEngineBackend {
         let calibration =
             reco_core::calibration::MatchCalibration::from_file(std::path::Path::new(&path))
                 .map_err(|e| WorkerError::ProfileLoad(e.to_string()))?;
-        self.current_calibration = Some(calibration);
-        self.has_result = true;
+        // Adopt the loaded profile as the live result and preview source so the
+        // preview/export flows consume it unchanged (D3-15 / WR-05).
+        self.adopt_calibration(calibration);
         events.profile_loaded(path);
         Ok(())
     }
@@ -2931,6 +2933,25 @@ impl GpuEngineBackend {
             self.has_result = false;
             self.current_calibration = None;
             events.result_invalidated();
+        }
+    }
+
+    /// Adopt a fresh or loaded calibration as the session's live result and the
+    /// preview's render source (D3-15 / WR-05).
+    ///
+    /// `begin_preview` renders from `self.calibration`, which before this only
+    /// the startup `import()` populated — so Preview kept rendering the
+    /// hardcoded startup profile regardless of what the operator calibrated or
+    /// loaded. The cached renderer is dropped so the next `begin_preview`
+    /// rebuilds from the adopted profile, but only when no preview session is
+    /// live: `tick_session` requires a renderer and would fail mid-session.
+    fn adopt_calibration(&mut self, calibration: reco_core::calibration::MatchCalibration) {
+        self.current_calibration = Some(calibration.clone());
+        self.calibration = Some(calibration);
+        self.has_result = true;
+        if self.session.is_none() {
+            self.renderer = None;
+            self.renderer_input = None;
         }
     }
 }
