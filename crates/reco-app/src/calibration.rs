@@ -640,8 +640,8 @@ mod tests {
     use super::*;
     use crate::events::{MetadataField, Provenance};
     use reco_calibrate::types::{
-        CalibrationConfig, CalibrationResult, FrameMatches, LensProfileInfo, MatchedPoint,
-        ProfileSource, SyncInfo,
+        CalibrationConfig, CalibrationResult, DebugFrame, FrameMatches, LensProfileInfo,
+        MatchedPoint, ProfileSource, SyncInfo,
     };
     use reco_core::calibration::{CameraParams, MatchCalibration, PlaneLayout};
 
@@ -1160,6 +1160,122 @@ mod tests {
             post_ransac,
             debug_frame: None,
         }
+    }
+
+    /// One `FrameMatches` with `n` verified points spread along the frame.
+    fn debug_frames(n: usize) -> Vec<FrameMatches> {
+        let denom = n.max(1) as f64;
+        let points: Vec<MatchedPoint> = (0..n)
+            .map(|i| MatchedPoint {
+                left: [0.0, 0.0],
+                right: [0.0, i as f64 / denom - 0.5],
+                left_pixel_nx: 0.5,
+                right_pixel_nx: i as f64 / denom,
+            })
+            .collect();
+        vec![FrameMatches {
+            points,
+            rejected: Vec::new(),
+            keypoints_left: n,
+            keypoints_right: n,
+            min_descriptors: n,
+            post_ratio_test: n,
+            post_spatial_filter: n,
+            post_ransac: n,
+            debug_frame: None,
+        }]
+    }
+
+    #[test]
+    fn debug_report_caps_points_and_flags_truncation() {
+        // T-04-10: a pathological match set must not cross unbounded; the cap
+        // holds and the report says so rather than silently dropping points.
+        let frames = debug_frames(DEBUG_POINT_CAP + 500);
+        let report = build_debug_report(&frames, None, 0.5);
+        assert_eq!(report.verified.len(), DEBUG_POINT_CAP);
+        assert!(report.points_capped);
+    }
+
+    #[test]
+    fn debug_report_downscales_thumbnails_to_the_max_edge() {
+        let (w, h) = (2000u32, 1000u32);
+        let rgba = vec![128u8; (w * h * 4) as usize];
+        let mut fm = frame_matches(1, 1, 1, 1, 1, 1);
+        fm.debug_frame = Some(DebugFrame {
+            left: rgba.clone(),
+            left_width: w,
+            left_height: h,
+            right: rgba,
+            right_width: w,
+            right_height: h,
+        });
+        let report = build_debug_report(&[fm], None, 0.0);
+        assert!(
+            report.left_width.max(report.left_height) <= DEBUG_THUMB_MAX_EDGE,
+            "thumbnail must be bounded: {}x{}",
+            report.left_width,
+            report.left_height
+        );
+        assert_eq!(
+            report.left_thumb.len() as u32,
+            report.left_width * report.left_height * 4,
+            "thumbnail length must match its geometry"
+        );
+    }
+
+    #[test]
+    fn debug_report_maps_points_into_the_unit_square() {
+        let frames = debug_frames(10);
+        let report = build_debug_report(&frames, None, 0.0);
+        assert_eq!(report.verified.len(), 10);
+        for p in &report.verified {
+            assert!((0.0..=1.0).contains(&p.x_nx), "x_nx out of range: {p:?}");
+            assert!((0.0..=1.0).contains(&p.y_nx), "y_nx out of range: {p:?}");
+        }
+    }
+
+    #[test]
+    fn debug_report_fails_closed_on_empty_input() {
+        let report = build_debug_report(&[], None, 0.0);
+        assert_eq!(report.frames_total, 0);
+        assert!(report.left_thumb.is_empty());
+        assert_eq!(report.left_width, 0);
+        assert!(report.verified.is_empty());
+        assert!(report.per_frame.is_empty());
+        assert!(!report.points_capped);
+    }
+
+    #[test]
+    fn debug_report_uses_the_run_residual_without_a_layout() {
+        let frames = debug_frames(3);
+        let report = build_debug_report(&frames, None, 0.25);
+        assert!(
+            report
+                .verified
+                .iter()
+                .all(|p| (p.error - 0.25).abs() < 1e-12),
+            "without a fit, points carry the run residual"
+        );
+    }
+
+    #[test]
+    fn debug_report_uses_per_point_residuals_with_a_layout() {
+        let frames = debug_frames(5);
+        let layout = PlaneLayout {
+            camera_axis_offset: 0.25,
+            intersect: 0.5,
+            x_ty: 0.0,
+            x_rz: 0.0,
+            z_rx: 0.0,
+            x_rx: 0.0,
+            z_rz: 0.0,
+        };
+        let report = build_debug_report(&frames, Some(&layout), 0.25);
+        assert_eq!(report.verified.len(), 5);
+        assert!(
+            report.verified.iter().all(|p| p.error.is_finite()),
+            "per-point residuals must be finite"
+        );
     }
 
     #[test]
