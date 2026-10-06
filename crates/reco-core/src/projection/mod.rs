@@ -220,11 +220,6 @@ impl Projection for CylindricalProjection {
     }
 }
 
-/// Maximum Newton-Raphson iterations for KB4 inverse distortion.
-const MAX_ITERATIONS: usize = 20;
-/// Convergence threshold for Newton-Raphson.
-const CONVERGENCE_EPS: f64 = 1e-10;
-
 /// Map a detection in camera pixel space to the yaw/pitch needed to
 /// center the virtual camera on it.
 ///
@@ -595,24 +590,11 @@ fn inverse_fisheye(dist_x: f64, dist_y: f64, params: &CameraParams) -> Option<(f
         return Some((cx, cy));
     }
 
-    // Newton-Raphson: solve f(theta) = theta_d_poly(theta) - theta_d = 0, where
-    // theta_d_poly lives in `reco_core::lens::kb4` (SYNC_WITH WGSL).
-    let mut theta = theta_d; // initial guess
-    for _ in 0..MAX_ITERATIONS {
-        let f = crate::lens::kb4::theta_d(theta, &k) - theta_d;
-        let f_prime = crate::lens::kb4::theta_d_prime(theta, &k);
-
-        if f_prime.abs() < 1e-15 {
-            return None; // degenerate
-        }
-
-        let delta = f / f_prime;
-        theta -= delta;
-
-        if delta.abs() < CONVERGENCE_EPS {
-            break;
-        }
-    }
+    // Newton-Raphson: solve f(theta) = theta_d_poly(theta) - theta_d = 0.
+    // The single KB4 inverse lives in `reco_core::lens::kb4`
+    // (`theta_from_theta_d`), shared with `lens::distorted_to_undistorted`;
+    // it returns `None` when the iteration does not converge.
+    let theta = crate::lens::kb4::theta_from_theta_d(theta_d, &k)?;
 
     // Recover undistorted coordinates
     let r = theta.tan(); // theta = atan(r) -> r = tan(theta)

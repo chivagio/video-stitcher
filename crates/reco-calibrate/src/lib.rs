@@ -65,6 +65,7 @@ pub mod error;
 pub mod features;
 pub mod filter;
 pub mod geometry;
+pub mod intrinsics;
 pub mod lens_database;
 /// M6 live calibration — drive the calibration pipeline from a live
 /// frame-pair source (OBS, V4L2, WebRTC, etc.). See the `live` module's
@@ -88,6 +89,10 @@ pub use defaults::{
     YDisparityFilter,
 };
 pub use error::{CalibrateError, CalibrationFailure};
+pub use intrinsics::{
+    IntrinsicsConfig, IntrinsicsRefinement, RawPixelMatch, optimize_intrinsics,
+    raw_to_matched_point,
+};
 pub use manual::{ManualPin, ManualSolveResult, pin_to_matched_point, solve_manual_calibration};
 pub use traits::{CostFunction, FeatureDetector, FeatureMatcher, PointFilter};
 pub use types::{

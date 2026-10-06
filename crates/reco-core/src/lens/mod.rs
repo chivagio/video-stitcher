@@ -28,6 +28,11 @@ pub(crate) use kb4::kb4_forward_scale;
 /// language-link; the `wgsl_kb4_matches_rust_kb4_on_theta_grid`
 /// compute-dispatch test locks the two sides together numerically.
 pub(crate) mod kb4 {
+    /// Maximum Newton-Raphson iterations for the KB4 inverse distortion.
+    pub(crate) const MAX_ITERATIONS: usize = 20;
+    /// Convergence threshold for the KB4 Newton-Raphson iteration.
+    pub(crate) const CONVERGENCE_EPS: f64 = 1e-10;
+
     /// Evaluate `θ_d = θ * (1 + k₁θ² + k₂θ⁴ + k₃θ⁶ + k₄θ⁸)`.
     ///
     /// SYNC_WITH `shaders/fisheye.wgsl` lines 184-188. Any edit here
@@ -65,6 +70,44 @@ pub(crate) mod kb4 {
             return 1.0;
         }
         theta_d(r.atan(), d) / r
+    }
+
+    /// Invert the KB4 polynomial: solve `θ_d(θ) = theta_d` for `θ` with
+    /// Newton-Raphson.
+    ///
+    /// This is the **single** KB4 inverse in the Rust source of truth.
+    /// `projection::inverse_fisheye` and [`super::distorted_to_undistorted`]
+    /// both delegate here so exactly one Newton-Raphson loop exists.
+    ///
+    /// Returns `Some(0.0)` at the optical center (`theta_d ≈ 0`, no
+    /// distortion), and `None` when the iteration fails to converge within
+    /// [`MAX_ITERATIONS`] or hits a degenerate (near-zero) derivative — a
+    /// typed refusal, never a NaN/Inf.
+    pub(crate) fn theta_from_theta_d(theta_d: f64, d: &[f64; 4]) -> Option<f64> {
+        if theta_d < 1e-12 {
+            return Some(0.0);
+        }
+
+        // Initial guess: for a mild barrel distortion θ_d ≈ θ, so seed with
+        // the measured θ_d and let Newton-Raphson pull it back.
+        let mut theta = theta_d;
+        for _ in 0..MAX_ITERATIONS {
+            let f = self::theta_d(theta, d) - theta_d;
+            let f_prime = self::theta_d_prime(theta, d);
+
+            if f_prime.abs() < 1e-15 {
+                return None; // degenerate derivative
+            }
+
+            let delta = f / f_prime;
+            theta -= delta;
+
+            if delta.abs() < CONVERGENCE_EPS {
+                return Some(theta);
+            }
+        }
+
+        None
     }
 }
 
@@ -187,6 +230,85 @@ pub fn undistorted_to_distorted(
 
     // Source pixel in the distorted image
     (fx * x * scale + cx, fy * y * scale + cy)
+}
+
+/// Map a pixel position in the original distorted (fisheye) image to
+/// the corresponding pixel in the undistorted output image.
+///
+/// This is the point-wise inverse of [`undistorted_to_distorted`] under
+/// the **same** output-intrinsics convention (`out_fx = fx / 2`,
+/// `out_cx = (w + 2·cx) / 4`, …). It solves the KB4 polynomial for `θ`
+/// with the shared [`kb4::theta_from_theta_d`] Newton-Raphson core, so
+/// exactly one KB4 inverse exists in the engine.
+///
+/// # Arguments
+/// * `src_x`, `src_y` - Pixel position in the distorted (raw) image.
+/// * `width`, `height` - Frame dimensions.
+/// * `params` - Camera intrinsics and KB4 distortion coefficients.
+///
+/// # Returns
+/// `Some((out_x, out_y))` in undistorted output-image pixels, or `None`
+/// when the KB4 inverse fails to converge or produces a non-finite result
+/// (a typed refusal, never a NaN/Inf).
+pub fn distorted_to_undistorted(
+    src_x: f64,
+    src_y: f64,
+    width: u32,
+    height: u32,
+    params: &CameraParams,
+) -> Option<(f64, f64)> {
+    let w = width as f64;
+    let h = height as f64;
+
+    // Scale original intrinsics to frame resolution (matches
+    // `undistorted_to_distorted`).
+    let sx = w / params.width as f64;
+    let sy = h / params.height as f64;
+    let fx = params.fx * sx;
+    let fy = params.fy * sy;
+    let cx = params.cx * sx;
+    let cy = params.cy * sy;
+
+    // Must match `undistorted_to_distorted` output intrinsics.
+    let out_fx = fx / 2.0;
+    let out_fy = fy / 2.0;
+    let out_cx = (w + 2.0 * cx) / 4.0;
+    let out_cy = (h + 2.0 * cy) / 4.0;
+
+    // Normalized distorted ray direction (distorted-image units).
+    let dx = (src_x - cx) / fx;
+    let dy = (src_y - cy) / fy;
+    let theta_d = (dx * dx + dy * dy).sqrt();
+
+    if theta_d < 1e-12 {
+        // Optical center: no distortion.
+        return Some((out_cx, out_cy));
+    }
+
+    // Solve θ from θ_d, then undo the KB4 radial scale.
+    let theta = kb4::theta_from_theta_d(theta_d, &params.d)?;
+    let r = theta.tan();
+    let scale = if theta.abs() < 1e-12 {
+        1.0
+    } else {
+        theta_d / r
+    };
+
+    if !scale.is_finite() {
+        return None;
+    }
+
+    let x = dx / scale;
+    let y = dy / scale;
+
+    let out_x = out_fx * x + out_cx;
+    let out_y = out_fy * y + out_cy;
+
+    if !out_x.is_finite() || !out_y.is_finite() {
+        return None;
+    }
+
+    Some((out_x, out_y))
 }
 
 /// Bilinear interpolation sample from a grayscale image.
