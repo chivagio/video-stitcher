@@ -3,6 +3,12 @@
   with the three sequential steps (Import · Calibrate · Preview) and a global
   Log toggle. `aria-current="step"` marks the active screen. The rail is the
   single router; the operator can revisit Import at any time.
+
+  Step enablement (UI-SPEC Interaction & State Contract):
+    Import    always
+    Calibrate both clips valid OR a profile is loaded
+    Preview   a valid calibration result exists
+  A disabled step carries its reason as a `title` (never a silently dead control).
 -->
 <script lang="ts">
   import type { Screen } from "../lib/types";
@@ -12,11 +18,19 @@
     onNavigate,
     logExpanded = false,
     onToggleLog,
+    calibrateEnabled = false,
+    previewEnabled = false,
+    calibrateReason = "Select two clips to calibrate.",
+    previewReason = "Calibrate first.",
   }: {
     active: Screen;
     onNavigate: (screen: Screen) => void;
     logExpanded?: boolean;
     onToggleLog: () => void;
+    calibrateEnabled?: boolean;
+    previewEnabled?: boolean;
+    calibrateReason?: string;
+    previewReason?: string;
   } = $props();
 
   const steps: { id: Screen; label: string }[] = [
@@ -24,6 +38,18 @@
     { id: "calibrate", label: "Calibrate" },
     { id: "preview", label: "Preview" },
   ];
+
+  function isEnabled(id: Screen): boolean {
+    if (id === "import") return true;
+    if (id === "calibrate") return calibrateEnabled;
+    return previewEnabled;
+  }
+
+  function reasonFor(id: Screen): string {
+    if (id === "calibrate" && !calibrateEnabled) return calibrateReason;
+    if (id === "preview" && !previewEnabled) return previewReason;
+    return "";
+  }
 </script>
 
 <nav class="workflow-rail" aria-label="Workflow">
@@ -34,10 +60,8 @@
         class="step"
         class:active={active === step.id}
         aria-current={active === step.id ? "step" : undefined}
-        disabled={step.id === "calibrate"}
-        title={step.id === "calibrate"
-          ? "Calibration wizard ships in plan 03-06"
-          : step.label}
+        disabled={!isEnabled(step.id)}
+        title={reasonFor(step.id) || step.label}
         onclick={() => onNavigate(step.id)}
       >
         {step.label}
@@ -60,7 +84,7 @@
     top: 0;
     left: 0;
     right: 0;
-    height: 48px;
+    height: var(--workflow-rail-height);
     display: flex;
     align-items: center;
     justify-content: space-between;

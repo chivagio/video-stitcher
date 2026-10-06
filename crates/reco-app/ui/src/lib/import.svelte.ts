@@ -49,6 +49,21 @@ class ImportStore {
     right: emptySlot("right"),
   });
 
+  /** The path of a loaded profile, or null (IMPT-05). */
+  profilePath = $state<string | null>(null);
+
+  /** Whether the current result no longer matches the inputs (D3-08). */
+  resultInvalidated = $state(false);
+
+  /**
+   * Whether a valid result exists (fresh calibration or loaded profile) — the
+   * Preview step's enablement. A fresh run's result is wired in plan 03-06;
+   * a loaded profile populates it here.
+   */
+  get hasResult(): boolean {
+    return this.profilePath !== null && !this.resultInvalidated;
+  }
+
   /** Unlisten function for the typed worker-event listener. */
   #unlisten: (() => void) | null = null;
 

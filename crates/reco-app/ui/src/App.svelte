@@ -132,18 +132,17 @@
     drawerExpanded = !drawerExpanded;
   }
 
-  // Workflow-rail navigation (D3-01). The Calibrate step is disabled in this
-  // tracer plan — its screen ships in plan 03-06 — so only Import/Preview are
-  // reachable here.
+  // Workflow-rail navigation (D3-01). The rail is the single router; the
+  // operator can revisit any enabled step at any time.
   function handleNavigate(next: Screen): void {
-    if (next === "calibrate") return;
     screen = next;
   }
 
-  // Calibrate CTA on the Import screen. The wizard is plan 03-06; this tracer
-  // wires the import seam only, so the button stays a documented stub.
+  // Calibrate CTA on the Import screen. Plan 03-05 wires the routing; the
+  // wizard body itself ships in plan 03-06 (the placeholder below is replaced
+  // there).
   function handleCalibrate(): void {
-    screen = "import";
+    screen = "calibrate";
   }
 
   // Pose controls.
@@ -213,6 +212,18 @@
   const isPlaying = $derived(transport.status === "playing");
   const controlsEnabled = $derived(transport.controlsEnabled);
   const isWarning = $derived(presenter.kind !== "native");
+
+  // Workflow-rail enablement (UI-SPEC Interaction & State Contract).
+  const bothReady = $derived(
+    importStore.inputs.left.status === "ready" &&
+      importStore.inputs.right.status === "ready",
+  );
+  // Calibrate needs both clips valid, or a loaded profile (which populates a
+  // result the operator can preview without re-running).
+  const calibrateEnabled = $derived(bothReady || importStore.profilePath !== null);
+  // Preview needs a valid result — a loaded profile counts; a fresh run's
+  // result is wired by the calibration store in plan 03-06.
+  const previewEnabled = $derived(importStore.hasResult);
 </script>
 
 <svelte:window onkeydown={handleGlobalKeyDown} />
@@ -224,11 +235,22 @@
     onNavigate={handleNavigate}
     logExpanded={drawerExpanded}
     onToggleLog={handleDrawerToggle}
+    {calibrateEnabled}
+    {previewEnabled}
   />
 
   {#if screen === "import"}
     <!-- Import screen: opaque dominant, covers the native preview region. -->
     <ImportScreen onCalibrate={handleCalibrate} />
+  {:else if screen === "calibrate"}
+    <!-- Calibrate placeholder (plan 03-05 router); the wizard ships in 03-06. -->
+    <div class="calibrate-placeholder">
+      <h2 class="placeholder-title">Ready to calibrate</h2>
+      <p class="placeholder-body">
+        Both clips are loaded and checked. Start calibration when you're ready.
+      </p>
+      <p class="placeholder-note">The calibration wizard ships in plan 03-06.</p>
+    </div>
   {:else}
     <!-- Preview surface (transparent in native mode) -->
     <PreviewSurface
@@ -340,5 +362,37 @@
     display: flex;
     align-items: center;
     gap: var(--space-sm);
+  }
+
+  .calibrate-placeholder {
+    position: fixed;
+    top: var(--workflow-rail-height);
+    left: 0;
+    right: 0;
+    bottom: 0;
+    /* Opaque dominant: no native preview surface may show through (UI-SPEC
+       Screen Router). The native view is suspended on this screen by Rust. */
+    background: var(--color-dominant);
+    padding: var(--space-3xl) var(--space-lg);
+    overflow-y: auto;
+  }
+
+  .placeholder-title {
+    margin: 0;
+    font-size: var(--text-display);
+    font-weight: var(--weight-semibold);
+    line-height: var(--line-tight);
+    color: var(--color-body-text);
+  }
+
+  .placeholder-body {
+    margin: var(--space-sm) 0 0;
+    color: var(--color-log-info);
+  }
+
+  .placeholder-note {
+    margin: var(--space-lg) 0 0;
+    color: var(--color-log-info);
+    font-style: italic;
   }
 </style>
