@@ -390,7 +390,7 @@
 
   .handle-readouts {
     display: flex;
-    flex-wrap: wrap;
+    flex-direction: column;
     gap: var(--space-sm);
   }
 
