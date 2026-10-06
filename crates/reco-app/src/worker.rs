@@ -10323,10 +10323,178 @@ mod tests {
 // CONCERNS.md (GPU tests skip in CI).
 #[cfg(test)]
 mod gpu_tests {
+    use std::path::PathBuf;
+    use std::sync::atomic::AtomicBool;
+
     #[test]
     #[ignore = "requires a GPU device; run with --ignored on a machine with Vulkan"]
     fn gpu_backend_imports_and_previews_one_frame() {
         // The device-owning path is exercised end-to-end by the binary; this
         // test documents the ignored hook for a GPU-capable runner.
+    }
+
+    /// The real mismatched Xiaomi pair (11T Pro left + 14T Pro right).
+    fn xiaomi_pair() -> (PathBuf, PathBuf) {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("test-media")
+            .join("xiaomi");
+        (
+            root.join("xiaomi-11tpro-left.mp4"),
+            root.join("xiaomi-14tpro-right.mp4"),
+        )
+    }
+
+    /// Real-clip non-regression acceptance on the Xiaomi pair (INTR-03 /
+    /// ROADMAP criterion 4).
+    ///
+    /// Runs the existing calibration pipeline on the real mismatched clips,
+    /// derives raw distorted-pixel observations from the verified matches, runs
+    /// the reduced `k1` refinement behind the held-out guard, and asserts the
+    /// non-regression bar: the held-out residual never regresses and `k1` stays
+    /// within its bound. Prints the baseline→refined delta and the verdict.
+    ///
+    /// Run explicitly (it loads ~540 MB of video and needs a GPU):
+    ///
+    /// ```text
+    /// cargo test -p reco-app xiaomi -- --ignored --nocapture
+    /// ```
+    ///
+    /// The clips are committed under `test-media/xiaomi/`; if they are absent
+    /// this test fails loudly rather than passing silently.
+    #[test]
+    #[ignore = "requires the real Xiaomi clips + a GPU; run with `cargo test -p reco-app xiaomi -- --ignored --nocapture`"]
+    fn xiaomi_k1_refinement_does_not_regress_the_held_out_fit() {
+        let (left, right) = xiaomi_pair();
+        assert!(
+            left.exists() && right.exists(),
+            "Xiaomi test clips not found at {} / {} — this acceptance test must \
+             not silently pass",
+            left.display(),
+            right.display()
+        );
+
+        let gpu = reco_core::gpu::GpuContext::new_blocking().expect("a GPU device is required");
+        let interrupted = AtomicBool::new(false);
+
+        // Sample more than the pipeline's default 2 frame pairs so the
+        // mismatched pair yields enough verified matches for the `k1` solve to
+        // be conditioned (the conditioning gate needs >= RECOMMENDED_MIN_MATCHES
+        // well-spread observations); with 2 frames the gate correctly refuses.
+        let config = reco_calibrate::CalibrationConfig {
+            num_frames: 12,
+            ..reco_calibrate::CalibrationConfig::default()
+        };
+        let options = reco_calibrate::video::CalibrateVideosOptions {
+            config: Some(config),
+            ..reco_calibrate::video::CalibrateVideosOptions::default()
+        };
+
+        let result = reco_calibrate::video::calibrate_videos_with_gpu(
+            &gpu,
+            &left,
+            &right,
+            options,
+            &mut |p| eprintln!("[xiaomi] {}: {}", p.step, p.detail),
+            &interrupted,
+        )
+        .expect("the real calibration pipeline must succeed on the Xiaomi pair");
+
+        let cal = &result.calibration;
+        let (lw, lh) = (cal.left.width, cal.left.height);
+        let (rw, rh) = (cal.right.width, cal.right.height);
+
+        // Derive raw distorted-pixel observations from every verified match
+        // (plane coord -> undistorted pixel -> raw pixel), the same derivation
+        // the worker uses at runtime.
+        let raw: Vec<reco_calibrate::RawPixelMatch> = result
+            .per_frame
+            .iter()
+            .flat_map(|fm| fm.points.iter())
+            .map(|p| {
+                let left_und = reco_calibrate::geometry::plane_to_pixel(p.right, lw, lh);
+                let right_und = reco_calibrate::geometry::plane_to_pixel(p.left, rw, rh);
+                let (lx, ly) = reco_core::lens::undistorted_to_distorted(
+                    left_und[0],
+                    left_und[1],
+                    lw,
+                    lh,
+                    &cal.left,
+                );
+                let (rx, ry) = reco_core::lens::undistorted_to_distorted(
+                    right_und[0],
+                    right_und[1],
+                    rw,
+                    rh,
+                    &cal.right,
+                );
+                reco_calibrate::RawPixelMatch {
+                    left_px: [lx, ly],
+                    right_px: [rx, ry],
+                }
+            })
+            .collect();
+
+        let cfg = reco_calibrate::IntrinsicsConfig::default();
+        let refinement = reco_calibrate::refine_intrinsics(&raw, &cal.layout, &cal.left, &cfg)
+            .expect("the reduced k1 refinement must run on the real observations");
+
+        let baseline_k1 = cal.left.d[0];
+        let bound = cfg.k1_bound;
+
+        // The non-regression bar. An accepted refinement must improve (or at
+        // least not worsen) the held-out fit; a rejected one is never applied,
+        // so the profile keeps the baseline k1 — the applied residual is the
+        // baseline by construction. Either way the *applied* result regresses
+        // nothing.
+        let non_regression = if refinement.accepted {
+            refinement.heldout_refined <= refinement.heldout_baseline
+        } else {
+            (refinement.k1 - baseline_k1).abs() < 1e-12
+        };
+        assert!(
+            non_regression,
+            "non-regression violated: accepted={} baseline_k1={baseline_k1} k1={} \
+             heldout {}/{} reason={:?}",
+            refinement.accepted,
+            refinement.k1,
+            refinement.heldout_baseline,
+            refinement.heldout_refined,
+            refinement.reason
+        );
+        assert!(
+            (refinement.k1 - baseline_k1).abs() <= bound + 1e-9,
+            "k1 must stay within its bound: |{} - {}| > {}",
+            refinement.k1,
+            baseline_k1,
+            bound
+        );
+
+        println!(
+            "xiaomi non-regression: accepted={} k1 {baseline_k1:.4} -> {:.4} (bound {bound})",
+            refinement.accepted, refinement.k1
+        );
+        println!(
+            "  held-out residual {:.6} -> {:.6}",
+            refinement.heldout_baseline, refinement.heldout_refined
+        );
+        println!("  reason: {:?}", refinement.reason);
+        if refinement.accepted {
+            println!(
+                "  applied k1 = {:.4} (profile updated; residual {:.6})",
+                refinement.k1, refinement.heldout_refined
+            );
+        } else {
+            println!(
+                "  applied k1 = baseline {baseline_k1:.4} (profile unchanged; residual {:.6})",
+                refinement.heldout_baseline
+            );
+        }
+        println!(
+            "  observations: {} across {} frames",
+            raw.len(),
+            result.per_frame.len()
+        );
     }
 }
