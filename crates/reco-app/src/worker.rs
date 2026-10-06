@@ -3452,6 +3452,10 @@ impl EngineBackend for GpuEngineBackend {
         // Exiting does not touch `current_calibration`, so an existing profile
         // survives leaving the flow (UI-SPEC "never a dead end").
         self.manual = None;
+        // IN-01: clear any armed debounced solve, or the worker loop would fire
+        // it after the flow closed and emit a spurious stale solve state.
+        self.manual_solve_at = None;
+        self.manual_relens_pending = false;
         events.info("manual calibration session ended");
         events.manual_solve_state(false, false);
         Ok(())
@@ -3756,6 +3760,10 @@ impl EngineBackend for GpuEngineBackend {
         }
         self.render_manual_preview(events)?;
         self.emit_manual_params(events);
+        // IN-02: drop any solve a prior lens edit armed — the baseline is
+        // restored, so re-detecting under it would be wasted work.
+        self.manual_solve_at = None;
+        self.manual_relens_pending = false;
         events.info("manual lens reset to the profile baseline");
         Ok(())
     }
@@ -3776,6 +3784,10 @@ impl EngineBackend for GpuEngineBackend {
         }
         self.render_manual_preview(events)?;
         self.emit_manual_params(events);
+        // IN-02: drop any solve a prior layout edit armed — the baseline is
+        // restored, so a confirmation solve would only re-run under it.
+        self.manual_solve_at = None;
+        self.manual_relens_pending = false;
         events.info("manual rig reset to the profile baseline");
         Ok(())
     }
@@ -5043,6 +5055,13 @@ impl GpuEngineBackend {
     /// arms the debounce; the worker loop runs the solve once it elapses. The
     /// solve is never run from this path directly (T-04.1-11).
     fn after_pin_mutation(&mut self, events: &EventSink) -> Result<(), WorkerError> {
+        // IN-03: with no session there is nothing to preview or solve.
+        // `manual_remove_pin`/`manual_clear_pins` call this unconditionally, so
+        // without this guard a remove/clear on a closed flow would arm a bogus
+        // solve.
+        if self.manual.is_none() {
+            return Ok(());
+        }
         events.manual_pins(self.manual_pin_views(), false);
         // Instant preview under the current real parameters.
         self.render_manual_preview(events)?;
@@ -5626,6 +5645,10 @@ mod tests {
         /// pins + instant preview, then arm the (short) debounce for a non-empty
         /// set or show the stale state for an empty one. Never solves directly.
         fn after_mock_pin_mutation(&mut self, events: &EventSink) {
+            // IN-03 parity: no session, nothing to preview or solve.
+            if !self.manual_open {
+                return;
+            }
             events.manual_pins(self.mock_pin_views(), false);
             events.manual_preview_frame(crate::events::ManualSide::Left, vec![0u8; 8], 2, 1);
             if self.manual_pins.is_empty() {
@@ -5936,6 +5959,8 @@ mod tests {
             self.manual_open = false;
             self.manual_pins.clear();
             self.manual_solve_at = None;
+            // IN-01 parity: drop any armed re-solve too.
+            self.manual_relens_pending = false;
             events.manual_solve_state(false, false);
             Ok(())
         }
@@ -6104,6 +6129,9 @@ mod tests {
             }
             events.manual_preview_frame(crate::events::ManualSide::Left, vec![0u8; 8], 2, 1);
             self.emit_mock_manual_params(events);
+            // IN-02 parity: drop any armed re-solve.
+            self.manual_solve_at = None;
+            self.manual_relens_pending = false;
             Ok(())
         }
 
@@ -6121,6 +6149,9 @@ mod tests {
             }
             events.manual_preview_frame(crate::events::ManualSide::Left, vec![0u8; 8], 2, 1);
             self.emit_mock_manual_params(events);
+            // IN-02 parity: drop any armed re-solve.
+            self.manual_solve_at = None;
+            self.manual_relens_pending = false;
             Ok(())
         }
 
