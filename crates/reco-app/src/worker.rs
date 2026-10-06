@@ -199,6 +199,8 @@ impl EventSink {
     /// `CalibrationHeartbeat` ticks while the worker thread is blocked inside
     /// `calibrate_videos_with_gpu` (D3-10). `Sender` is `Clone + Send`, so the
     /// thread can own one independently of the worker.
+    // Used by the calibration job wired in Task 3 of this plan.
+    #[allow(dead_code)]
     fn sender_clone(&self) -> Sender<WorkerEvent> {
         self.tx.clone()
     }
@@ -1156,6 +1158,8 @@ pub struct GpuEngineBackend {
     /// The shared calibration-cancel flag (CALB-02 / D3-11). A clone of the
     /// [`CalibrationCancel`] managed in Tauri state; `calibrate` passes it to
     /// `calibrate_videos_with_gpu`, which polls it between steps.
+    // Read by the calibration job wired in Task 3 of this plan.
+    #[allow(dead_code)]
     calibration_cancel: Arc<AtomicBool>,
     /// The single GPU device owner (FOUND-03). Declared **last** so it drops
     /// after the decode source, renderer, and presenter surface — the documented

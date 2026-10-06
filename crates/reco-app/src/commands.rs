@@ -389,7 +389,7 @@ fn validate_options(options: &crate::events::CalibrationOptions) -> Result<(), W
     const MAX_NUM_FRAMES: usize = 200;
 
     if let Some(n) = options.num_frames
-        && (n < 1 || n > MAX_NUM_FRAMES)
+        && !(1..=MAX_NUM_FRAMES).contains(&n)
     {
         return Err(WorkerError::InvalidInput {
             field: "num_frames".to_string(),

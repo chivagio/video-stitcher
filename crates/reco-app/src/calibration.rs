@@ -38,22 +38,111 @@ pub fn check_compatibility(
     left_path: &str,
     right_path: &str,
 ) -> Vec<CompatibilityIssue> {
-    let _ = (left, right, left_path, right_path);
-    unimplemented!()
+    let mut issues = Vec::new();
+
+    // Same-file guard: the only check shown even though it is almost always
+    // wrong; still non-blocking (D3-05). An empty path is a not-yet-filled slot
+    // and never equals another empty path for this purpose.
+    if !left_path.is_empty() && left_path == right_path {
+        issues.push(CompatibilityIssue {
+            code: CompatibilityCode::SameFile,
+            message: format!(
+                "Camera A and Camera B point at the same file ({left_path}); they must be different clips"
+            ),
+        });
+    }
+
+    if let (Some((lw, lh)), Some((rw, rh))) = (parse_resolution(left), parse_resolution(right))
+        && (lw, lh) != (rw, rh)
+    {
+        issues.push(CompatibilityIssue {
+            code: CompatibilityCode::ResolutionMismatch,
+            message: format!(
+                "Camera A is {lw}×{lh} but Camera B is {rw}×{rh}"
+            ),
+        });
+        // Aspect ratio, tolerance ~1% of the larger aspect.
+        let left_aspect = lw as f64 / lh as f64;
+        let right_aspect = rw as f64 / rh as f64;
+        let tolerance = 0.01 * left_aspect.max(right_aspect);
+        if (left_aspect - right_aspect).abs() > tolerance {
+            issues.push(CompatibilityIssue {
+                code: CompatibilityCode::AspectMismatch,
+                message: format!(
+                    "Camera A and Camera B have different aspect ratios ({left_aspect:.3} vs {right_aspect:.3})"
+                ),
+            });
+        }
+    }
+
+    if let (Some(lfps), Some(rfps)) = (parse_fps(left), parse_fps(right))
+        && (lfps - rfps).abs() > 0.5
+    {
+        issues.push(CompatibilityIssue {
+            code: CompatibilityCode::FpsMismatch,
+            message: format!(
+                "Camera A runs at {lfps} fps but Camera B runs at {rfps} fps"
+            ),
+        });
+    }
+
+    if let (Some(lcodec), Some(rcodec)) = (codec_name(left), codec_name(right))
+        && lcodec != rcodec
+    {
+        issues.push(CompatibilityIssue {
+            code: CompatibilityCode::CodecMismatch,
+            message: format!(
+                "Camera A is {lcodec} but Camera B is {rcodec}; they should use the same codec"
+            ),
+        });
+    }
+
+    issues
+}
+
+/// Parse a `"1920×1080"` display value into `(width, height)`.
+fn parse_resolution(metadata: &InputMetadata) -> Option<(u32, u32)> {
+    let value = metadata.resolution.value.as_deref()?;
+    let (w, h) = value.split_once('×')?;
+    Some((w.trim().parse().ok()?, h.trim().parse().ok()?))
+}
+
+/// Parse a `"30 fps"` display value into its numeric frame rate.
+fn parse_fps(metadata: &InputMetadata) -> Option<f64> {
+    let value = metadata.fps.value.as_deref()?;
+    let number = value.split_whitespace().next()?;
+    number.parse().ok()
+}
+
+/// The codec name, when present.
+fn codec_name(metadata: &InputMetadata) -> Option<&str> {
+    metadata.codec.value.as_deref().filter(|c| !c.is_empty())
 }
 
 /// Map an engine [`CalibrationStep`] to its host [`CalibrationStage`] (CALB-01).
 pub fn stage_from_step(step: CalibrationStep) -> CalibrationStage {
-    let _ = step;
-    unimplemented!()
+    match step {
+        CalibrationStep::Probing => CalibrationStage::Probing,
+        CalibrationStep::DetectingProfiles => CalibrationStage::DetectingProfiles,
+        CalibrationStep::AudioSync => CalibrationStage::AudioSync,
+        CalibrationStep::ExtractingFrames => CalibrationStage::ExtractingFrames,
+        CalibrationStep::Undistorting => CalibrationStage::Undistorting,
+        CalibrationStep::FeatureMatching => CalibrationStage::FeatureMatching,
+        CalibrationStep::Optimizing => CalibrationStage::Optimizing,
+    }
 }
 
 /// Band a calibration confidence into `High` / `Medium` / `Low` (CALB-03).
 ///
 /// `High` for `>= 0.8`, `Medium` for `>= 0.5`, else `Low`.
 pub fn confidence_band(confidence: f64) -> ConfidenceBand {
-    let _ = confidence;
-    unimplemented!()
+    if confidence >= 0.8 {
+        ConfidenceBand::High
+    } else if confidence >= 0.5 {
+        ConfidenceBand::Medium
+    } else {
+        ConfidenceBand::Low
+    }
 }
 
 /// Project a [`CalibrationResult`] into the CALB-03 [`Scorecard`] (D3-13).
@@ -61,8 +150,36 @@ pub fn confidence_band(confidence: f64) -> ConfidenceBand {
 /// Never fabricates a field: `per_frame_matches` is `0` only when
 /// `frames_used == 0`, and a missing lens profile is `None`.
 pub fn project_scorecard(result: &CalibrationResult) -> Scorecard {
-    let _ = result;
-    unimplemented!()
+    let per_frame_matches = if result.frames_used > 0 {
+        result.total_matches as f64 / result.frames_used as f64
+    } else {
+        0.0
+    };
+
+    // Prefer the left profile, fall back to the right (the scorecard reports one
+    // resolved profile + source).
+    let lens_profile = result
+        .left_lens_profile
+        .as_ref()
+        .or(result.right_lens_profile.as_ref())
+        .map(|info| LensProfileView {
+            name: profile_name(info),
+            source: profile_source_label(&info.source),
+        });
+
+    Scorecard {
+        confidence: result.confidence,
+        confidence_band: confidence_band(result.confidence),
+        residual_error: result.residual_error,
+        total_matches: result.total_matches as u64,
+        per_frame_matches,
+        frames_used: result.frames_used as u64,
+        lens_profile,
+        sync: SyncView {
+            method: map_sync_method(result.sync.method),
+            confidence: result.sync.confidence,
+        },
+    }
 }
 
 /// Build the engine [`CalibrateVideosOptions`](reco_calibrate::video::CalibrateVideosOptions)
@@ -76,26 +193,68 @@ pub fn build_video_options(
     left: Option<CameraParams>,
     right: Option<CameraParams>,
 ) -> reco_calibrate::video::CalibrateVideosOptions {
-    let _ = (options, left, right);
-    unimplemented!()
+    let mut config = CalibrationConfig::default();
+    if let Some(num_frames) = options.num_frames {
+        config.num_frames = num_frames;
+    }
+    if let Some(skip_start_secs) = options.skip_start_secs {
+        config.skip_start_secs = skip_start_secs;
+    }
+    if let Some(skip_end_secs) = options.skip_end_secs {
+        config.skip_end_secs = skip_end_secs;
+    }
+    if let Some(use_imu_rotation_seeds) = options.use_imu_rotation_seeds {
+        config.use_imu_rotation_seeds = use_imu_rotation_seeds;
+    }
+
+    // Both or neither: the engine warns and falls back to auto-detect on a
+    // one-sided pair, so drop a half-set override here rather than rely on that.
+    let (left_params, right_params) = match (left, right) {
+        (Some(l), Some(r)) => (Some(l), Some(r)),
+        _ => (None, None),
+    };
+
+    reco_calibrate::video::CalibrateVideosOptions {
+        config: Some(config),
+        left_params,
+        right_params,
+        ..Default::default()
+    }
 }
 
 /// The human-readable name for a resolved lens profile.
 fn profile_name(info: &LensProfileInfo) -> String {
-    let _ = info;
-    unimplemented!()
+    if info.lens.trim().is_empty() {
+        info.camera.clone()
+    } else {
+        format!("{} {}", info.camera, info.lens)
+    }
 }
 
 /// The human-readable source label for a resolved lens profile.
 fn profile_source_label(source: &ProfileSource) -> String {
-    let _ = source;
-    unimplemented!()
+    match source {
+        ProfileSource::Database => "database".to_string(),
+        ProfileSource::File(path) => {
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("file");
+            format!("file: {name}")
+        }
+        ProfileSource::AutoDetected => "auto-detected".to_string(),
+        ProfileSource::Fallback => "fallback".to_string(),
+    }
 }
 
 /// Map the engine sync method to the host vocabulary.
 fn map_sync_method(method: EngineSyncMethod) -> SyncMethod {
-    let _ = method;
-    unimplemented!()
+    match method {
+        EngineSyncMethod::Imu => SyncMethod::Imu,
+        EngineSyncMethod::Audio => SyncMethod::Audio,
+        EngineSyncMethod::Manual => SyncMethod::Manual,
+        EngineSyncMethod::None => SyncMethod::None,
+    }
 }
 
 #[cfg(test)]
