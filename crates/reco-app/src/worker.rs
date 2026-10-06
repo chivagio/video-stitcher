@@ -199,11 +199,100 @@ impl EventSink {
     /// `CalibrationHeartbeat` ticks while the worker thread is blocked inside
     /// `calibrate_videos_with_gpu` (D3-10). `Sender` is `Clone + Send`, so the
     /// thread can own one independently of the worker.
-    // Used by the calibration job wired in Task 3 of this plan.
-    #[allow(dead_code)]
     fn sender_clone(&self) -> Sender<WorkerEvent> {
         self.tx.clone()
     }
+
+    /// Emit the advisory compatibility findings (IMPT-03).
+    ///
+    /// Each issue is also mirrored to the process log at WARN, so a headless
+    /// run shows the same reasons the webview banner renders.
+    fn compatibility(&self, issues: Vec<crate::events::CompatibilityIssue>) {
+        for issue in &issues {
+            log::warn!("compatibility: {}", issue.message);
+        }
+        let _ = self.tx.send(WorkerEvent::Compatibility { issues });
+    }
+
+    /// Emit the lens-profile candidates for one input (IMPT-04).
+    fn lens_candidates(
+        &self,
+        role: crate::events::InputRole,
+        candidates: Vec<crate::events::LensCandidate>,
+    ) {
+        let _ = self.tx.send(WorkerEvent::LensCandidates { role, candidates });
+    }
+
+    /// Emit the applied (or cleared) lens override for one input (IMPT-04).
+    fn lens_override_applied(
+        &self,
+        role: crate::events::InputRole,
+        candidate: Option<crate::events::LensCandidate>,
+    ) {
+        let _ = self.tx.send(WorkerEvent::LensOverrideApplied { role, candidate });
+    }
+
+    /// Emit a stage-checklist row change (CALB-01).
+    fn stage(
+        &self,
+        step: crate::events::CalibrationStage,
+        status: crate::events::StageStatus,
+        detail: impl Into<String>,
+    ) {
+        let _ = self.tx.send(WorkerEvent::CalibrationStage {
+            step,
+            status,
+            detail: detail.into(),
+        });
+    }
+
+    /// Emit overall calibration progress (CALB-01).
+    fn progress(&self, fraction: f64) {
+        let _ = self.tx.send(WorkerEvent::CalibrationProgress { fraction });
+    }
+
+    /// Emit the completed calibration's scorecard (CALB-03).
+    fn result(&self, scorecard: crate::events::Scorecard) {
+        let _ = self.tx.send(WorkerEvent::CalibrationResult { scorecard });
+    }
+
+    /// Emit that a profile was loaded (IMPT-05).
+    fn profile_loaded(&self, path: impl Into<String>) {
+        let _ = self.tx.send(WorkerEvent::ProfileLoaded { path: path.into() });
+    }
+
+    /// Emit that a profile was saved (IMPT-06).
+    fn profile_saved(&self, path: impl Into<String>) {
+        let _ = self.tx.send(WorkerEvent::ProfileSaved { path: path.into() });
+    }
+
+    /// Emit that the current result no longer matches the inputs (D3-08).
+    fn result_invalidated(&self) {
+        let _ = self.tx.send(WorkerEvent::ResultInvalidated);
+    }
+}
+
+/// The array index for a camera role (`Left` = 0, `Right` = 1).
+fn role_index(role: crate::events::InputRole) -> usize {
+    match role {
+        crate::events::InputRole::Left => 0,
+        crate::events::InputRole::Right => 1,
+    }
+}
+
+/// The overall progress fraction for a stage (stage `n` of 7, 1-based).
+fn stage_fraction(stage: crate::events::CalibrationStage) -> f64 {
+    use crate::events::CalibrationStage as S;
+    let ordinal = match stage {
+        S::Probing => 0,
+        S::DetectingProfiles => 1,
+        S::AudioSync => 2,
+        S::ExtractingFrames => 3,
+        S::Undistorting => 4,
+        S::FeatureMatching => 5,
+        S::Optimizing => 6,
+    };
+    (ordinal as f64 + 1.0) / 7.0
 }
 
 /// The recovery action a classified surface error demands (FOUND-05).
@@ -417,6 +506,56 @@ pub trait EngineBackend: Send {
         path: String,
         events: &EventSink,
     ) -> Result<(), WorkerError>;
+
+    /// Clear one camera input slot (IMPT-01).
+    ///
+    /// Clears the slot, recomputes compatibility, and invalidates any existing
+    /// result (D3-08).
+    fn clear_input(
+        &mut self,
+        role: crate::events::InputRole,
+        events: &EventSink,
+    ) -> Result<(), WorkerError>;
+
+    /// Emit the lens-profile candidates for one input's resolution (IMPT-04).
+    fn lens_candidates(
+        &mut self,
+        role: crate::events::InputRole,
+        events: &EventSink,
+    ) -> Result<(), WorkerError>;
+
+    /// Apply a lens-profile override to one input (IMPT-04 / D3-08).
+    fn set_lens_override(
+        &mut self,
+        role: crate::events::InputRole,
+        candidate: crate::events::LensCandidate,
+        events: &EventSink,
+    ) -> Result<(), WorkerError>;
+
+    /// Clear a lens-profile override, returning the input to auto-detect.
+    fn clear_lens_override(
+        &mut self,
+        role: crate::events::InputRole,
+        events: &EventSink,
+    ) -> Result<(), WorkerError>;
+
+    /// Run calibration on the worker's own device (CALB-01 / FOUND-03).
+    ///
+    /// `interrupted` is the worker loop's shutdown flag; cancellation of a
+    /// running calibration is driven by the backend's own shared flag (set by
+    /// `cancel_calibration`). Emits stage/progress/heartbeat/result events.
+    fn calibrate(
+        &mut self,
+        options: crate::events::CalibrationOptions,
+        events: &EventSink,
+        interrupted: &AtomicBool,
+    ) -> Result<(), WorkerError>;
+
+    /// Load a calibration profile from a local file (IMPT-05).
+    fn load_profile(&mut self, path: String, events: &EventSink) -> Result<(), WorkerError>;
+
+    /// Save the current calibration profile to a local file (IMPT-06).
+    fn save_profile(&mut self, path: String, events: &EventSink) -> Result<(), WorkerError>;
 
     /// Begin a preview **session**: build/ensure the renderer, paint the idle
     /// frame, and start the transport, but do NOT run a frame loop.
@@ -780,20 +919,44 @@ fn handle_command<B: EngineBackend>(
                 events.failed(e);
             }
         }
-        // The calibration vocabulary lands in Task 3 of this plan; until the
-        // backend methods exist these commands are rejected with a typed error
-        // rather than silently dropped (they are never reachable from the UI
-        // before the wizard ships). Task 3 replaces each arm with the real call.
-        WorkerCommand::ClearInput { .. }
-        | WorkerCommand::LensCandidates { .. }
-        | WorkerCommand::SetLensOverride { .. }
-        | WorkerCommand::ClearLensOverride { .. }
-        | WorkerCommand::StartCalibration { .. }
-        | WorkerCommand::LoadProfile { .. }
-        | WorkerCommand::SaveProfile { .. } => {
-            events.failed(WorkerError::Unsupported {
-                operation: "calibration commands are not wired yet".to_string(),
-            });
+        WorkerCommand::ClearInput { role } => {
+            if let Err(e) = backend.clear_input(role, events) {
+                events.failed(e);
+            }
+        }
+        WorkerCommand::LensCandidates { role } => {
+            if let Err(e) = backend.lens_candidates(role, events) {
+                events.failed(e);
+            }
+        }
+        WorkerCommand::SetLensOverride { role, candidate } => {
+            if let Err(e) = backend.set_lens_override(role, candidate, events) {
+                events.failed(e);
+            }
+        }
+        WorkerCommand::ClearLensOverride { role } => {
+            if let Err(e) = backend.clear_lens_override(role, events) {
+                events.failed(e);
+            }
+        }
+        WorkerCommand::StartCalibration { options } => {
+            // Reset the loop's interrupted flag (mirroring Export). The actual
+            // calibration cancel flag is the backend's shared `Arc<AtomicBool>`,
+            // reset inside `calibrate` before the engine starts.
+            interrupted.store(false, Ordering::SeqCst);
+            if let Err(e) = backend.calibrate(options, events, interrupted) {
+                events.failed(e);
+            }
+        }
+        WorkerCommand::LoadProfile { path } => {
+            if let Err(e) = backend.load_profile(path, events) {
+                events.failed(e);
+            }
+        }
+        WorkerCommand::SaveProfile { path } => {
+            if let Err(e) = backend.save_profile(path, events) {
+                events.failed(e);
+            }
         }
         WorkerCommand::Export => {
             interrupted.store(false, Ordering::SeqCst);
@@ -873,6 +1036,9 @@ fn worker_loop<B: EngineBackend>(
                             | WorkerCommand::Preview
                             | WorkerCommand::Export
                             | WorkerCommand::SetInput { .. }
+                            | WorkerCommand::StartCalibration { .. }
+                            | WorkerCommand::LoadProfile { .. }
+                            | WorkerCommand::SaveProfile { .. }
                     );
                     let keep_going = handle_command(cmd, &mut backend, &events, &interrupted);
                     ran_job |= is_job;
@@ -1093,6 +1259,22 @@ pub struct GpuEngineBackend {
     /// Populated by `SetInput`; the worker owns them so the webview never holds
     /// an engine-reachable path. Plan 03-03 reads this to run calibration.
     input_paths: std::collections::HashMap<crate::events::InputRole, String>,
+    /// The probed metadata for each input, indexed by role (IMPT-02).
+    ///
+    /// Kept so compatibility can be recomputed and lens candidates resolved
+    /// without re-probing the file.
+    inputs: [Option<crate::events::InputMetadata>; 2],
+    /// The resolved lens override for each input, indexed by role (IMPT-04).
+    ///
+    /// `None` means auto-detect. Passed to calibration as `left_params` /
+    /// `right_params` (only when both are set).
+    lens_overrides: [Option<reco_core::calibration::CameraParams>; 2],
+    /// The current calibration: the result of a run or a loaded profile
+    /// (IMPT-05/06). Consumed by save and, later, by preview/export.
+    current_calibration: Option<reco_core::calibration::MatchCalibration>,
+    /// Whether [`Self::current_calibration`] reflects a fresh result/loaded
+    /// profile (drives `ResultInvalidated` on input/override changes, D3-08).
+    has_result: bool,
     /// The loaded calibration, if `Import` has run.
     calibration: Option<reco_core::calibration::MatchCalibration>,
     /// The open decode source, if `Import` has run.
@@ -1158,8 +1340,6 @@ pub struct GpuEngineBackend {
     /// The shared calibration-cancel flag (CALB-02 / D3-11). A clone of the
     /// [`CalibrationCancel`] managed in Tauri state; `calibrate` passes it to
     /// `calibrate_videos_with_gpu`, which polls it between steps.
-    // Read by the calibration job wired in Task 3 of this plan.
-    #[allow(dead_code)]
     calibration_cancel: Arc<AtomicBool>,
     /// The single GPU device owner (FOUND-03). Declared **last** so it drops
     /// after the decode source, renderer, and presenter surface — the documented
@@ -1272,6 +1452,10 @@ impl GpuEngineBackend {
             chrome: crate::presenter::ChromeState::default(),
             view_mode: crate::presenter::ViewMode::Panorama,
             input_paths: std::collections::HashMap::new(),
+            inputs: [None, None],
+            lens_overrides: [None, None],
+            current_calibration: None,
+            has_result: false,
             calibration: None,
             source: None,
             input_size: None,
@@ -1566,6 +1750,46 @@ impl GpuEngineBackend {
     }
 }
 
+/// Spawn the calibration heartbeat monitor (CALB-01 / D3-10).
+///
+/// The monitor emits a `CalibrationHeartbeat` every ~500 ms until `stop` is
+/// set, so a long silent stage (e.g. the 30-60 s telemetry parse in
+/// `DetectingProfiles`) never looks stuck. It reads the shared last-detail so
+/// the tick reports the stage that is actually running. The worker always sets
+/// `stop` and joins the handle before returning, so the thread cannot outlive
+/// the run or accumulate (T-03-09).
+fn spawn_heartbeat_monitor(
+    tx: Sender<WorkerEvent>,
+    stop: Arc<AtomicBool>,
+    detail: Arc<std::sync::Mutex<(crate::events::CalibrationStage, String)>>,
+) -> Result<JoinHandle<()>, WorkerError> {
+    thread::Builder::new()
+        .name("reco-calibration-heartbeat".to_string())
+        .spawn(move || {
+            let start = std::time::Instant::now();
+            loop {
+                // Sleep in short slices so the stop flag is honored promptly
+                // (never wait a full 500 ms after calibration returns).
+                for _ in 0..10 {
+                    if stop.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(50));
+                }
+                let (step, last_detail) = match detail.lock() {
+                    Ok(guard) => guard.clone(),
+                    Err(_) => (crate::events::CalibrationStage::Probing, String::new()),
+                };
+                let _ = tx.send(WorkerEvent::CalibrationHeartbeat {
+                    elapsed_ms: start.elapsed().as_millis() as u64,
+                    step,
+                    last_detail,
+                });
+            }
+        })
+        .map_err(|e| WorkerError::Engine(format!("failed to spawn heartbeat monitor: {e}")))
+}
+
 /// Install the FOUND-05 device-lost callback and uncaptured-error handler.
 ///
 /// The lost callback only flips the shared flag and logs; the worker thread
@@ -1660,9 +1884,228 @@ impl EngineBackend for GpuEngineBackend {
             .and_then(|n| n.to_str())
             .unwrap_or(path.as_str())
             .to_string();
+        let idx = role_index(role);
+        self.inputs[idx] = Some(metadata.clone());
         self.input_paths.insert(role, path);
         events.info(format!("{} selected: {filename}", role.label()));
         events.metadata(role, metadata);
+        // Recompute the advisory checks from both inputs and report them
+        // (IMPT-03). Changing an input after a run invalidates the result
+        // (D3-08): the scorecard must reflect the clips it actually used.
+        self.emit_compatibility(events);
+        self.invalidate_result(events);
+        Ok(())
+    }
+
+    fn clear_input(
+        &mut self,
+        role: crate::events::InputRole,
+        events: &EventSink,
+    ) -> Result<(), WorkerError> {
+        let idx = role_index(role);
+        self.inputs[idx] = None;
+        self.input_paths.remove(&role);
+        self.lens_overrides[idx] = None;
+        events.info(format!("{} cleared", role.label()));
+        self.emit_compatibility(events);
+        self.invalidate_result(events);
+        Ok(())
+    }
+
+    fn lens_candidates(
+        &mut self,
+        role: crate::events::InputRole,
+        events: &EventSink,
+    ) -> Result<(), WorkerError> {
+        let idx = role_index(role);
+        // Resolution of the input drives the candidate filter; a missing input
+        // lists every profile (0 = wildcard in `LensDatabase::candidates`).
+        let (width, height) = self.inputs[idx]
+            .as_ref()
+            .and_then(crate::calibration::parse_resolution)
+            .unwrap_or((0, 0));
+        let candidates = reco_calibrate::lens_database::LensDatabase::embedded()
+            .candidates(width, height)
+            .into_iter()
+            .map(|summary| crate::events::LensCandidate {
+                camera: summary.camera,
+                lens: summary.lens,
+                width: summary.width,
+                height: summary.height,
+            })
+            .collect();
+        events.lens_candidates(role, candidates);
+        Ok(())
+    }
+
+    fn set_lens_override(
+        &mut self,
+        role: crate::events::InputRole,
+        candidate: crate::events::LensCandidate,
+        events: &EventSink,
+    ) -> Result<(), WorkerError> {
+        let idx = role_index(role);
+        // Resolve the chosen summary back to full `CameraParams` via the
+        // embedded database (D3-07). A summary that no longer resolves clears
+        // the override rather than storing a half-built profile.
+        let summary = reco_calibrate::types::LensProfileSummary {
+            camera: candidate.camera.clone(),
+            lens: candidate.lens.clone(),
+            width: candidate.width,
+            height: candidate.height,
+        };
+        let params = reco_calibrate::lens_database::LensDatabase::embedded()
+            .load_by_summary(&summary);
+        self.lens_overrides[idx] = params;
+        events.info(format!(
+            "{} lens override: {} {}",
+            role.label(),
+            candidate.camera,
+            candidate.lens
+        ));
+        events.lens_override_applied(role, Some(candidate));
+        self.emit_compatibility(events);
+        self.invalidate_result(events);
+        Ok(())
+    }
+
+    fn clear_lens_override(
+        &mut self,
+        role: crate::events::InputRole,
+        events: &EventSink,
+    ) -> Result<(), WorkerError> {
+        let idx = role_index(role);
+        self.lens_overrides[idx] = None;
+        events.info(format!("{} lens override cleared", role.label()));
+        events.lens_override_applied(role, None);
+        self.emit_compatibility(events);
+        self.invalidate_result(events);
+        Ok(())
+    }
+
+    fn calibrate(
+        &mut self,
+        options: crate::events::CalibrationOptions,
+        events: &EventSink,
+        _interrupted: &AtomicBool,
+    ) -> Result<(), WorkerError> {
+        let left = self
+            .input_paths
+            .get(&crate::events::InputRole::Left)
+            .cloned()
+            .ok_or(WorkerError::NotImported)?;
+        let right = self
+            .input_paths
+            .get(&crate::events::InputRole::Right)
+            .cloned()
+            .ok_or(WorkerError::NotImported)?;
+
+        // Clear a stale cancel from a previous run before starting.
+        self.calibration_cancel.store(false, Ordering::SeqCst);
+
+        events.stage(
+            crate::events::CalibrationStage::Probing,
+            crate::events::StageStatus::Active,
+            "Probing video metadata",
+        );
+        events.progress(0.0);
+
+        // Shared last-detail state for the heartbeat monitor, so a silent stage
+        // reports what it is doing (D3-10).
+        let detail = Arc::new(std::sync::Mutex::new((
+            crate::events::CalibrationStage::Probing,
+            "Probing video metadata".to_string(),
+        )));
+        let stop = Arc::new(AtomicBool::new(false));
+        let heartbeat = spawn_heartbeat_monitor(
+            events.sender_clone(),
+            Arc::clone(&stop),
+            Arc::clone(&detail),
+        )?;
+
+        let engine_options = crate::calibration::build_video_options(
+            &options,
+            self.lens_overrides[0].clone(),
+            self.lens_overrides[1].clone(),
+        );
+
+        // The progress callback runs on the worker thread inside
+        // `calibrate_videos_with_gpu`; it maps engine steps to host stages and
+        // updates the heartbeat's last-detail.
+        let mut on_progress = |progress: &reco_calibrate::types::CalibrationProgress| {
+            let stage = crate::calibration::stage_from_step(progress.step);
+            if let Ok(mut guard) = detail.lock() {
+                *guard = (stage, progress.detail.clone());
+            }
+            events.stage(stage, crate::events::StageStatus::Active, progress.detail.clone());
+            events.progress(stage_fraction(stage));
+        };
+
+        let result = reco_calibrate::video::calibrate_videos_with_gpu(
+            &self.gpu,
+            std::path::Path::new(&left),
+            std::path::Path::new(&right),
+            engine_options,
+            &mut on_progress,
+            &self.calibration_cancel,
+        );
+
+        // Always stop and join the monitor before returning (T-03-09): it must
+        // not outlive the run or accumulate.
+        stop.store(true, Ordering::SeqCst);
+        let _ = heartbeat.join();
+
+        match result {
+            Ok(calibration_result) => {
+                let scorecard = crate::calibration::project_scorecard(&calibration_result);
+                self.current_calibration = Some(calibration_result.calibration.clone());
+                self.has_result = true;
+                events.stage(
+                    crate::events::CalibrationStage::Optimizing,
+                    crate::events::StageStatus::Done,
+                    "Calibration complete",
+                );
+                events.progress(1.0);
+                events.result(scorecard);
+                Ok(())
+            }
+            Err(reco_calibrate::video::CalibrateVideosError::Cancelled) => {
+                // CALB-02: the partial result is discarded and never offered.
+                events.log(Level::Warn, "calibration cancelled — partial result discarded");
+                Ok(())
+            }
+            Err(e) => {
+                events.stage(
+                    crate::events::CalibrationStage::Probing,
+                    crate::events::StageStatus::Failed,
+                    e.to_string(),
+                );
+                Err(WorkerError::Engine(e.to_string()))
+            }
+        }
+    }
+
+    fn load_profile(&mut self, path: String, events: &EventSink) -> Result<(), WorkerError> {
+        // Validate by deserialization into `MatchCalibration` (size cap + typed
+        // `validate()`); never deserialize unchecked (T-03-08).
+        let calibration = reco_core::calibration::MatchCalibration::from_file(
+            std::path::Path::new(&path),
+        )
+        .map_err(|e| WorkerError::ProfileLoad(e.to_string()))?;
+        self.current_calibration = Some(calibration);
+        self.has_result = true;
+        events.profile_loaded(path);
+        Ok(())
+    }
+
+    fn save_profile(&mut self, path: String, events: &EventSink) -> Result<(), WorkerError> {
+        let calibration = self.current_calibration.as_ref().ok_or_else(|| {
+            WorkerError::ProfileSave("no calibration result to save".to_string())
+        })?;
+        calibration
+            .to_file(std::path::Path::new(&path))
+            .map_err(|e| WorkerError::ProfileSave(e.to_string()))?;
+        events.profile_saved(path);
         Ok(())
     }
 
@@ -2354,6 +2797,69 @@ impl EngineBackend for GpuEngineBackend {
 }
 
 impl GpuEngineBackend {
+    /// Recompute the full advisory compatibility list from the current inputs
+    /// and lens overrides (IMPT-03 / D3-06).
+    ///
+    /// Overlap is never part of this — it is unknown until calibration.
+    fn current_compatibility(&self) -> Vec<crate::events::CompatibilityIssue> {
+        let left_path = self
+            .input_paths
+            .get(&crate::events::InputRole::Left)
+            .map(String::as_str)
+            .unwrap_or("");
+        let right_path = self
+            .input_paths
+            .get(&crate::events::InputRole::Right)
+            .map(String::as_str)
+            .unwrap_or("");
+        let mut issues = match (&self.inputs[0], &self.inputs[1]) {
+            (Some(left), Some(right)) => {
+                crate::calibration::check_compatibility(left, right, left_path, right_path)
+            }
+            _ => Vec::new(),
+        };
+        // A lens override whose calibration resolution differs from the clip is
+        // a lens/resolution mismatch (D3-06) — the comparison needs the
+        // override, so it lives here rather than in the pure input check.
+        for (idx, role) in [
+            (0, crate::events::InputRole::Left),
+            (1, crate::events::InputRole::Right),
+        ] {
+            let input_resolution = self.inputs[idx]
+                .as_ref()
+                .and_then(crate::calibration::parse_resolution);
+            if let (Some((iw, ih)), Some(over)) = (input_resolution, self.lens_overrides[idx].as_ref())
+                && (over.width, over.height) != (iw, ih)
+            {
+                issues.push(crate::events::CompatibilityIssue {
+                    code: crate::events::CompatibilityCode::LensResolutionMismatch,
+                    message: format!(
+                        "{} lens override is {}×{} but the clip is {iw}×{ih}",
+                        role.label(),
+                        over.width,
+                        over.height
+                    ),
+                });
+            }
+        }
+        issues
+    }
+
+    /// Emit the current advisory compatibility list (IMPT-03).
+    fn emit_compatibility(&self, events: &EventSink) {
+        events.compatibility(self.current_compatibility());
+    }
+
+    /// Invalidate a live result if inputs/profile changed (D3-08).
+    fn invalidate_result(&mut self, events: &EventSink) {
+        if self.has_result {
+            self.has_result = false;
+            events.result_invalidated();
+        }
+    }
+}
+
+impl GpuEngineBackend {
     /// Apply the FOUND-05 recovery action for a classified surface error.
     ///
     /// `Reconfigure` reconfigures the surface on the existing device;
@@ -2449,6 +2955,67 @@ mod tests {
     use super::*;
     use std::sync::mpsc::RecvTimeoutError;
 
+    /// The metadata the mock's `set_input` reports when a test does not
+    /// preload `mock_metadata` for that role.
+    fn default_mock_metadata() -> crate::events::InputMetadata {
+        crate::events::InputMetadata {
+            resolution: crate::events::MetadataField::probed("1920×1080"),
+            fps: crate::events::MetadataField::probed("30 fps"),
+            duration: crate::events::MetadataField::estimated("0:02"),
+            codec: crate::events::MetadataField::missing(crate::events::Provenance::Probed),
+        }
+    }
+
+    /// A fabricated CALB-03 scorecard for the mock's calibration result.
+    fn mock_scorecard() -> crate::events::Scorecard {
+        crate::events::Scorecard {
+            confidence: 0.87,
+            confidence_band: crate::events::ConfidenceBand::High,
+            residual_error: 0.25,
+            total_matches: 900,
+            per_frame_matches: 300.0,
+            frames_used: 3,
+            lens_profile: None,
+            sync: crate::events::SyncView {
+                method: crate::events::SyncMethod::None,
+                confidence: None,
+            },
+        }
+    }
+
+    /// A minimal valid calibration for the mock's load/save round-trip.
+    fn sample_mock_calibration() -> reco_core::calibration::MatchCalibration {
+        use reco_core::calibration::{CameraParams, MatchCalibration, PlaneLayout};
+        let camera = CameraParams {
+            width: 1920,
+            height: 1080,
+            fx: 1000.0,
+            fy: 1000.0,
+            cx: 960.0,
+            cy: 540.0,
+            d: [0.0; 4],
+        };
+        MatchCalibration {
+            left: camera.clone(),
+            right: camera,
+            layout: PlaneLayout {
+                camera_axis_offset: 0.25,
+                intersect: 0.5,
+                x_ty: 0.0,
+                x_rz: 0.0,
+                z_rx: 0.0,
+                x_rx: 0.0,
+                z_rz: 0.0,
+            },
+            rig_tilt: 0.0,
+            rig_roll: 0.0,
+            sync_offset: 0,
+            field_roi: None,
+            lens_correction_amount: 1.0,
+            blend_width: 0.05,
+        }
+    }
+
     /// A GPU-free backend that records the order of the operations it saw.
     ///
     /// It models the session as: `session_active` while a transport exists;
@@ -2520,6 +3087,20 @@ mod tests {
         /// `None` means "the source serves `total_frames`", which keeps every
         /// existing test's arithmetic unchanged.
         source_frames: Option<u64>,
+        /// The mock's per-role probed metadata, indexed by role (IMPT-02).
+        inputs: [Option<crate::events::InputMetadata>; 2],
+        /// Metadata a test wants `set_input` to report (else a fixed default).
+        mock_metadata: [Option<crate::events::InputMetadata>; 2],
+        /// The mock's per-role input paths (IMPT-01).
+        input_paths: [Option<String>; 2],
+        /// The mock's per-role lens overrides (IMPT-04).
+        lens_overrides: [Option<reco_core::calibration::CameraParams>; 2],
+        /// The mock's current calibration (IMPT-05/06).
+        current_calibration: Option<reco_core::calibration::MatchCalibration>,
+        /// Whether the mock holds a live result (D3-08).
+        has_result: bool,
+        /// The mock's shared calibration-cancel flag (CALB-02).
+        calibration_cancel: Arc<AtomicBool>,
     }
 
     impl MockBackend {
@@ -2544,6 +3125,13 @@ mod tests {
                 source_exhausted: false,
                 warmup_ticks: 0,
                 source_frames: None,
+                inputs: [None, None],
+                mock_metadata: [None, None],
+                input_paths: [None, None],
+                lens_overrides: [None, None],
+                current_calibration: None,
+                has_result: false,
+                calibration_cancel: Arc::new(AtomicBool::new(false)),
             }
         }
 
@@ -2573,6 +3161,29 @@ mod tests {
         fn record(&self, op: &'static str) {
             self.ops.lock().unwrap().push(op);
         }
+
+        /// Recompute and emit the advisory compatibility list, using the SAME
+        /// pure decision the real backend uses (never a reimplementation).
+        fn emit_mock_compatibility(&self, events: &EventSink) {
+            let issues = match (&self.inputs[0], &self.inputs[1]) {
+                (Some(left), Some(right)) => crate::calibration::check_compatibility(
+                    left,
+                    right,
+                    self.input_paths[0].as_deref().unwrap_or(""),
+                    self.input_paths[1].as_deref().unwrap_or(""),
+                ),
+                _ => Vec::new(),
+            };
+            events.compatibility(issues);
+        }
+
+        /// Invalidate a live result if one exists (D3-08).
+        fn invalidate_mock_result(&mut self, events: &EventSink) {
+            if self.has_result {
+                self.has_result = false;
+                events.result_invalidated();
+            }
+        }
     }
 
     impl EngineBackend for MockBackend {
@@ -2599,23 +3210,150 @@ mod tests {
             events: &EventSink,
         ) -> Result<(), WorkerError> {
             self.record("set_input");
+            let idx = role_index(role);
             let filename = std::path::Path::new(&path)
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or(path.as_str())
                 .to_string();
+            let metadata = self.mock_metadata[idx]
+                .clone()
+                .unwrap_or_else(default_mock_metadata);
+            self.inputs[idx] = Some(metadata.clone());
+            self.input_paths[idx] = Some(path);
             events.info(format!("{} selected: {filename}", role.label()));
-            // Mirror the real backend's typed event shape so a worker-loop test
-            // can assert the protocol without a GPU.
-            events.metadata(
+            events.metadata(role, metadata);
+            // Use the same pure decision the real backend uses.
+            self.emit_mock_compatibility(events);
+            self.invalidate_mock_result(events);
+            Ok(())
+        }
+
+        fn clear_input(
+            &mut self,
+            role: crate::events::InputRole,
+            events: &EventSink,
+        ) -> Result<(), WorkerError> {
+            self.record("clear_input");
+            let idx = role_index(role);
+            self.inputs[idx] = None;
+            self.input_paths[idx] = None;
+            self.lens_overrides[idx] = None;
+            events.info(format!("{} cleared", role.label()));
+            self.emit_mock_compatibility(events);
+            self.invalidate_mock_result(events);
+            Ok(())
+        }
+
+        fn lens_candidates(
+            &mut self,
+            role: crate::events::InputRole,
+            events: &EventSink,
+        ) -> Result<(), WorkerError> {
+            self.record("lens_candidates");
+            events.lens_candidates(
                 role,
-                crate::events::InputMetadata {
-                    resolution: crate::events::MetadataField::probed("1920×1080"),
-                    fps: crate::events::MetadataField::probed("30 fps"),
-                    duration: crate::events::MetadataField::estimated("0:02"),
-                    codec: crate::events::MetadataField::missing(crate::events::Provenance::Probed),
-                },
+                vec![crate::events::LensCandidate {
+                    camera: "Mock Camera".to_string(),
+                    lens: "Wide".to_string(),
+                    width: 1920,
+                    height: 1080,
+                }],
             );
+            Ok(())
+        }
+
+        fn set_lens_override(
+            &mut self,
+            role: crate::events::InputRole,
+            candidate: crate::events::LensCandidate,
+            events: &EventSink,
+        ) -> Result<(), WorkerError> {
+            self.record("set_lens_override");
+            let idx = role_index(role);
+            self.lens_overrides[idx] = Some(reco_core::calibration::CameraParams {
+                width: candidate.width,
+                height: candidate.height,
+                fx: 1000.0,
+                fy: 1000.0,
+                cx: candidate.width as f64 / 2.0,
+                cy: candidate.height as f64 / 2.0,
+                d: [0.0; 4],
+            });
+            events.lens_override_applied(role, Some(candidate));
+            self.emit_mock_compatibility(events);
+            self.invalidate_mock_result(events);
+            Ok(())
+        }
+
+        fn clear_lens_override(
+            &mut self,
+            role: crate::events::InputRole,
+            events: &EventSink,
+        ) -> Result<(), WorkerError> {
+            self.record("clear_lens_override");
+            let idx = role_index(role);
+            self.lens_overrides[idx] = None;
+            events.lens_override_applied(role, None);
+            self.emit_mock_compatibility(events);
+            self.invalidate_mock_result(events);
+            Ok(())
+        }
+
+        fn calibrate(
+            &mut self,
+            _options: crate::events::CalibrationOptions,
+            events: &EventSink,
+            _interrupted: &AtomicBool,
+        ) -> Result<(), WorkerError> {
+            self.record("calibrate");
+            // Mirror the real backend: a fresh run clears a stale cancel.
+            self.calibration_cancel.store(false, Ordering::SeqCst);
+            for stage in [
+                crate::events::CalibrationStage::Probing,
+                crate::events::CalibrationStage::DetectingProfiles,
+                crate::events::CalibrationStage::AudioSync,
+                crate::events::CalibrationStage::ExtractingFrames,
+                crate::events::CalibrationStage::Undistorting,
+                crate::events::CalibrationStage::FeatureMatching,
+                crate::events::CalibrationStage::Optimizing,
+            ] {
+                events.stage(stage, crate::events::StageStatus::Active, "mock stage");
+            }
+            events.progress(1.0);
+            events.result(mock_scorecard());
+            self.has_result = true;
+            Ok(())
+        }
+
+        fn load_profile(
+            &mut self,
+            path: String,
+            events: &EventSink,
+        ) -> Result<(), WorkerError> {
+            self.record("load_profile");
+            // Mirror the real backend's typed-error shape without touching disk.
+            if path.is_empty() {
+                return Err(WorkerError::ProfileLoad("empty path".to_string()));
+            }
+            self.current_calibration = Some(sample_mock_calibration());
+            self.has_result = true;
+            events.profile_loaded(path);
+            Ok(())
+        }
+
+        fn save_profile(
+            &mut self,
+            path: String,
+            events: &EventSink,
+        ) -> Result<(), WorkerError> {
+            self.record("save_profile");
+            if self.current_calibration.is_none() {
+                return Err(WorkerError::ProfileSave(
+                    "no calibration result to save".to_string(),
+                ));
+            }
+            events.profile_saved(path);
             Ok(())
         }
 
@@ -2997,6 +3735,185 @@ mod tests {
             "SetInput must emit a typed ImportMetadata event: {seen:?}"
         );
         assert!(ops_without_pointer_drain(&ops).contains(&"set_input"));
+    }
+
+    #[test]
+    fn start_calibration_emits_a_stage_sequence_and_a_result() {
+        let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (worker, events) = EngineWorker::spawn(MockBackend::new(Arc::clone(&ops)));
+        let handle = worker.handle();
+        handle
+            .send(WorkerCommand::StartCalibration {
+                options: crate::events::CalibrationOptions::default(),
+            })
+            .unwrap();
+        handle.send(WorkerCommand::Shutdown).unwrap();
+
+        let seen = drain_until_shutdown(&events);
+        let stages: Vec<crate::events::CalibrationStage> = seen
+            .iter()
+            .filter_map(|e| match e {
+                WorkerEvent::CalibrationStage { step, .. } => Some(*step),
+                _ => None,
+            })
+            .collect();
+        for expected in [
+            crate::events::CalibrationStage::Probing,
+            crate::events::CalibrationStage::DetectingProfiles,
+            crate::events::CalibrationStage::AudioSync,
+            crate::events::CalibrationStage::ExtractingFrames,
+            crate::events::CalibrationStage::Undistorting,
+            crate::events::CalibrationStage::FeatureMatching,
+            crate::events::CalibrationStage::Optimizing,
+        ] {
+            assert!(
+                stages.contains(&expected),
+                "expected a stage event for {expected:?}; saw {stages:?}"
+            );
+        }
+        assert!(
+            seen.iter()
+                .any(|e| matches!(e, WorkerEvent::CalibrationProgress { .. })),
+            "calibration must emit progress"
+        );
+        assert!(
+            seen.iter()
+                .any(|e| matches!(e, WorkerEvent::CalibrationResult { .. })),
+            "calibration must emit a scorecard result"
+        );
+    }
+
+    #[test]
+    fn a_stale_calibration_cancel_is_reset_by_a_new_run() {
+        // CALB-02: the shared flag is the cancel channel; a new run must clear
+        // a stale cancel left by a previous one, or every later run would abort
+        // immediately.
+        let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let flag = Arc::new(AtomicBool::new(true));
+        let mut mock = MockBackend::new(Arc::clone(&ops));
+        mock.calibration_cancel = Arc::clone(&flag);
+        let (worker, events) = EngineWorker::spawn(mock);
+        let handle = worker.handle();
+        handle
+            .send(WorkerCommand::StartCalibration {
+                options: crate::events::CalibrationOptions::default(),
+            })
+            .unwrap();
+        handle.send(WorkerCommand::Shutdown).unwrap();
+        drain_until_shutdown(&events);
+
+        assert!(
+            !flag.load(Ordering::SeqCst),
+            "a fresh calibration run must reset the shared cancel flag"
+        );
+    }
+
+    #[test]
+    fn two_incompatible_inputs_emit_a_compatibility_event() {
+        let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut mock = MockBackend::new(Arc::clone(&ops));
+        // Preload the right input with a different resolution than the default.
+        mock.mock_metadata[1] = Some(crate::events::InputMetadata {
+            resolution: crate::events::MetadataField::probed("3840×2160"),
+            fps: crate::events::MetadataField::probed("30 fps"),
+            duration: crate::events::MetadataField::estimated("0:05"),
+            codec: crate::events::MetadataField::missing(crate::events::Provenance::Probed),
+        });
+        let (worker, events) = EngineWorker::spawn(mock);
+        let handle = worker.handle();
+        handle
+            .send(WorkerCommand::SetInput {
+                role: crate::events::InputRole::Left,
+                path: "/media/a.mp4".to_string(),
+            })
+            .unwrap();
+        handle
+            .send(WorkerCommand::SetInput {
+                role: crate::events::InputRole::Right,
+                path: "/media/b.mp4".to_string(),
+            })
+            .unwrap();
+        handle.send(WorkerCommand::Shutdown).unwrap();
+
+        let seen = drain_until_shutdown(&events);
+        let mismatch = seen.iter().any(|e| match e {
+            WorkerEvent::Compatibility { issues } => issues
+                .iter()
+                .any(|i| i.code == crate::events::CompatibilityCode::ResolutionMismatch),
+            _ => false,
+        });
+        assert!(
+            mismatch,
+            "two different resolutions must emit a ResolutionMismatch: {seen:?}"
+        );
+    }
+
+    #[test]
+    fn changing_a_lens_override_after_a_run_invalidates_the_result() {
+        let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (worker, events) = EngineWorker::spawn(MockBackend::new(Arc::clone(&ops)));
+        let handle = worker.handle();
+        handle
+            .send(WorkerCommand::LoadProfile {
+                path: "/media/match.json".to_string(),
+            })
+            .unwrap();
+        handle
+            .send(WorkerCommand::SetLensOverride {
+                role: crate::events::InputRole::Left,
+                candidate: crate::events::LensCandidate {
+                    camera: "Mock Camera".to_string(),
+                    lens: "Wide".to_string(),
+                    width: 1920,
+                    height: 1080,
+                },
+            })
+            .unwrap();
+        handle.send(WorkerCommand::Shutdown).unwrap();
+
+        let seen = drain_until_shutdown(&events);
+        let loaded_idx = seen
+            .iter()
+            .position(|e| matches!(e, WorkerEvent::ProfileLoaded { .. }))
+            .expect("a ProfileLoaded event");
+        let invalidated_idx = seen
+            .iter()
+            .position(|e| matches!(e, WorkerEvent::ResultInvalidated))
+            .expect("changing an override after a run invalidates the result");
+        assert!(
+            invalidated_idx > loaded_idx,
+            "ResultInvalidated must follow the profile load"
+        );
+    }
+
+    #[test]
+    fn profile_load_then_save_round_trips_through_typed_events() {
+        let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (worker, events) = EngineWorker::spawn(MockBackend::new(Arc::clone(&ops)));
+        let handle = worker.handle();
+        handle
+            .send(WorkerCommand::LoadProfile {
+                path: "/media/match.json".to_string(),
+            })
+            .unwrap();
+        handle
+            .send(WorkerCommand::SaveProfile {
+                path: "/media/out.json".to_string(),
+            })
+            .unwrap();
+        handle.send(WorkerCommand::Shutdown).unwrap();
+
+        let seen = drain_until_shutdown(&events);
+        assert!(
+            seen.iter()
+                .any(|e| matches!(e, WorkerEvent::ProfileLoaded { path } if path == "/media/match.json")),
+            "load must emit ProfileLoaded with the path"
+        );
+        assert!(
+            seen.iter()
+                .any(|e| matches!(e, WorkerEvent::ProfileSaved { path } if path == "/media/out.json")),
+            "save must emit ProfileSaved with the path"
+        );
     }
 
     /// Drain events until `Shutdown`'s info line arrives, or time out.

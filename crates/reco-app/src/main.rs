@@ -23,9 +23,6 @@
 //! This binary is the only place `anyhow` is used; the presenter/engine types
 //! use typed `thiserror` errors (CONVENTIONS.md).
 
-// The calibration helpers are called by the worker's calibration job, which is
-// wired in Task 3 of this plan; until then the non-test build sees them unused.
-#[allow(dead_code)]
 mod calibration;
 mod commands;
 mod events;

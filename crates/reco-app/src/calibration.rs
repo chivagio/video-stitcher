@@ -101,7 +101,7 @@ pub fn check_compatibility(
 }
 
 /// Parse a `"1920×1080"` display value into `(width, height)`.
-fn parse_resolution(metadata: &InputMetadata) -> Option<(u32, u32)> {
+pub(crate) fn parse_resolution(metadata: &InputMetadata) -> Option<(u32, u32)> {
     let value = metadata.resolution.value.as_deref()?;
     let (w, h) = value.split_once('×')?;
     Some((w.trim().parse().ok()?, h.trim().parse().ok()?))
