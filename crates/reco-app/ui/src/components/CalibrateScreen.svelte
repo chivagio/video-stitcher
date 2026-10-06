@@ -18,6 +18,8 @@
   import AdvancedDisclosure from "./AdvancedDisclosure.svelte";
   import Scorecard from "./Scorecard.svelte";
   import FailurePanel from "./FailurePanel.svelte";
+  import CompatibilityBanner from "./CompatibilityBanner.svelte";
+  import { importStore } from "../lib/import.svelte";
 
   let {
     onRequestCancel,
@@ -77,6 +79,14 @@
           </p>
         {/if}
       </header>
+
+      {#if calibration.status === "ready" && importStore.readiness.findings.length > 0}
+        <CompatibilityBanner
+          report={importStore.readiness}
+          onCalibrateAnyway={handleStart}
+          onReviewInputs={onBackToImport}
+        />
+      {/if}
 
       <StageChecklist />
       <CalibrationProgress />

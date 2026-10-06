@@ -79,19 +79,42 @@ export interface InputMetadata {
   codec: MetadataField;
 }
 
-/** Which advisory compatibility check failed (mirror `events::CompatibilityCode`). */
-export type CompatibilityCode =
+/** How serious a readiness finding is (mirror `events::ReadinessSeverity`). */
+export type ReadinessSeverity =
+  | "blocking_shape"
+  | "likely_quality"
+  | "informational";
+
+/** Which readiness check produced a finding (mirror `events::ReadinessCode`). */
+export type ReadinessCode =
   | "resolution_mismatch"
   | "aspect_mismatch"
   | "fps_mismatch"
   | "codec_mismatch"
   | "lens_resolution_mismatch"
-  | "same_file";
+  | "same_file"
+  | "exposure_mismatch"
+  | "low_overlap"
+  | "lens_unavailable";
 
-/** One advisory compatibility finding (mirror `events::CompatibilityIssue`). */
-export interface CompatibilityIssue {
-  code: CompatibilityCode;
+/** One readiness finding (mirror `events::ReadinessFinding`). */
+export interface ReadinessFinding {
+  code: ReadinessCode;
+  severity: ReadinessSeverity;
+  /** User-facing reason authored in Rust; rendered verbatim. */
   message: string;
+  /** Whether the underlying value came from a sampled (estimated) pass. */
+  estimated: boolean;
+}
+
+/**
+ * The severity-sorted readiness report (mirror `events::ReadinessReport`).
+ * Unknown estimates are `null`, never a fabricated `0`.
+ */
+export interface ReadinessReport {
+  findings: ReadinessFinding[];
+  overlap_estimate: number | null;
+  exposure_delta_stops: number | null;
 }
 
 /** One lens-profile candidate for the override dropdown (mirror `events::LensCandidate`). */
@@ -183,7 +206,7 @@ export interface CalibrationOptions {
  */
 export type WorkerEventTyped =
   | { kind: "import_metadata"; data: { role: InputRole; metadata: InputMetadata } }
-  | { kind: "compatibility"; data: { issues: CompatibilityIssue[] } }
+  | { kind: "readiness"; data: { report: ReadinessReport } }
   | { kind: "lens_candidates"; data: { role: InputRole; candidates: LensCandidate[] } }
   | {
       kind: "lens_override_applied";

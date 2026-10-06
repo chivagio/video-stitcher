@@ -16,10 +16,10 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import type {
-  CompatibilityIssue,
   InputMetadata,
   InputRole,
   LensCandidate,
+  ReadinessReport,
   WorkerEventTyped,
 } from "./types";
 import { WORKER_EVENT_TYPED } from "./types";
@@ -90,8 +90,12 @@ class ImportStore {
     right: emptySlot("right"),
   });
 
-  /** The advisory compatibility findings; empty means every check passed. */
-  compatibility = $state<CompatibilityIssue[]>([]);
+  /** The severity-sorted readiness report; empty findings means all passed. */
+  readiness = $state<ReadinessReport>({
+    findings: [],
+    overlap_estimate: null,
+    exposure_delta_stops: null,
+  });
 
   /** Whether the check evaluation itself failed (degraded, never blocking). */
   checksUnavailable = $state(false);
@@ -149,8 +153,8 @@ class ImportStore {
         this.#removeFromQueue(role);
         break;
       }
-      case "compatibility": {
-        this.compatibility = event.data.issues;
+      case "readiness": {
+        this.readiness = event.data.report;
         this.checksUnavailable = false;
         this.checksError = null;
         break;

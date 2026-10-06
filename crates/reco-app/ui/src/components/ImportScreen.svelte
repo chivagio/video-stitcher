@@ -20,13 +20,13 @@
     importStore.inputs.left.status === "empty" &&
       importStore.inputs.right.status === "empty",
   );
-  const hasIssues = $derived(importStore.compatibility.length > 0);
+  const hasIssues = $derived(importStore.readiness.findings.length > 0);
 
   // "Review inputs" dismisses the banner so the operator can edit the slots.
   let bannerDismissed = $state(false);
   $effect(() => {
     // Reset the dismissal whenever the findings change.
-    void importStore.compatibility;
+    void importStore.readiness;
     bannerDismissed = false;
   });
 
@@ -86,7 +86,7 @@
       {/if}
       {#if bothReady && hasIssues && !bannerDismissed}
         <CompatibilityBanner
-          issues={importStore.compatibility}
+          report={importStore.readiness}
           onCalibrateAnyway={onCalibrate}
           onReviewInputs={() => (bannerDismissed = true)}
         />
