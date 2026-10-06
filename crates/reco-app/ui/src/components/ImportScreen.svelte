@@ -1,39 +1,41 @@
 <!--
-  Import screen (D3-01/02/03, IMPT-01/02): a centered 960px column on an opaque
-  dominant screen body. Two explicit camera slots side by side; a footer CTA
-  enabled only when both clips are valid. Below the slots sits the
-  InlineNotice/CompatibilityBanner area (wired in Task 3).
+  Import screen (D3-01/02/03, IMPT-01..IMPT-06): a centered 960px column on an
+  opaque dominant screen body. Two explicit camera slots side by side; below
+  them the InlineNotice/CompatibilityBanner area; then the footer action row
+  with the Calibrate CTA and the profile load/save actions.
 -->
 <script lang="ts">
   import type { InputRole } from "../lib/types";
   import { importStore } from "../lib/import.svelte";
   import FileDropSlot from "./FileDropSlot.svelte";
   import ActionButton from "./ActionButton.svelte";
+  import CompatibilityBanner from "./CompatibilityBanner.svelte";
+  import InlineNotice from "./InlineNotice.svelte";
+  import ProfileActions from "./ProfileActions.svelte";
 
   let { onCalibrate }: { onCalibrate: () => void } = $props();
 
-  const bothReady = $derived(
-    importStore.inputs.left.status === "ready" &&
-      importStore.inputs.right.status === "ready",
-  );
+  const bothReady = $derived(importStore.bothReady);
   const bothEmpty = $derived(
     importStore.inputs.left.status === "empty" &&
       importStore.inputs.right.status === "empty",
   );
+  const hasIssues = $derived(importStore.compatibility.length > 0);
+
+  // "Review inputs" dismisses the banner so the operator can edit the slots.
+  let bannerDismissed = $state(false);
+  $effect(() => {
+    // Reset the dismissal whenever the findings change.
+    void importStore.compatibility;
+    bannerDismissed = false;
+  });
 
   function handleChoose(role: InputRole): void {
     void importStore.chooseFile(role);
   }
 
-  // Dropping two files at once fills A then B (D3-03); a single file fills the
-  // slot it was dropped on.
   function handleDropFiles(role: InputRole, paths: string[]): void {
-    if (paths.length >= 2) {
-      void importStore.setPathFromDrop("left", paths[0]);
-      void importStore.setPathFromDrop("right", paths[1]);
-    } else if (paths.length === 1) {
-      void importStore.setPathFromDrop(role, paths[0]);
-    }
+    void importStore.dropFiles(role, paths);
   }
 </script>
 
@@ -69,18 +71,45 @@
       />
     </div>
 
-    <footer class="import-footer">
-      <ActionButton
-        variant="primary"
-        disabled={!bothReady}
-        title={bothReady ? "Start calibration" : "Select two clips to calibrate."}
-        onClick={onCalibrate}
-      >
-        Calibrate
-      </ActionButton>
-      {#if !bothReady}
-        <span class="disabled-hint">Select two clips to calibrate.</span>
+    <div class="notices">
+      {#if importStore.checksUnavailable}
+        <InlineNotice
+          level="warn"
+          message={`Couldn't run compatibility checks: ${importStore.checksError ?? "unknown error"}. You can still calibrate.`}
+        />
       {/if}
+      {#if importStore.resultInvalidated}
+        <InlineNotice
+          level="warn"
+          message="Inputs changed — the loaded calibration no longer matches. Re-run calibration."
+        />
+      {/if}
+      {#if bothReady && hasIssues && !bannerDismissed}
+        <CompatibilityBanner
+          issues={importStore.compatibility}
+          onCalibrateAnyway={onCalibrate}
+          onReviewInputs={() => (bannerDismissed = true)}
+        />
+      {:else if bothReady && !hasIssues && !importStore.checksUnavailable}
+        <p class="compatible-line">Inputs look compatible.</p>
+      {/if}
+    </div>
+
+    <footer class="import-footer">
+      <div class="footer-cta">
+        <ActionButton
+          variant="primary"
+          disabled={!bothReady}
+          title={bothReady ? "Start calibration" : "Select two clips to calibrate."}
+          onClick={onCalibrate}
+        >
+          Calibrate
+        </ActionButton>
+        {#if !bothReady}
+          <span class="disabled-hint">Select two clips to calibrate.</span>
+        {/if}
+      </div>
+      <ProfileActions />
     </footer>
   </div>
 </div>
@@ -135,7 +164,27 @@
     gap: var(--space-lg);
   }
 
+  .notices {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-sm);
+  }
+
+  .compatible-line {
+    margin: 0;
+    color: var(--color-success);
+    font-size: var(--text-body);
+  }
+
   .import-footer {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: var(--space-md);
+  }
+
+  .footer-cta {
     display: flex;
     align-items: center;
     gap: var(--space-md);

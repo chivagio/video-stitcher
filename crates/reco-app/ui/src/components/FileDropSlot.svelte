@@ -10,6 +10,7 @@
   import type { InputRole } from "../lib/types";
   import type { InputSlot } from "../lib/import.svelte";
   import MetadataTable from "./MetadataTable.svelte";
+  import LensProfilePicker from "./LensProfilePicker.svelte";
 
   let {
     slot,
@@ -81,6 +82,7 @@
 
   {#if slot.status === "ready"}
     <MetadataTable metadata={slot.metadata} />
+    <LensProfilePicker {slot} />
   {:else if slot.status === "loading"}
     <MetadataTable metadata={null} loading />
   {/if}
