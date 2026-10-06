@@ -23,6 +23,12 @@ import type {
   WorkerEventTyped,
 } from "./types";
 import { WORKER_EVENT_TYPED } from "./types";
+import { formatWorkerError } from "./errors";
+import { calibration } from "./calibration.svelte";
+
+// Re-exported for existing consumers; the canonical implementation lives in
+// `errors.ts` so the calibration store can share it without an import cycle.
+export { formatWorkerError };
 
 /** Per-slot state machine (UI-SPEC Import Screen Contract). */
 export type InputStatus = "empty" | "loading" | "error" | "ready";
@@ -72,37 +78,6 @@ function emptySlot(role: InputRole): InputSlot {
     candidatesStatus: "idle",
     candidatesError: null,
   };
-}
-
-/**
- * Render a typed worker error (or a rejected command) as display text.
- *
- * Worker errors cross IPC as the externally-tagged `WorkerError` enum, e.g.
- * `{ Engine: "…" }` or `{ InvalidInput: { field, reason } }`. This unwraps the
- * typed inner text so the UI renders the engine/worker message, never a bare
- * code or `[object Object]` (CONVENTIONS.md:113).
- */
-export function formatWorkerError(error: unknown): string {
-  if (error == null) return "unknown error";
-  if (typeof error === "string") return error;
-  if (typeof error === "object") {
-    const obj = error as Record<string, unknown>;
-    const keys = Object.keys(obj);
-    if (keys.length === 1) {
-      const payload = obj[keys[0]];
-      if (typeof payload === "string") return payload;
-      if (payload && typeof payload === "object") {
-        const p = payload as Record<string, unknown>;
-        if (typeof p.field === "string" && typeof p.reason === "string") {
-          return `invalid ${p.field}: ${p.reason}`;
-        }
-        return JSON.stringify(payload);
-      }
-    }
-    if (typeof obj.message === "string") return obj.message;
-    return JSON.stringify(error);
-  }
-  return String(error);
 }
 
 /**
@@ -255,6 +230,11 @@ class ImportStore {
       this.profileError = message;
       return;
     }
+    // A calibration failure while a run is in flight belongs to the calibration
+    // store (it renders the typed error on the Calibrate screen). Without this
+    // guard the generic fallback below would mislabel it as a compatibility
+    // check failure and pollute the Import screen (E9 / T-03-17).
+    if (calibration.isActive) return;
     if (this.bothReady) {
       this.checksUnavailable = true;
       this.checksError = message;

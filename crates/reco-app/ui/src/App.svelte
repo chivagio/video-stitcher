@@ -25,6 +25,7 @@
   import { presenter } from "./lib/presenter.svelte";
   import { log } from "./lib/log.svelte";
   import { importStore } from "./lib/import.svelte";
+  import { calibration } from "./lib/calibration.svelte";
   import PreviewSurface from "./components/PreviewSurface.svelte";
   import Timeline from "./components/Timeline.svelte";
   import TimecodeReadout from "./components/TimecodeReadout.svelte";
@@ -35,6 +36,8 @@
   import LogDrawer from "./components/LogDrawer.svelte";
   import WorkflowRail from "./components/WorkflowRail.svelte";
   import ImportScreen from "./components/ImportScreen.svelte";
+  import CalibrateScreen from "./components/CalibrateScreen.svelte";
+  import ConfirmDialog from "./components/ConfirmDialog.svelte";
   import type { PresenterKind, Screen, ViewMode } from "./lib/types";
 
   // Chrome state (reported to the worker via set_chrome).
@@ -47,6 +50,10 @@
   // Active screen (D3-01). Import is the landing screen when no result exists.
   let screen = $state<Screen>("import");
 
+  // Cancel-calibration confirmation (CALB-02). Owned here so the dialog overlays
+  // the whole app; the Calibrate screen requests it via `onRequestCancel`.
+  let cancelDialogOpen = $state(false);
+
   // Initialize stores on mount, then reconcile with the worker.
   onMount(() => {
     void (async () => {
@@ -58,6 +65,7 @@
       // its listener is registered when `republish_projection` fires (A10
       // ordering).
       await importStore.init();
+      await calibration.init();
       // Subscribe first, *then* ask the worker to re-assert its state. The
       // worker boots and imports before the webview has loaded, and the event
       // bridge only reaches listeners registered at emit time — so its opening
@@ -76,6 +84,7 @@
       presenter.destroy();
       log.destroy();
       importStore.destroy();
+      calibration.destroy();
     };
   });
 
@@ -138,11 +147,24 @@
     screen = next;
   }
 
-  // Calibrate CTA on the Import screen. Plan 03-05 wires the routing; the
-  // wizard body itself ships in plan 03-06 (the placeholder below is replaced
-  // there).
+  // Calibrate CTA on the Import screen (plan 03-05 routing).
   function handleCalibrate(): void {
     screen = "calibrate";
+  }
+
+  // Cancel-calibration confirmation (CALB-02). The Calibrate screen requests
+  // the dialog; confirming sets the worker's shared cancel flag.
+  function handleRequestCancel(): void {
+    cancelDialogOpen = true;
+  }
+
+  function handleConfirmCancel(): void {
+    cancelDialogOpen = false;
+    void calibration.cancel();
+  }
+
+  function handleKeepRunning(): void {
+    cancelDialogOpen = false;
   }
 
   // Pose controls.
@@ -221,9 +243,10 @@
   // Calibrate needs both clips valid, or a loaded profile (which populates a
   // result the operator can preview without re-running).
   const calibrateEnabled = $derived(bothReady || importStore.profilePath !== null);
-  // Preview needs a valid result — a loaded profile counts; a fresh run's
-  // result is wired by the calibration store in plan 03-06.
-  const previewEnabled = $derived(importStore.hasResult);
+  // Preview needs a valid result — a loaded profile or a fresh calibration run.
+  const previewEnabled = $derived(
+    importStore.hasResult || calibration.result !== null,
+  );
 </script>
 
 <svelte:window onkeydown={handleGlobalKeyDown} />
@@ -243,14 +266,11 @@
     <!-- Import screen: opaque dominant, covers the native preview region. -->
     <ImportScreen onCalibrate={handleCalibrate} />
   {:else if screen === "calibrate"}
-    <!-- Calibrate placeholder (plan 03-05 router); the wizard ships in 03-06. -->
-    <div class="calibrate-placeholder">
-      <h2 class="placeholder-title">Ready to calibrate</h2>
-      <p class="placeholder-body">
-        Both clips are loaded and checked. Start calibration when you're ready.
-      </p>
-      <p class="placeholder-note">The calibration wizard ships in plan 03-06.</p>
-    </div>
+    <!-- Calibrate wizard (CALB-01/02/03). -->
+    <CalibrateScreen
+      onRequestCancel={handleRequestCancel}
+      onBackToImport={() => (screen = "import")}
+    />
   {:else}
     <!-- Preview surface (transparent in native mode) -->
     <PreviewSurface
@@ -334,6 +354,18 @@
 
   <!-- Event-log drawer (global; toggled from the workflow rail). -->
   <LogDrawer expanded={drawerExpanded} onToggle={handleDrawerToggle} />
+
+  <!-- Cancel-calibration confirmation (CALB-02). -->
+  <ConfirmDialog
+    open={cancelDialogOpen}
+    heading="Cancel calibration?"
+    body="The calibration will stop and the partial result will be discarded. You can start again at any time."
+    confirmLabel="Cancel calibration"
+    cancelLabel="Keep running"
+    destructive={true}
+    onConfirm={handleConfirmCancel}
+    onCancel={handleKeepRunning}
+  />
 </div>
 
 <style>
@@ -364,35 +396,4 @@
     gap: var(--space-sm);
   }
 
-  .calibrate-placeholder {
-    position: fixed;
-    top: var(--workflow-rail-height);
-    left: 0;
-    right: 0;
-    bottom: 0;
-    /* Opaque dominant: no native preview surface may show through (UI-SPEC
-       Screen Router). The native view is suspended on this screen by Rust. */
-    background: var(--color-dominant);
-    padding: var(--space-3xl) var(--space-lg);
-    overflow-y: auto;
-  }
-
-  .placeholder-title {
-    margin: 0;
-    font-size: var(--text-display);
-    font-weight: var(--weight-semibold);
-    line-height: var(--line-tight);
-    color: var(--color-body-text);
-  }
-
-  .placeholder-body {
-    margin: var(--space-sm) 0 0;
-    color: var(--color-log-info);
-  }
-
-  .placeholder-note {
-    margin: var(--space-lg) 0 0;
-    color: var(--color-log-info);
-    font-style: italic;
-  }
 </style>
