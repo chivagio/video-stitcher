@@ -186,3 +186,280 @@ pub fn solve_manual_calibration(
         auto_used: auto.len(),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::geometry::OptParams;
+    use approx::assert_abs_diff_eq;
+
+    /// Synthetic test-rig resolution (both cameras share it, like a matched pair).
+    const LW: u32 = 1920;
+    const LH: u32 = 1080;
+    const RW: u32 = 1920;
+    const RH: u32 = 1080;
+
+    /// A truth rig consistent with the crate's ray-trace generator (rotations
+    /// are zero because the generator does not encode them).
+    fn truth() -> OptParams {
+        OptParams {
+            x_ty: 0.01,
+            intersect: 0.55,
+            cam_d: 0.24,
+            x_rz: 0.0,
+            z_rx: 0.0,
+            z_rz: None,
+            x_rx: None,
+        }
+    }
+
+    /// Ray-trace `n` plane-coordinate pairs exactly consistent with `true_params`.
+    ///
+    /// Mirrors `optimizer::tests::synthetic_points` (that helper is private to
+    /// its module, so a small local copy keeps this module self-contained).
+    fn synthetic_points(true_params: &OptParams, n: usize) -> Vec<MatchedPoint> {
+        use crate::geometry::PLANE_WIDTH;
+
+        let half_offset = PLANE_WIDTH / 2.0 * (1.0 - true_params.intersect);
+        let cam = nalgebra::Vector3::new(true_params.cam_d, 0.0, true_params.cam_d);
+
+        let mut points = Vec::with_capacity(n);
+        let grid = (n as f64).sqrt().ceil() as usize;
+
+        for iy in 0..grid {
+            for ix in 0..grid {
+                if points.len() >= n {
+                    break;
+                }
+                let fx = (ix as f64 + 0.5) / grid as f64;
+                let fy = (iy as f64 + 0.5) / grid as f64;
+
+                let yaw = -0.9 + fx * 0.5;
+                let pitch = (fy - 0.5) * 0.4;
+                let d = nalgebra::Vector3::new(yaw, pitch, yaw - 0.3).normalize();
+
+                if d.z.abs() < 1e-10 || d.x.abs() < 1e-10 {
+                    continue;
+                }
+                let t_x = -cam.z / d.z;
+                let t_z = -cam.x / d.x;
+                if t_x < 0.0 || t_z < 0.0 {
+                    continue;
+                }
+
+                let hit_x = cam + t_x * d;
+                let hit_z = cam + t_z * d;
+
+                let x_coord = hit_x.x - half_offset;
+                let y_coord = -(hit_x.y - true_params.x_ty);
+                let z_coord = -(hit_z.z - half_offset);
+                let z_y = -hit_z.y;
+
+                points.push(MatchedPoint::from_planes(
+                    [x_coord, y_coord],
+                    [z_coord, z_y],
+                ));
+            }
+        }
+        points
+    }
+
+    /// Inverse of [`normalize_to_plane`]: a plane coordinate back to pixels.
+    fn plane_to_px(plane: [f64; 2], w: u32, h: u32) -> [f64; 2] {
+        let wf = w as f64;
+        let hf = h as f64;
+        [(plane[0] + 0.5) * wf, (plane[1] * wf / hf + 0.5) * hf]
+    }
+
+    /// Reconstruct natural-order pixel pins from optimizer-space points, so the
+    /// swap-correct [`pin_to_matched_point`] round-trips back to the same points.
+    fn pins_from_points(points: &[MatchedPoint]) -> Vec<ManualPin> {
+        points
+            .iter()
+            .map(|p| ManualPin {
+                // `.left` holds the right camera's pixel (x-plane);
+                // `.right` holds the left camera's pixel (z-plane).
+                right_px: plane_to_px(p.left, RW, RH),
+                left_px: plane_to_px(p.right, LW, LH),
+            })
+            .collect()
+    }
+
+    /// Guards the swap: swap-correct pins recover the synthetic truth.
+    #[test]
+    fn swap_correct_pins_recover_the_synthetic_truth() {
+        let t = truth();
+        let points = synthetic_points(&t, 64);
+        let pins = pins_from_points(&points);
+
+        // Sanity: the helper round-trips the generator's own points.
+        for (pin, expected) in pins.iter().zip(points.iter()) {
+            let mp = pin_to_matched_point(pin.left_px, pin.right_px, (LW, LH), (RW, RH));
+            assert_abs_diff_eq!(mp.left[0], expected.left[0], epsilon = 1e-9);
+            assert_abs_diff_eq!(mp.left[1], expected.left[1], epsilon = 1e-9);
+            assert_abs_diff_eq!(mp.right[0], expected.right[0], epsilon = 1e-9);
+            assert_abs_diff_eq!(mp.right[1], expected.right[1], epsilon = 1e-9);
+        }
+
+        let config = CalibrationConfig::default();
+        let result = solve_manual_calibration(&pins, &[], (LW, LH), (RW, RH), &config)
+            .expect("swap-correct solve should succeed");
+
+        assert_eq!(result.pins_used, pins.len());
+        assert_eq!(result.auto_used, 0);
+        assert_abs_diff_eq!(result.layout.camera_axis_offset, t.cam_d, epsilon = 0.02);
+        assert_abs_diff_eq!(result.layout.intersect, t.intersect, epsilon = 0.05);
+        assert_abs_diff_eq!(result.layout.x_ty, t.x_ty, epsilon = 0.01);
+    }
+
+    /// Guards the trap: the naive no-swap mapping yields a *different* rig with
+    /// a healthy residual, so residual alone cannot detect a wrong swap.
+    #[test]
+    fn no_swap_pins_do_not_recover_the_truth_and_residual_hides_it() {
+        let t = truth();
+        let points = synthetic_points(&t, 64);
+        let pins = pins_from_points(&points);
+
+        // The WRONG mapping: left pixel -> left plane, right pixel -> right plane.
+        let naive: Vec<MatchedPoint> = pins
+            .iter()
+            .map(|p| MatchedPoint {
+                left: normalize_to_plane(p.left_px[0], p.left_px[1], LW, LH),
+                right: normalize_to_plane(p.right_px[0], p.right_px[1], RW, RH),
+                left_pixel_nx: p.left_px[0] / LW as f64,
+                right_pixel_nx: p.right_px[0] / RW as f64,
+            })
+            .collect();
+
+        let config = CalibrationConfig::default();
+        let wrong = solve_manual_calibration(&[], &naive, (LW, LH), (RW, RH), &config)
+            .expect("the wrong-swap solve still returns a rig — that is the trap");
+
+        // The no-swap rig is self-consistent (low residual) but wrong: overlap
+        // collapses to ~0 and the vertical translation drifts off the truth.
+        assert!(
+            wrong.residual < 1e-3,
+            "wrong-swap residual should look healthy, got {}",
+            wrong.residual
+        );
+        assert!(
+            wrong.layout.intersect < 0.1,
+            "wrong swap collapses intersect toward 0, got {}",
+            wrong.layout.intersect
+        );
+        assert!(
+            (wrong.layout.intersect - t.intersect).abs() > 0.2,
+            "wrong-swap intersect must differ from truth"
+        );
+        assert!(
+            (wrong.layout.x_ty - t.x_ty).abs() > 0.01,
+            "wrong-swap x_ty must differ from truth"
+        );
+    }
+
+    /// Guards empty input: a typed error, never a bogus zero layout.
+    #[test]
+    fn empty_pin_set_is_a_typed_error_not_a_bogus_solve() {
+        let config = CalibrationConfig::default();
+        let err = solve_manual_calibration(&[], &[], (LW, LH), (RW, RH), &config)
+            .expect_err("an empty set must not solve");
+
+        match err {
+            CalibrateError::InsufficientMatches { got, min } => {
+                assert_eq!(got, 0);
+                assert_eq!(min, 1);
+            }
+            other => panic!("expected InsufficientMatches, got {other:?}"),
+        }
+    }
+
+    /// Guards coincident input: all pins at one location is degenerate.
+    #[test]
+    fn coincident_pins_are_rejected_as_degenerate() {
+        let config = CalibrationConfig::default();
+        let pins = vec![
+            ManualPin {
+                left_px: [960.0, 540.0],
+                right_px: [960.0, 540.0],
+            };
+            6
+        ];
+
+        let err = solve_manual_calibration(&pins, &[], (LW, LH), (RW, RH), &config)
+            .expect_err("coincident pins must not solve");
+        assert!(
+            matches!(err, CalibrateError::InvalidConfig(_)),
+            "expected a degenerate-set error, got {err:?}"
+        );
+    }
+
+    /// Guards collinear input: pins along a single line are degenerate.
+    #[test]
+    fn collinear_pins_are_rejected_as_degenerate() {
+        let config = CalibrationConfig::default();
+        let pins: Vec<ManualPin> = (0..8)
+            .map(|i| {
+                let x = 200.0 + i as f64 * 150.0;
+                ManualPin {
+                    left_px: [x, 540.0],
+                    right_px: [x, 540.0],
+                }
+            })
+            .collect();
+
+        let err = solve_manual_calibration(&pins, &[], (LW, LH), (RW, RH), &config)
+            .expect_err("collinear pins must not solve");
+        assert!(
+            matches!(err, CalibrateError::InvalidConfig(_)),
+            "expected a degenerate-set error, got {err:?}"
+        );
+    }
+
+    /// Guards ordering: reversing the pin order yields the same layout.
+    #[test]
+    fn pin_order_does_not_affect_the_solve() {
+        let t = truth();
+        let points = synthetic_points(&t, 64);
+        let mut pins = pins_from_points(&points);
+        let config = CalibrationConfig::default();
+
+        let forward = solve_manual_calibration(&pins, &[], (LW, LH), (RW, RH), &config)
+            .expect("forward solve should succeed");
+        pins.reverse();
+        let reversed = solve_manual_calibration(&pins, &[], (LW, LH), (RW, RH), &config)
+            .expect("reversed solve should succeed");
+
+        assert_abs_diff_eq!(
+            forward.layout.camera_axis_offset,
+            reversed.layout.camera_axis_offset,
+            epsilon = 1e-6
+        );
+        assert_abs_diff_eq!(
+            forward.layout.intersect,
+            reversed.layout.intersect,
+            epsilon = 1e-6
+        );
+        assert_abs_diff_eq!(forward.layout.x_ty, reversed.layout.x_ty, epsilon = 1e-6);
+        assert_abs_diff_eq!(forward.layout.x_rz, reversed.layout.x_rz, epsilon = 1e-6);
+        assert_abs_diff_eq!(forward.layout.z_rx, reversed.layout.z_rx, epsilon = 1e-6);
+    }
+
+    /// Guards MANU-04: pre-swapped auto matches are appended without re-swapping.
+    #[test]
+    fn prepopulated_auto_matches_are_not_re_swapped() {
+        let t = truth();
+        let points = synthetic_points(&t, 64);
+        let (auto, pin_pts) = points.split_at(32);
+        let pins = pins_from_points(pin_pts);
+
+        let config = CalibrationConfig::default();
+        let result = solve_manual_calibration(&pins, auto, (LW, LH), (RW, RH), &config)
+            .expect("auto + pins solve should succeed");
+
+        assert_eq!(result.pins_used, pins.len());
+        assert_eq!(result.auto_used, auto.len());
+        assert_abs_diff_eq!(result.layout.camera_axis_offset, t.cam_d, epsilon = 0.02);
+        assert_abs_diff_eq!(result.layout.intersect, t.intersect, epsilon = 0.05);
+        assert_abs_diff_eq!(result.layout.x_ty, t.x_ty, epsilon = 0.01);
+    }
+}
