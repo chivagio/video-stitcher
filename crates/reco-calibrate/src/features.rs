@@ -9,6 +9,7 @@
 //! be added as separate implementations behind the same interface.
 
 use crate::akaze;
+use crate::types::MatchConfig;
 
 /// Descriptor size in bytes (512 bits = 64 bytes, AKAZE M-LDB).
 const DESC_BYTES: usize = akaze::DESC_BYTES;
@@ -422,6 +423,24 @@ pub fn match_descriptors(left: &[Descriptor], right: &[Descriptor], ratio: f64) 
     matches
 }
 
+/// Derive a per-frame Lowe ratio from descriptor-distance statistics (CALB-07).
+///
+/// (RED stub — implementation added in the GREEN step.)
+pub fn adaptive_lowe_ratio(_left: &[Descriptor], _right: &[Descriptor], cfg: &MatchConfig) -> f64 {
+    cfg.ratio_min
+}
+
+/// Match descriptors coarse-to-fine with scale-consistent verification (CALB-07).
+///
+/// (RED stub — implementation added in the GREEN step.)
+pub fn match_descriptors_multiscale(
+    _left: &[Descriptor],
+    _right: &[Descriptor],
+    _cfg: &MatchConfig,
+) -> Vec<RawMatch> {
+    Vec::new()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -482,5 +501,101 @@ mod tests {
         let matches = match_descriptors(&left, &right, 0.7);
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].right_idx, 0); // matched to d_close
+    }
+
+    /// Build a descriptor whose first byte is `b` (remaining bytes zero).
+    fn unique_desc(b: u8) -> Descriptor {
+        let mut d = [0u8; DESC_BYTES];
+        d[0] = b;
+        d
+    }
+
+    fn unique_set(n: u8) -> Vec<Descriptor> {
+        (0..n).map(unique_desc).collect()
+    }
+
+    #[test]
+    fn adaptive_ratio_stays_within_bounds() {
+        let cfg = MatchConfig::default();
+        let left = unique_set(12);
+        let right = left.clone();
+        let ratio = adaptive_lowe_ratio(&left, &right, &cfg);
+        assert!(
+            (cfg.ratio_min..=cfg.ratio_max).contains(&ratio),
+            "ratio {ratio} outside [{}, {}]",
+            cfg.ratio_min,
+            cfg.ratio_max
+        );
+
+        // A too-thin sample must still respect the bounds (via the fallback).
+        let ratio_thin = adaptive_lowe_ratio(&left[..2], &right[..2], &cfg);
+        assert!((cfg.ratio_min..=cfg.ratio_max).contains(&ratio_thin));
+    }
+
+    #[test]
+    fn adaptive_ratio_falls_back_when_sample_is_thin() {
+        let cfg = MatchConfig::default();
+        let left = vec![[0u8; DESC_BYTES]; 3];
+        let right = vec![[0u8; DESC_BYTES], [0xFFu8; DESC_BYTES]];
+        assert_eq!(
+            adaptive_lowe_ratio(&left, &right, &cfg),
+            cfg.lowe_ratio,
+            "thin samples must return the fixed fallback ratio"
+        );
+    }
+
+    #[test]
+    fn well_separated_ratio_is_wider_than_noisy() {
+        let cfg = MatchConfig::default();
+        // Well-separated: every query has an exact partner (best distance 0).
+        let well = unique_set(12);
+        let well_ratio = adaptive_lowe_ratio(&well, &well, &cfg);
+
+        // Noisy: queries are all-zeros, train is maximally distant.
+        let noisy_q = vec![[0u8; DESC_BYTES]; 12];
+        let noisy_t = vec![[0xFFu8; DESC_BYTES]; 12];
+        let noisy_ratio = adaptive_lowe_ratio(&noisy_q, &noisy_t, &cfg);
+
+        assert!(
+            well_ratio > noisy_ratio,
+            "well-separated ({well_ratio}) should be looser than noisy ({noisy_ratio})"
+        );
+    }
+
+    #[test]
+    fn multiscale_keeps_cross_checked_matches() {
+        let cfg = MatchConfig::default();
+        let left = unique_set(12);
+        let right = left.clone();
+        let fine = match_descriptors(&left, &right, cfg.lowe_ratio);
+        let multi = match_descriptors_multiscale(&left, &right, &cfg);
+
+        assert!(!multi.is_empty(), "expected matches for identical sets");
+        assert!(
+            multi.iter().all(|m| fine
+                .iter()
+                .any(|f| f.left_idx == m.left_idx && f.right_idx == m.right_idx)),
+            "every multi-scale match must survive the single-scale cross-check"
+        );
+    }
+
+    #[test]
+    fn multiscale_disabled_matches_single_scale_exactly() {
+        let cfg = MatchConfig {
+            multi_scale: false,
+            adaptive_ratio: false,
+            ..Default::default()
+        };
+        let left = unique_set(12);
+        let right = left.clone();
+        let single = match_descriptors(&left, &right, cfg.lowe_ratio);
+        let multi = match_descriptors_multiscale(&left, &right, &cfg);
+
+        assert_eq!(multi.len(), single.len());
+        for (a, b) in multi.iter().zip(single.iter()) {
+            assert_eq!(a.left_idx, b.left_idx);
+            assert_eq!(a.right_idx, b.right_idx);
+            assert_eq!(a.distance, b.distance);
+        }
     }
 }

@@ -160,6 +160,21 @@ pub struct MatchConfig {
     /// through unchanged. Default `0.5`.
     #[serde(default = "default_exposure_target")]
     pub exposure_target: f64,
+    /// Derive the Lowe ratio per frame from descriptor-distance statistics
+    /// instead of using the fixed [`Self::lowe_ratio`] (CALB-07). Default `true`.
+    #[serde(default = "default_true")]
+    pub adaptive_ratio: bool,
+    /// Lower bound for the adaptive Lowe ratio (strictest). Default `0.65`.
+    #[serde(default = "default_ratio_min")]
+    pub ratio_min: f64,
+    /// Upper bound for the adaptive Lowe ratio (loosest). Default `0.85`.
+    #[serde(default = "default_ratio_max")]
+    pub ratio_max: f64,
+    /// Run coarse-to-fine multi-scale matching with scale-consistent
+    /// verification (CALB-07). When `false`, matching reduces exactly to the
+    /// single-scale cross-checked matcher. Default `true`.
+    #[serde(default = "default_true")]
+    pub multi_scale: bool,
 }
 
 /// Serde default helper: `true`.
@@ -170,6 +185,16 @@ fn default_true() -> bool {
 /// Serde default helper: the linear-light exposure target.
 fn default_exposure_target() -> f64 {
     0.5
+}
+
+/// Serde default helper: adaptive-ratio lower bound.
+fn default_ratio_min() -> f64 {
+    0.65
+}
+
+/// Serde default helper: adaptive-ratio upper bound.
+fn default_ratio_max() -> f64 {
+    0.85
 }
 
 impl Default for MatchConfig {
@@ -185,6 +210,10 @@ impl Default for MatchConfig {
             ransac_threshold: 1.0,
             exposure_normalize: true,
             exposure_target: 0.5,
+            adaptive_ratio: true,
+            ratio_min: 0.65,
+            ratio_max: 0.85,
+            multi_scale: true,
         }
     }
 }
@@ -369,6 +398,24 @@ impl CalibrationConfig {
             return Err(CalibrateError::InvalidConfig(format!(
                 "exposure_target must be in (0, 1], got {}",
                 self.matching.exposure_target
+            )));
+        }
+        if !(self.matching.ratio_min > 0.0 && self.matching.ratio_min <= 1.0) {
+            return Err(CalibrateError::InvalidConfig(format!(
+                "ratio_min must be in (0, 1], got {}",
+                self.matching.ratio_min
+            )));
+        }
+        if !(self.matching.ratio_max > 0.0 && self.matching.ratio_max <= 1.0) {
+            return Err(CalibrateError::InvalidConfig(format!(
+                "ratio_max must be in (0, 1], got {}",
+                self.matching.ratio_max
+            )));
+        }
+        if self.matching.ratio_min > self.matching.ratio_max {
+            return Err(CalibrateError::InvalidConfig(format!(
+                "ratio_min ({}) must be <= ratio_max ({})",
+                self.matching.ratio_min, self.matching.ratio_max
             )));
         }
         Ok(())
