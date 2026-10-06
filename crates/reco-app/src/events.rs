@@ -176,6 +176,84 @@ pub struct CompatibilityIssue {
     pub message: String,
 }
 
+/// Severity of one readiness finding (CALB-05).
+///
+/// Declared least-severe-last so a plain `sort` puts blocking-shape findings
+/// first, likely-quality next, informational last. Serializes snake_case.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ReadinessSeverity {
+    /// A shape mismatch — a run will almost certainly fail.
+    BlockingShape,
+    /// Compatible shape but likely to reduce stitch quality.
+    LikelyQuality,
+    /// Informational only; never a reason to avoid a run.
+    Informational,
+}
+
+/// Which readiness check produced a finding (CALB-05).
+///
+/// A superset of the Phase-3 [`CompatibilityCode`]: the same shape checks plus
+/// the sampled exposure/overlap estimates and lens-profile availability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ReadinessCode {
+    /// The two clips have different frame resolutions.
+    ResolutionMismatch,
+    /// The two clips have different aspect ratios (tolerance ~1%).
+    AspectMismatch,
+    /// The two clips' frame rates differ by more than 0.5 fps.
+    FpsMismatch,
+    /// The two clips use different codecs.
+    CodecMismatch,
+    /// A lens override's resolution does not match the input's.
+    LensResolutionMismatch,
+    /// Both slots point at the same file.
+    SameFile,
+    /// The sampled exposure differs by more than the configured threshold.
+    ExposureMismatch,
+    /// The sampled overlap estimate is below the usable threshold.
+    LowOverlap,
+    /// No lens profile matched either camera.
+    LensUnavailable,
+}
+
+/// One readiness finding (CALB-05).
+///
+/// `message` is already user-facing: the webview renders it verbatim and never
+/// invents a reason (T-04-08). `estimated` marks a value derived from a sampled
+/// frame pair rather than a directly measured property.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ReadinessFinding {
+    /// Which check produced this finding.
+    pub code: ReadinessCode,
+    /// How serious the finding is (drives the banner group).
+    pub severity: ReadinessSeverity,
+    /// Human-readable reason.
+    pub message: String,
+    /// Whether the underlying value was estimated from a sample.
+    pub estimated: bool,
+}
+
+/// The severity-sorted readiness report for the two selected inputs (CALB-05).
+///
+/// Non-blocking by design (consent, not prevention). `overlap_estimate` and
+/// `exposure_delta_stops` are `None` when the cheap sampled pass could not run —
+/// an honest unknown, never a fabricated `0.0`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ReadinessReport {
+    /// The findings, sorted blocking-shape first, informational last.
+    pub findings: Vec<ReadinessFinding>,
+    /// Estimated horizontal overlap fraction (`0.0..=1.0`), or `None` if unknown.
+    pub overlap_estimate: Option<f64>,
+    /// Estimated exposure difference in stops, or `None` if unknown.
+    pub exposure_delta_stops: Option<f64>,
+}
+
 /// One lens-profile candidate for the override dropdown (IMPT-04 / D3-07).
 ///
 /// Mirrors `reco_calibrate::types::LensProfileSummary` so the frontend never

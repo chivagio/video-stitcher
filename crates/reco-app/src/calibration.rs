@@ -19,8 +19,41 @@ use reco_core::calibration::CameraParams;
 use crate::events::{
     CalibrationDiagnosis, CalibrationOptions, CalibrationStage, CompatibilityCode,
     CompatibilityIssue, ConfidenceBand, DiagnosisMetrics, InputMetadata, LensProfileView,
-    Scorecard, SyncMethod, SyncView,
+    ReadinessCode, ReadinessFinding, ReadinessReport, ReadinessSeverity, Scorecard, SyncMethod,
+    SyncView,
 };
+
+/// Sampled statistics feeding the readiness estimate (CALB-05).
+///
+/// Both fields are `None` when the cheap sampled pass could not run (a decode
+/// failure, a non-UTF8 path, …): the report then states the value is unknown
+/// rather than faking a number (T-04-07).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ReadinessSamples {
+    /// Estimated horizontal overlap fraction (`0.0..=1.0`), if sampled.
+    pub overlap: Option<f64>,
+    /// Estimated exposure difference in stops, if sampled.
+    pub exposure_delta_stops: Option<f64>,
+}
+
+/// Severity-sorted readiness projection for the two selected inputs (CALB-05).
+///
+/// (RED stub — the severity classification and the sampled findings are added
+/// in the GREEN step.)
+pub fn estimate_readiness(
+    _left: &InputMetadata,
+    _right: &InputMetadata,
+    _left_path: &str,
+    _right_path: &str,
+    _lens_available: bool,
+    samples: ReadinessSamples,
+) -> ReadinessReport {
+    ReadinessReport {
+        findings: Vec::new(),
+        overlap_estimate: samples.overlap,
+        exposure_delta_stops: samples.exposure_delta_stops,
+    }
+}
 
 /// The advisory compatibility findings for the two selected inputs (IMPT-03).
 ///
@@ -481,6 +514,135 @@ mod tests {
                 .iter()
                 .all(|i| i.code != CompatibilityCode::FpsMismatch),
             "30 vs 30.2 fps is within tolerance"
+        );
+    }
+
+    #[test]
+    fn differing_resolutions_produce_a_blocking_shape_readiness_finding() {
+        let left = metadata("1920×1080", "30 fps", Some("h264"));
+        let right = metadata("3840×2160", "30 fps", Some("h264"));
+        let report = estimate_readiness(
+            &left,
+            &right,
+            "/a.mp4",
+            "/b.mp4",
+            true,
+            ReadinessSamples::default(),
+        );
+        assert!(
+            report.findings.iter().any(|f| f.code == ReadinessCode::ResolutionMismatch
+                && f.severity == ReadinessSeverity::BlockingShape),
+            "expected a BlockingShape resolution finding: {:?}",
+            report.findings
+        );
+    }
+
+    #[test]
+    fn an_exposure_delta_above_threshold_is_a_likely_quality_estimate() {
+        let left = metadata("1920×1080", "30 fps", Some("h264"));
+        let right = metadata("1920×1080", "30 fps", Some("h264"));
+        let report = estimate_readiness(
+            &left,
+            &right,
+            "/a.mp4",
+            "/b.mp4",
+            true,
+            ReadinessSamples {
+                overlap: Some(0.5),
+                exposure_delta_stops: Some(2.0),
+            },
+        );
+        let finding = report
+            .findings
+            .iter()
+            .find(|f| f.code == ReadinessCode::ExposureMismatch)
+            .expect("an exposure finding");
+        assert_eq!(finding.severity, ReadinessSeverity::LikelyQuality);
+        assert!(
+            finding.estimated,
+            "an exposure delta from sampling must be labelled estimated"
+        );
+        assert_eq!(report.exposure_delta_stops, Some(2.0));
+    }
+
+    #[test]
+    fn no_lens_profile_is_an_informational_finding_never_blocking() {
+        let left = metadata("1920×1080", "30 fps", Some("h264"));
+        let right = metadata("1920×1080", "30 fps", Some("h264"));
+        let report = estimate_readiness(
+            &left,
+            &right,
+            "/a.mp4",
+            "/b.mp4",
+            false,
+            ReadinessSamples::default(),
+        );
+        let finding = report
+            .findings
+            .iter()
+            .find(|f| f.code == ReadinessCode::LensUnavailable)
+            .expect("a lens-unavailable finding");
+        assert_eq!(finding.severity, ReadinessSeverity::Informational);
+        assert!(
+            report
+                .findings
+                .iter()
+                .all(|f| f.severity != ReadinessSeverity::BlockingShape),
+            "no lens profile must never block: {:?}",
+            report.findings
+        );
+    }
+
+    #[test]
+    fn findings_are_sorted_blocking_shape_then_likely_quality_then_informational() {
+        let left = metadata("1920×1080", "30 fps", Some("h264"));
+        let right = metadata("3840×2160", "60 fps", Some("hevc"));
+        let report = estimate_readiness(
+            &left,
+            &right,
+            "/a.mp4",
+            "/b.mp4",
+            false,
+            ReadinessSamples {
+                overlap: Some(0.05),
+                exposure_delta_stops: Some(3.0),
+            },
+        );
+        let severities: Vec<ReadinessSeverity> =
+            report.findings.iter().map(|f| f.severity).collect();
+        let mut sorted = severities.clone();
+        sorted.sort();
+        assert_eq!(
+            severities, sorted,
+            "findings must be severity-sorted: {severities:?}"
+        );
+        assert!(severities.contains(&ReadinessSeverity::BlockingShape));
+        assert!(severities.contains(&ReadinessSeverity::LikelyQuality));
+        assert!(severities.contains(&ReadinessSeverity::Informational));
+    }
+
+    #[test]
+    fn unknown_overlap_and_exposure_serialize_as_null_never_zero() {
+        let left = metadata("1920×1080", "30 fps", Some("h264"));
+        let right = metadata("1920×1080", "30 fps", Some("h264"));
+        let report = estimate_readiness(
+            &left,
+            &right,
+            "/a.mp4",
+            "/b.mp4",
+            true,
+            ReadinessSamples::default(),
+        );
+        assert_eq!(report.overlap_estimate, None);
+        assert_eq!(report.exposure_delta_stops, None);
+        let json = serde_json::to_value(&report).expect("serializes");
+        assert!(
+            json["overlap_estimate"].is_null(),
+            "unknown overlap must be null, never 0.0: {json}"
+        );
+        assert!(
+            json["exposure_delta_stops"].is_null(),
+            "unknown exposure must be null, never 0.0: {json}"
         );
     }
 
