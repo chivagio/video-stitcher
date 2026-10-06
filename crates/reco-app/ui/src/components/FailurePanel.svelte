@@ -15,11 +15,13 @@
     error = null,
     onTryAgain,
     onBackToImport,
+    onCalibrateManually,
   }: {
     diagnosis: CalibrationDiagnosis | null;
     error?: string | null;
     onTryAgain: () => void;
     onBackToImport: () => void;
+    onCalibrateManually: () => void;
   } = $props();
 
   // Report honestly when the run failed before any frame pair produced matches:
@@ -86,6 +88,9 @@
 
   <div class="actions">
     <ActionButton variant="primary" onClick={onTryAgain}>Try again</ActionButton>
+    <ActionButton variant="secondary" onClick={onCalibrateManually}>
+      Calibrate manually
+    </ActionButton>
     <ActionButton variant="secondary" onClick={onBackToImport}>
       Back to import
     </ActionButton>

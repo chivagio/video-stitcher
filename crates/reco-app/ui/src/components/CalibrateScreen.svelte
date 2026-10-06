@@ -21,8 +21,10 @@
   import DebugSection from "./DebugSection.svelte";
   import FieldRoiEditor from "./FieldRoiEditor.svelte";
   import CompatibilityBanner from "./CompatibilityBanner.svelte";
+  import ManualCalibrationFlow from "./ManualCalibrationFlow.svelte";
   import Icon from "./Icon.svelte";
   import { importStore } from "../lib/import.svelte";
+  import { manual } from "../lib/manual.svelte";
 
   let {
     onRequestCancel,
@@ -56,9 +58,18 @@
     options = next;
     advancedValid = valid;
   }
+
+  // Open the manual calibration flow (MANU-01). Always reachable from the ready
+  // state and the failure panel; no calibration `.json` is ever required.
+  function handleManualStart(): void {
+    void manual.begin(0);
+  }
 </script>
 
 <div class="calibrate-screen">
+  {#if manual.open}
+    <ManualCalibrationFlow onExit={() => {}} />
+  {:else}
   <div class="calibrate-column">
     {#if calibration.status === "done" && calibration.result !== null}
       <header class="screen-header">
@@ -92,6 +103,7 @@
         error={calibration.error}
         onTryAgain={handleStart}
         onBackToImport={onBackToImport}
+        onCalibrateManually={handleManualStart}
       />
       <DebugSection report={calibration.debug} ran={true} />
     {:else}
@@ -151,6 +163,9 @@
           >
             Start calibration
           </ActionButton>
+          <ActionButton variant="secondary" onClick={handleManualStart}>
+            Calibrate manually
+          </ActionButton>
           {#if !advancedValid}
             <span class="disabled-hint">
               Fix the advanced values before starting.
@@ -168,6 +183,7 @@
       </div>
     {/if}
   </div>
+  {/if}
 </div>
 
 <style>
