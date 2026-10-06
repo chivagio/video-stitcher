@@ -33,7 +33,11 @@
       {heading}
     </h3>
     <ul class="reason-list">
-      {#each issues as issue (issue.code)}
+      <!-- Key on the index, not `issue.code`: `current_compatibility` pushes
+           one `LensResolutionMismatch` per role, so overriding both slots with
+           mismatched resolutions yields two issues with the same code, and a
+           keyed each with duplicate keys throws at runtime (Svelte 5). -->
+      {#each issues as issue, i (i)}
         <li class="reason">{issue.message}</li>
       {/each}
     </ul>
