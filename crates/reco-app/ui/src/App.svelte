@@ -26,6 +26,7 @@
   import { log } from "./lib/log.svelte";
   import { importStore } from "./lib/import.svelte";
   import { calibration } from "./lib/calibration.svelte";
+  import { fieldRoi } from "./lib/roi.svelte";
   import PreviewSurface from "./components/PreviewSurface.svelte";
   import Timeline from "./components/Timeline.svelte";
   import TimecodeReadout from "./components/TimecodeReadout.svelte";
@@ -37,6 +38,7 @@
   import WorkflowRail from "./components/WorkflowRail.svelte";
   import ImportScreen from "./components/ImportScreen.svelte";
   import CalibrateScreen from "./components/CalibrateScreen.svelte";
+  import FieldRoiEditor from "./components/FieldRoiEditor.svelte";
   import ConfirmDialog from "./components/ConfirmDialog.svelte";
   import type { PresenterKind, Screen, ViewMode } from "./lib/types";
 
@@ -54,6 +56,12 @@
   // the whole app; the Calibrate screen requests it via `onRequestCancel`.
   let cancelDialogOpen = $state(false);
 
+  // Field ROI editor panel on Preview (CALB-09). It renders its own
+  // webview-owned canvas in the controls region (never over the Rust-owned
+  // native child view), so opening it expands the controls panel and the worker
+  // shrinks the native viewport to match.
+  let fieldRoiOpen = $state(false);
+
   // Initialize stores on mount, then reconcile with the worker.
   onMount(() => {
     void (async () => {
@@ -66,6 +74,7 @@
       // ordering).
       await importStore.init();
       await calibration.init();
+      await fieldRoi.init();
       // Subscribe first, *then* ask the worker to re-assert its state. The
       // worker boots and imports before the webview has loaded, and the event
       // bridge only reaches listeners registered at emit time — so its opening
@@ -85,6 +94,7 @@
       log.destroy();
       importStore.destroy();
       calibration.destroy();
+      fieldRoi.destroy();
     };
   });
 
@@ -134,6 +144,14 @@
   // Panel toggle.
   function handlePanelToggle(): void {
     panelExpanded = !panelExpanded;
+  }
+
+  // Field ROI editor toggle (CALB-09). Opening the editor expands the controls
+  // panel so the native viewport (which excludes the panel region) never
+  // overlaps the webview-owned editor canvas.
+  function handleFieldRoiToggle(): void {
+    fieldRoiOpen = !fieldRoiOpen;
+    if (fieldRoiOpen) panelExpanded = true;
   }
 
   // Drawer toggle.
@@ -340,6 +358,12 @@
           onToggle={handleViewToggle}
         />
         <TransportButton
+          icon="polygon"
+          label="Field ROI"
+          active={fieldRoiOpen}
+          onClick={handleFieldRoiToggle}
+        />
+        <TransportButton
           icon="log"
           label="Log"
           active={drawerExpanded}
@@ -360,6 +384,26 @@
       onResetView={handleResetView}
       onPresenterChange={handlePresenterChange}
     />
+
+    <!-- Field ROI editor (CALB-09). Webview-owned, docked in the controls
+         region (the native viewport excludes it), so it never hit-tests or
+         paints over the Rust-owned native child view. -->
+    {#if fieldRoiOpen}
+      <div class="field-roi-panel" role="region" aria-label="Field ROI editor">
+        <div class="field-roi-panel-header">
+          <span class="field-roi-panel-title">Field ROI</span>
+          <button
+            type="button"
+            class="field-roi-close"
+            aria-label="Close field ROI editor"
+            onclick={() => (fieldRoiOpen = false)}
+          >
+            Close
+          </button>
+        </div>
+        <FieldRoiEditor report={calibration.debug} />
+      </div>
+    {/if}
   {/if}
 
   <!-- Event-log drawer (global; toggled from the workflow rail). -->
@@ -406,4 +450,46 @@
     gap: var(--space-sm);
   }
 
+  .field-roi-panel {
+    position: fixed;
+    right: 0;
+    top: var(--workflow-rail-height);
+    bottom: var(--transport-bar-height);
+    width: var(--controls-panel-width);
+    padding: var(--space-md);
+    background: var(--color-secondary);
+    border-left: 1px solid var(--color-dominant);
+    overflow-y: auto;
+    z-index: 12;
+  }
+
+  .field-roi-panel-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-sm);
+    margin-bottom: var(--space-sm);
+  }
+
+  .field-roi-panel-title {
+    font-weight: var(--weight-semibold);
+    color: var(--color-body-text);
+  }
+
+  .field-roi-close {
+    min-height: 32px;
+    padding: var(--space-xs) var(--space-sm);
+    border: 1px solid var(--color-secondary);
+    border-radius: var(--space-xs);
+    background: var(--color-dominant);
+    color: var(--color-body-text);
+    font-family: var(--font-ui);
+    font-size: var(--text-body);
+    cursor: pointer;
+  }
+
+  .field-roi-close:focus-visible {
+    outline: none;
+    box-shadow: 0 0 0 2px var(--color-accent);
+  }
 </style>

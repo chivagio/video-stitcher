@@ -2397,6 +2397,8 @@ impl EngineBackend for GpuEngineBackend {
                 // Adopt the result as the preview source too (D3-15 / WR-05),
                 // so the scorecard and the rendered stitch describe one profile.
                 self.adopt_calibration(calibration_result.calibration.clone());
+                // Pre-populate the field ROI editor from the fresh result (CALB-09).
+                self.emit_field_roi(events);
                 events.stage(
                     crate::events::CalibrationStage::Optimizing,
                     crate::events::StageStatus::Done,
@@ -2492,6 +2494,8 @@ impl EngineBackend for GpuEngineBackend {
         // Adopt the loaded profile as the live result and preview source so the
         // preview/export flows consume it unchanged (D3-15 / WR-05).
         self.adopt_calibration(calibration);
+        // Pre-populate the field ROI editor from the loaded profile (CALB-09).
+        self.emit_field_roi(events);
         events.profile_loaded(path);
         Ok(())
     }
@@ -3315,6 +3319,23 @@ impl GpuEngineBackend {
         events.readiness(self.current_readiness());
     }
 
+    /// Publish the current calibration's field ROI to the frontend (CALB-09).
+    ///
+    /// Called whenever a calibration is adopted (run success or profile load), so
+    /// the editor pre-populates from the loaded/current profile rather than
+    /// starting empty. An absent ROI publishes `FieldRoiCleared` so a previously
+    /// shown polygon does not linger across a load.
+    fn emit_field_roi(&self, events: &EventSink) {
+        match self
+            .current_calibration
+            .as_ref()
+            .and_then(|c| c.field_roi.clone())
+        {
+            Some(roi) => events.field_roi_applied(roi),
+            None => events.field_roi_cleared(),
+        }
+    }
+
     /// Invalidate a live result if inputs/profile changed (D3-08).
     ///
     /// The stored `current_calibration` is cleared alongside the flag: once the
@@ -3635,6 +3656,9 @@ mod tests {
         lens_overrides: [Option<reco_core::calibration::CameraParams>; 2],
         /// The mock's current calibration (IMPT-05/06).
         current_calibration: Option<reco_core::calibration::MatchCalibration>,
+        /// The field ROI a test wants `load_profile` to install (CALB-09), so the
+        /// pre-population emit can be asserted without a real profile file.
+        mock_field_roi: Option<reco_core::calibration::FieldRoi>,
         /// Whether the mock holds a live result (D3-08).
         has_result: bool,
         /// The mock's shared calibration-cancel flag (CALB-02).
@@ -3674,6 +3698,7 @@ mod tests {
                 input_paths: [None, None],
                 lens_overrides: [None, None],
                 current_calibration: None,
+                mock_field_roi: None,
                 has_result: false,
                 calibration_cancel: Arc::new(AtomicBool::new(false)),
                 screen_visible: Arc::new(std::sync::Mutex::new(None)),
@@ -3930,8 +3955,16 @@ mod tests {
             if path.is_empty() {
                 return Err(WorkerError::ProfileLoad("empty path".to_string()));
             }
-            self.current_calibration = Some(sample_mock_calibration());
+            let mut calibration = sample_mock_calibration();
+            calibration.field_roi = self.mock_field_roi.clone();
+            self.current_calibration = Some(calibration);
             self.has_result = true;
+            // Mirror the real backend: publish the loaded profile's ROI (CALB-09)
+            // so the editor pre-populates.
+            match self.mock_field_roi.clone() {
+                Some(roi) => events.field_roi_applied(roi),
+                None => events.field_roi_cleared(),
+            }
             events.profile_loaded(path);
             Ok(())
         }
@@ -4570,6 +4603,39 @@ mod tests {
         let json = cal.to_json_pretty();
         let back: reco_core::calibration::MatchCalibration = serde_json::from_str(&json).unwrap();
         assert_eq!(back.field_roi, cal.field_roi);
+    }
+
+    #[test]
+    fn loading_a_profile_publishes_its_field_roi_for_pre_population() {
+        // CALB-09: the editor pre-populates from the loaded/current calibration,
+        // so the worker must publish the profile's ROI when it is adopted.
+        let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (evt_tx, evt_rx) = std::sync::mpsc::channel();
+        let events = EventSink { tx: evt_tx };
+        let interrupted = AtomicBool::new(false);
+        let mut mock = MockBackend::new(Arc::clone(&ops));
+        mock.mock_field_roi = Some(reco_core::calibration::FieldRoi {
+            left: vec![[0.1, 0.9], [0.3, 0.7], [0.5, 0.6]],
+            right: vec![[0.6, 0.9], [0.8, 0.7], [0.7, 0.6]],
+        });
+
+        assert!(handle_command(
+            WorkerCommand::LoadProfile {
+                path: "/media/match.json".to_string(),
+            },
+            &mut mock,
+            &events,
+            &interrupted,
+        ));
+
+        let published = evt_rx.try_iter().find_map(|e| match e {
+            WorkerEvent::FieldRoiApplied { field_roi } => Some(field_roi),
+            _ => None,
+        });
+        assert_eq!(
+            published, mock.mock_field_roi,
+            "loading a profile must publish its field ROI"
+        );
     }
 
     #[test]

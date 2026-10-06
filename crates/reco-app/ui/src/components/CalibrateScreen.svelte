@@ -19,7 +19,9 @@
   import Scorecard from "./Scorecard.svelte";
   import FailurePanel from "./FailurePanel.svelte";
   import DebugSection from "./DebugSection.svelte";
+  import FieldRoiEditor from "./FieldRoiEditor.svelte";
   import CompatibilityBanner from "./CompatibilityBanner.svelte";
+  import Icon from "./Icon.svelte";
   import { importStore } from "../lib/import.svelte";
 
   let {
@@ -34,6 +36,11 @@
   // the result-state "Re-run calibration" use the same values.
   let options = $state<CalibrationOptions>(defaultOptions());
   let advancedValid = $state(true);
+
+  // The Field ROI editor (CALB-09) is a collapsible section, reachable from the
+  // ready and result states. It renders its own (webview-owned) canvas, so it is
+  // fully operable on this screen regardless of the presenter.
+  let fieldRoiOpen = $state(false);
 
   function handleStart(): void {
     if (!advancedValid) return;
@@ -58,6 +65,23 @@
         <h2 class="screen-title">Calibration result</h2>
       </header>
       <Scorecard scorecard={calibration.result} onRerun={handleRerun} />
+      <section class="roi-section">
+        <button
+          type="button"
+          class="roi-toggle"
+          aria-expanded={fieldRoiOpen}
+          onclick={() => (fieldRoiOpen = !fieldRoiOpen)}
+        >
+          <span class="chevron" class:open={fieldRoiOpen}>
+            <Icon name="chevron-down" />
+          </span>
+          <Icon name="polygon" />
+          Field ROI
+        </button>
+        {#if fieldRoiOpen}
+          <FieldRoiEditor report={calibration.debug} />
+        {/if}
+      </section>
       <DebugSection report={calibration.debug} ran={true} />
     {:else if calibration.status === "failed"}
       <header class="screen-header">
@@ -96,6 +120,26 @@
 
       {#if calibration.status === "ready"}
         <AdvancedDisclosure {options} onChange={handleOptions} />
+      {/if}
+
+      {#if calibration.status === "ready"}
+        <section class="roi-section">
+          <button
+            type="button"
+            class="roi-toggle"
+            aria-expanded={fieldRoiOpen}
+            onclick={() => (fieldRoiOpen = !fieldRoiOpen)}
+          >
+            <span class="chevron" class:open={fieldRoiOpen}>
+              <Icon name="chevron-down" />
+            </span>
+            <Icon name="polygon" />
+            Field ROI
+          </button>
+          {#if fieldRoiOpen}
+            <FieldRoiEditor report={calibration.debug} />
+          {/if}
+        </section>
       {/if}
 
       <div class="actions">
@@ -171,5 +215,48 @@
     display: flex;
     align-items: center;
     gap: var(--space-md);
+  }
+
+  .roi-section {
+    border-top: 1px solid var(--color-secondary);
+    padding-top: var(--space-sm);
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-md);
+  }
+
+  .roi-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-xs);
+    padding: var(--space-xs) var(--space-sm);
+    border: none;
+    border-radius: var(--space-xs);
+    background: transparent;
+    color: var(--color-body-text);
+    font-family: var(--font-ui);
+    font-size: var(--text-body);
+    font-weight: var(--weight-semibold);
+    cursor: pointer;
+  }
+
+  .roi-toggle:focus-visible {
+    outline: none;
+    box-shadow: 0 0 0 2px var(--color-accent);
+  }
+
+  .chevron {
+    display: inline-flex;
+    transition: transform 150ms ease;
+  }
+
+  .chevron.open {
+    transform: rotate(180deg);
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .chevron {
+      transition: none;
+    }
   }
 </style>
