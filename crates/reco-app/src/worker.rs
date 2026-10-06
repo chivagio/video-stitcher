@@ -3422,8 +3422,9 @@ impl EngineBackend for GpuEngineBackend {
             ..reco_calibrate::IntrinsicsConfig::default()
         };
 
-        let refinement = reco_calibrate::refine_intrinsics(&raw, &layout, &left_params, &config)
-            .map_err(|e| WorkerError::Engine(e.to_string()))?;
+        let refinement =
+            reco_calibrate::refine_intrinsics(&raw, &layout, &left_params, &right_params, &config)
+                .map_err(|e| WorkerError::Engine(e.to_string()))?;
 
         let view = crate::calibration::project_intrinsics_refinement(&refinement, baseline_k1);
 
@@ -10437,8 +10438,9 @@ mod gpu_tests {
             .collect();
 
         let cfg = reco_calibrate::IntrinsicsConfig::default();
-        let refinement = reco_calibrate::refine_intrinsics(&raw, &cal.layout, &cal.left, &cfg)
-            .expect("the reduced k1 refinement must run on the real observations");
+        let refinement =
+            reco_calibrate::refine_intrinsics(&raw, &cal.layout, &cal.left, &cal.right, &cfg)
+                .expect("the reduced k1 refinement must run on the real observations");
 
         let baseline_k1 = cal.left.d[0];
         let bound = cfg.k1_bound;

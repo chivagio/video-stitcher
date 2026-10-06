@@ -233,29 +233,35 @@ pub const RECOMMENDED_MIN_SPREAD: f64 = 0.30;
 /// Convert a raw-pixel correspondence to an optimizer-space [`MatchedPoint`].
 ///
 /// Each raw distorted pixel is mapped to an undistorted output pixel with
-/// [`distorted_to_undistorted`] under `params_with_k1` (whose `d[0]` is the
-/// **candidate** `k1`), then normalized to plane coordinates with the same
-/// left/right swap as [`crate::manual::pin_to_matched_point`]: the right
-/// camera's pixel lands on the left plane (`.left`) and the left camera's
-/// pixel on the right plane (`.right`).
+/// [`distorted_to_undistorted`] under its **own** camera's parameters (each
+/// camera's `d[0]` carries the candidate `k1`), then normalized to plane
+/// coordinates with the same left/right swap as
+/// [`crate::manual::pin_to_matched_point`]: the right camera's pixel lands on
+/// the left plane (`.left`) and the left camera's pixel on the right plane
+/// (`.right`).
+///
+/// Per-camera intrinsics are required on a mismatched rig (the phase's Xiaomi
+/// pair): mapping the right camera's pixels with the left camera's `fx/fy/cx/cy`
+/// is a systematic plane-coordinate error that the 1-parameter `k1` solve would
+/// absorb, biasing the result (WR-02).
 ///
 /// Returns `None` if either camera's KB4 inverse fails to converge.
 #[must_use]
 pub fn raw_to_matched_point(
     raw: &RawPixelMatch,
-    params_with_k1: &CameraParams,
+    left_params: &CameraParams,
+    right_params: &CameraParams,
     left_wh: (u32, u32),
     right_wh: (u32, u32),
 ) -> Option<MatchedPoint> {
     let (lw, lh) = left_wh;
     let (rw, rh) = right_wh;
 
-    // Left camera raw pixel -> undistorted output pixel.
-    let left_und =
-        distorted_to_undistorted(raw.left_px[0], raw.left_px[1], lw, lh, params_with_k1)?;
-    // Right camera raw pixel -> undistorted output pixel.
+    // Left camera raw pixel -> undistorted output pixel (left intrinsics).
+    let left_und = distorted_to_undistorted(raw.left_px[0], raw.left_px[1], lw, lh, left_params)?;
+    // Right camera raw pixel -> undistorted output pixel (right intrinsics).
     let right_und =
-        distorted_to_undistorted(raw.right_px[0], raw.right_px[1], rw, rh, params_with_k1)?;
+        distorted_to_undistorted(raw.right_px[0], raw.right_px[1], rw, rh, right_params)?;
 
     Some(MatchedPoint {
         // Right camera pixel -> left plane (x-plane in optimizer space).
@@ -275,7 +281,10 @@ pub fn raw_to_matched_point(
 #[derive(Clone)]
 struct IntrinsicsCost<'a> {
     points: &'a [RawPixelMatch],
-    base: &'a CameraParams,
+    /// Left camera's fixed intrinsics (only `d[0]` is substituted).
+    left_base: &'a CameraParams,
+    /// Right camera's fixed intrinsics (only `d[0]` is substituted).
+    right_base: &'a CameraParams,
     layout: OptParams,
     left_wh: (u32, u32),
     right_wh: (u32, u32),
@@ -291,23 +300,43 @@ impl CostFunction for IntrinsicsCost<'_> {
 
     fn cost(&self, p: &Self::Param) -> Result<Self::Output, Error> {
         let k1 = p[0];
+        let err = self.error(k1);
+        // A divergent inverse already carries the out-of-domain cost; do not
+        // add the bounds penalty on top of it.
+        if err >= OUT_OF_DOMAIN_COST {
+            return Ok(err);
+        }
+        Ok(err + k1_bounds_penalty(k1, self.k1_bounds))
+    }
+}
 
-        // Observations at the candidate k1: substitute into d[0], leaving
-        // fx/fy/cx/cy/cam_d untouched (they never enter the free vector).
-        let mut params = self.base.clone();
-        params.d[0] = k1;
+impl IntrinsicsCost<'_> {
+    /// The unpenalized trimmed seam-weighted reprojection error at `k1`.
+    ///
+    /// Returns [`OUT_OF_DOMAIN_COST`] when a candidate `k1` makes the KB4
+    /// inverse diverge. Split out from [`CostFunction::cost`] so the reported
+    /// [`IntrinsicsRefinement::residual`] is the true reprojection error and not
+    /// the penalized Nelder-Mead objective (IN-01).
+    fn error(&self, k1: f64) -> f64 {
+        // Observations at the candidate k1: substitute into d[0] of each
+        // camera's params, leaving fx/fy/cx/cy/cam_d untouched (they never
+        // enter the free vector).
+        let mut left = self.left_base.clone();
+        left.d[0] = k1;
+        let mut right = self.right_base.clone();
+        right.d[0] = k1;
 
         let mut points = Vec::with_capacity(self.points.len());
         for raw in self.points {
-            match raw_to_matched_point(raw, &params, self.left_wh, self.right_wh) {
+            match raw_to_matched_point(raw, &left, &right, self.left_wh, self.right_wh) {
                 Some(mp) => points.push(mp),
                 // Divergent inverse: reject this candidate with a large
                 // finite cost (never a NaN/Inf).
-                None => return Ok(OUT_OF_DOMAIN_COST),
+                None => return OUT_OF_DOMAIN_COST,
             }
         }
 
-        let err = if self.trim_fraction > 0.0 {
+        if self.trim_fraction > 0.0 {
             geometry::trimmed_seam_weighted_reprojection_error(
                 &points,
                 &self.layout,
@@ -316,9 +345,7 @@ impl CostFunction for IntrinsicsCost<'_> {
             )
         } else {
             geometry::seam_weighted_reprojection_error(&points, &self.layout, self.sigma)
-        };
-
-        Ok(err + k1_bounds_penalty(k1, self.k1_bounds))
+        }
     }
 }
 
@@ -338,16 +365,16 @@ fn k1_bounds_penalty(k1: f64, (lo, hi): (f64, f64)) -> f64 {
 /// Refine `k1` against raw-pixel correspondences at a fixed layout.
 ///
 /// Solves the reduced 1-parameter problem: `k1` alone is free, bounded to
-/// `[base.d[0] - k1_bound, base.d[0] + k1_bound]`; `fx/fy`, `cx/cy`, and
-/// `cam_d` are fixed (they never enter the free vector). The objective
-/// converts each observation to plane coordinates at the candidate `k1`
-/// (via [`raw_to_matched_point`]) and evaluates the trimmed seam-weighted
-/// reprojection error at `layout` (converted to [`OptParams`] from the
-/// [`PlaneLayout`] fields).
+/// `[left_base.d[0] - k1_bound, left_base.d[0] + k1_bound]`; `fx/fy`, `cx/cy`,
+/// and `cam_d` are fixed (they never enter the free vector). The candidate `k1`
+/// is substituted into **both** cameras' `d[0]`. The objective converts each
+/// observation to plane coordinates at the candidate `k1` (via
+/// [`raw_to_matched_point`], each camera under its own intrinsics) and evaluates
+/// the trimmed seam-weighted reprojection error at `layout` (converted to
+/// [`OptParams`] from the [`PlaneLayout`] fields).
 ///
-/// Frame dimensions are taken from `base.width`/`base.height` for both
-/// cameras; callers with a genuinely different right-camera resolution can
-/// convert with [`raw_to_matched_point`] directly.
+/// Frame dimensions come from each camera's own `width`/`height`, so a
+/// mismatched-resolution rig is handled correctly.
 ///
 /// # Errors
 ///
@@ -360,7 +387,8 @@ fn k1_bounds_penalty(k1: f64, (lo, hi): (f64, f64)) -> f64 {
 pub fn optimize_intrinsics(
     points: &[RawPixelMatch],
     layout: &PlaneLayout,
-    base: &CameraParams,
+    left_base: &CameraParams,
+    right_base: &CameraParams,
     cfg: &IntrinsicsConfig,
 ) -> Result<IntrinsicsRefinement, CalibrateError> {
     if points.is_empty() {
@@ -377,22 +405,23 @@ pub fn optimize_intrinsics(
         layout.z_rx,
     ]);
 
-    let lo = base.d[0] - cfg.k1_bound;
-    let hi = base.d[0] + cfg.k1_bound;
+    let lo = left_base.d[0] - cfg.k1_bound;
+    let hi = left_base.d[0] + cfg.k1_bound;
 
     let cost = IntrinsicsCost {
         points,
-        base,
+        left_base,
+        right_base,
         layout: layout_params,
-        left_wh: (base.width, base.height),
-        right_wh: (base.width, base.height),
+        left_wh: (left_base.width, left_base.height),
+        right_wh: (right_base.width, right_base.height),
         sigma: cfg.sigma,
         trim_fraction: cfg.trim_fraction,
         k1_bounds: (lo, hi),
     };
 
     // 1-D simplex: two vertices around the profile's current k1.
-    let start = base.d[0].clamp(lo, hi);
+    let start = left_base.d[0].clamp(lo, hi);
     let perturbation = SIMPLEX_PERTURBATION * (hi - lo);
     let second = if start + perturbation <= hi {
         start + perturbation
@@ -458,8 +487,9 @@ fn normalized_radius(px: [f64; 2], params: &CameraParams, radius: f64) -> f64 {
 /// observations, and a set that fails it must not reach the solver.
 ///
 /// `radial_spread` is the mean, over observations, of each match's distance
-/// from the principal point (per-camera `base.cx`/`base.cy`), normalized by the
-/// frame's corner radius and averaged across the two cameras. `well_conditioned`
+/// from its own camera's principal point (`left_base.cx`/`cy` for the left
+/// pixel, `right_base.cx`/`cy` for the right), normalized by that camera's
+/// frame corner radius and averaged across the two cameras. `well_conditioned`
 /// requires `match_count >= min_matches`, `radial_spread >= min_spread`, and a
 /// finite `layout` — the layout is the fixed solve context, and a layout that
 /// cannot host a solve is itself a reason to refuse. Recommended thresholds are
@@ -472,17 +502,21 @@ fn normalized_radius(px: [f64; 2], params: &CameraParams, radius: f64) -> f64 {
 pub fn conditioning(
     points: &[RawPixelMatch],
     layout: &PlaneLayout,
-    base: &CameraParams,
+    left_base: &CameraParams,
+    right_base: &CameraParams,
     min_matches: usize,
     min_spread: f64,
 ) -> Conditioning {
     let match_count = points.len();
-    let radius = frame_corner_radius(base);
+    let left_radius = frame_corner_radius(left_base);
+    let right_radius = frame_corner_radius(right_base);
 
     let mut spread_sum = 0.0_f64;
     for raw in points {
-        let left_r = normalized_radius(raw.left_px, base, radius);
-        let right_r = normalized_radius(raw.right_px, base, radius);
+        // Each camera's pixel is measured against its own principal point and
+        // frame corner radius (WR-02: the rig may be mismatched).
+        let left_r = normalized_radius(raw.left_px, left_base, left_radius);
+        let right_r = normalized_radius(raw.right_px, right_base, right_radius);
         // A match constrains `k1` only where both cameras carry radial
         // leverage, so the per-match position is their average.
         spread_sum += 0.5 * (left_r + right_r);
@@ -588,20 +622,30 @@ fn split_fit_heldout(
 }
 
 /// Map raw observations to optimizer-space plane coordinates at a candidate
-/// `k1` (both cameras sharing `base`'s intrinsics).
+/// `k1` (each camera under its own intrinsics).
 ///
 /// Returns `None` if any KB4 inverse diverges at this candidate.
 fn map_matched(
     points: &[RawPixelMatch],
-    base: &CameraParams,
+    left_base: &CameraParams,
+    right_base: &CameraParams,
     k1: f64,
-    wh: (u32, u32),
 ) -> Option<Vec<MatchedPoint>> {
-    let mut params = base.clone();
-    params.d[0] = k1;
+    let mut left = left_base.clone();
+    left.d[0] = k1;
+    let mut right = right_base.clone();
+    right.d[0] = k1;
     points
         .iter()
-        .map(|raw| raw_to_matched_point(raw, &params, wh, wh))
+        .map(|raw| {
+            raw_to_matched_point(
+                raw,
+                &left,
+                &right,
+                (left_base.width, left_base.height),
+                (right_base.width, right_base.height),
+            )
+        })
         .collect()
 }
 
@@ -613,9 +657,9 @@ fn map_matched(
 fn reprojection_residual(
     points: &[RawPixelMatch],
     layout: &PlaneLayout,
-    base: &CameraParams,
+    left_base: &CameraParams,
+    right_base: &CameraParams,
     k1: f64,
-    wh: (u32, u32),
     sigma: f64,
 ) -> f64 {
     let params = OptParams::from_5param(&[
@@ -625,7 +669,7 @@ fn reprojection_residual(
         layout.x_rz,
         layout.z_rx,
     ]);
-    match map_matched(points, base, k1, wh) {
+    match map_matched(points, left_base, right_base, k1) {
         Some(matched) if !matched.is_empty() => {
             geometry::seam_weighted_reprojection_error(&matched, &params, sigma)
         }
@@ -777,11 +821,13 @@ fn solve_layout_warm(
 /// 4. accepts the refinement only when the held-out reprojection error improves
 ///    by more than [`IntrinsicsConfig::improvement_epsilon`]. Otherwise the
 ///    result is `accepted == false` with [`RefinementReason::GuardRejected`] and
-///    [`IntrinsicsRefinement::k1`] equals the baseline `base.d[0]`.
+///    [`IntrinsicsRefinement::k1`] equals the baseline `left_base.d[0]`.
 ///
-/// `base` is never mutated: the caller writes the returned `k1` into the
-/// profile only when `accepted` is `true`. The layout is re-solved internally to
-/// keep the `k1` stage coherent; only `k1` crosses back to the caller.
+/// `left_base`/`right_base` are never mutated: the caller writes the returned
+/// `k1` into the profile only when `accepted` is `true`. Each camera's raw
+/// pixels are mapped with its own intrinsics (WR-02). The layout is re-solved
+/// internally to keep the `k1` stage coherent; only `k1` crosses back to the
+/// caller.
 ///
 /// # Errors
 ///
@@ -791,15 +837,23 @@ fn solve_layout_warm(
 pub fn refine_intrinsics(
     points: &[RawPixelMatch],
     layout: &PlaneLayout,
-    base: &CameraParams,
+    left_base: &CameraParams,
+    right_base: &CameraParams,
     cfg: &IntrinsicsConfig,
 ) -> Result<IntrinsicsRefinement, CalibrateError> {
     // (1) The conditioning gate runs before any solve: an ill-conditioned set
     //     is refused with a typed reason, never silently fitted.
-    let cond = conditioning(points, layout, base, cfg.min_matches, cfg.min_spread);
+    let cond = conditioning(
+        points,
+        layout,
+        left_base,
+        right_base,
+        cfg.min_matches,
+        cfg.min_spread,
+    );
     if !cond.well_conditioned {
         return Ok(rejected(
-            base.d[0],
+            left_base.d[0],
             0.0,
             0.0,
             0.0,
@@ -810,7 +864,7 @@ pub fn refine_intrinsics(
     // A fit/held-out split needs at least one observation on each side.
     if points.len() < 2 {
         return Ok(rejected(
-            base.d[0],
+            left_base.d[0],
             0.0,
             0.0,
             0.0,
@@ -821,7 +875,7 @@ pub fn refine_intrinsics(
     let (fit, heldout) = split_fit_heldout(points, cfg);
     if fit.is_empty() || heldout.is_empty() {
         return Ok(rejected(
-            base.d[0],
+            left_base.d[0],
             0.0,
             0.0,
             0.0,
@@ -829,20 +883,32 @@ pub fn refine_intrinsics(
         ));
     }
 
-    let wh = (base.width, base.height);
-
     // Baseline: the profile's k1 at the caller's layout (a coherent pair).
-    let heldout_baseline = reprojection_residual(&heldout, layout, base, base.d[0], wh, cfg.sigma);
-    let baseline_fit = reprojection_residual(&fit, layout, base, base.d[0], wh, cfg.sigma);
+    let heldout_baseline = reprojection_residual(
+        &heldout,
+        layout,
+        left_base,
+        right_base,
+        left_base.d[0],
+        cfg.sigma,
+    );
+    let baseline_fit = reprojection_residual(
+        &fit,
+        layout,
+        left_base,
+        right_base,
+        left_base.d[0],
+        cfg.sigma,
+    );
 
     let mut current_layout = layout.clone();
-    let mut current_k1 = base.d[0];
+    let mut current_k1 = left_base.d[0];
     // (best k1, held-out residual, fit residual)
     let mut best: Option<(f64, f64, f64)> = None;
 
     for _ in 0..cfg.max_rounds.max(1) {
         // (2) Warm-started layout solve on the fit set at the current k1.
-        let Some(fit_matched) = map_matched(&fit, base, current_k1, wh) else {
+        let Some(fit_matched) = map_matched(&fit, left_base, right_base, current_k1) else {
             break;
         };
         let Some(solved_layout) = solve_layout_warm(&fit_matched, &current_layout, cfg) else {
@@ -850,22 +916,34 @@ pub fn refine_intrinsics(
         };
 
         // (3) Refine k1 at that layout on the fit set.
-        let refinement = optimize_intrinsics(&fit, &solved_layout, base, cfg)?;
+        let refinement = optimize_intrinsics(&fit, &solved_layout, left_base, right_base, cfg)?;
         let candidate_k1 = refinement.k1;
 
         // (4) Re-solve the layout warm-started at the refined k1, so the layout
         //     never wanders and the held-out evaluation uses a coherent pair.
-        let Some(refined_matched) = map_matched(&fit, base, candidate_k1, wh) else {
+        let Some(refined_matched) = map_matched(&fit, left_base, right_base, candidate_k1) else {
             break;
         };
         let final_layout =
             solve_layout_warm(&refined_matched, &solved_layout, cfg).unwrap_or(solved_layout);
 
         // (5) Held-out (and fit) residual at the refined k1 and re-solved layout.
-        let heldout_refined =
-            reprojection_residual(&heldout, &final_layout, base, candidate_k1, wh, cfg.sigma);
-        let fit_refined =
-            reprojection_residual(&fit, &final_layout, base, candidate_k1, wh, cfg.sigma);
+        let heldout_refined = reprojection_residual(
+            &heldout,
+            &final_layout,
+            left_base,
+            right_base,
+            candidate_k1,
+            cfg.sigma,
+        );
+        let fit_refined = reprojection_residual(
+            &fit,
+            &final_layout,
+            left_base,
+            right_base,
+            candidate_k1,
+            cfg.sigma,
+        );
 
         // Stop as soon as the held-out fit stops improving.
         let improves = best
@@ -881,7 +959,7 @@ pub fn refine_intrinsics(
 
     let Some((best_k1, heldout_refined, fit_residual)) = best else {
         return Ok(rejected(
-            base.d[0],
+            left_base.d[0],
             baseline_fit,
             heldout_baseline,
             heldout_baseline,
@@ -902,7 +980,7 @@ pub fn refine_intrinsics(
         })
     } else {
         Ok(rejected(
-            base.d[0],
+            left_base.d[0],
             baseline_fit,
             heldout_baseline,
             heldout_refined,
@@ -1132,8 +1210,8 @@ mod tests {
         let layout = layout_from(t);
 
         let cfg = IntrinsicsConfig::default();
-        let refinement =
-            optimize_intrinsics(&raw, &layout, &base, &cfg).expect("reduced solve should succeed");
+        let refinement = optimize_intrinsics(&raw, &layout, &base, &base, &cfg)
+            .expect("reduced solve should succeed");
         (refinement.k1 - true_k1).abs()
     }
 
@@ -1222,8 +1300,9 @@ mod tests {
             z_rz: 0.0,
         };
 
-        let refinement = optimize_intrinsics(&raw, &layout, &base, &IntrinsicsConfig::default())
-            .expect("solve should succeed");
+        let refinement =
+            optimize_intrinsics(&raw, &layout, &base, &base, &IntrinsicsConfig::default())
+                .expect("solve should succeed");
 
         // k1 moved away from the (wrong) starting value...
         assert!(
@@ -1243,6 +1322,63 @@ mod tests {
         assert!((refinement.k1 - base.d[0]).abs() <= IntrinsicsConfig::default().k1_bound + 1e-9);
     }
 
+    /// WR-02: `raw_to_matched_point` maps each camera's raw pixel with its OWN
+    /// intrinsics. On a mismatched rig, mapping the right pixel with the left
+    /// camera's parameters yields a materially different (biased) plane
+    /// coordinate; this test pins both the round-trip and that difference.
+    #[test]
+    fn raw_to_matched_point_uses_each_cameras_own_intrinsics() {
+        let left_synth = camera_params(0.12);
+        let mut right_synth = camera_params(0.12);
+        right_synth.fx = 1.30 * left_synth.fx;
+        right_synth.fy = 1.30 * left_synth.fy;
+        right_synth.cx = left_synth.cx + 24.0;
+        right_synth.cy = left_synth.cy - 18.0;
+
+        let mp = synthetic_points(&truth(), 196)
+            .into_iter()
+            .find(|mp| {
+                let left_und = plane_to_pixel(mp.right, LW, LH);
+                let right_und = plane_to_pixel(mp.left, RW, RH);
+                let inside = |p: [f64; 2], w: u32, h: u32| {
+                    let mx = 0.08 * w as f64;
+                    let my = 0.08 * h as f64;
+                    p[0] >= mx && p[0] <= w as f64 - mx && p[1] >= my && p[1] <= h as f64 - my
+                };
+                inside(left_und, LW, LH) && inside(right_und, RW, RH)
+            })
+            .expect("at least one in-frame synthetic point");
+
+        let left_und = plane_to_pixel(mp.right, LW, LH);
+        let right_und = plane_to_pixel(mp.left, RW, RH);
+        let left_raw = undistorted_to_distorted(left_und[0], left_und[1], LW, LH, &left_synth);
+        let right_raw = undistorted_to_distorted(right_und[0], right_und[1], RW, RH, &right_synth);
+        let raw = RawPixelMatch {
+            left_px: [left_raw.0, left_raw.1],
+            right_px: [right_raw.0, right_raw.1],
+        };
+
+        // Correct per-camera mapping recovers the source plane coordinates.
+        let back = raw_to_matched_point(&raw, &left_synth, &right_synth, (LW, LH), (RW, RH))
+            .expect("inverse should converge");
+        assert!((back.left[0] - mp.left[0]).abs() < 1e-6);
+        assert!((back.left[1] - mp.left[1]).abs() < 1e-6);
+        assert!((back.right[0] - mp.right[0]).abs() < 1e-6);
+        assert!((back.right[1] - mp.right[1]).abs() < 1e-6);
+
+        // Mapping the right camera's pixel with the LEFT camera's intrinsics
+        // (the pre-fix behaviour) is materially biased in the right camera's
+        // plane coordinate — this is what WR-02 fixed.
+        let wrong = raw_to_matched_point(&raw, &left_synth, &left_synth, (LW, LH), (RW, RH))
+            .expect("inverse should converge");
+        let bias =
+            ((wrong.left[0] - mp.left[0]).powi(2) + (wrong.left[1] - mp.left[1]).powi(2)).sqrt();
+        assert!(
+            bias > 1e-3,
+            "the mismatched-rig bias should be material, got {bias}"
+        );
+    }
+
     /// Test 4 (empty): an empty observation set is a typed error, never a
     /// zero-`k1` result.
     #[test]
@@ -1259,6 +1395,7 @@ mod tests {
         let err = optimize_intrinsics(
             &[],
             &layout,
+            &camera_params(0.0),
             &camera_params(0.0),
             &IntrinsicsConfig::default(),
         )
@@ -1320,7 +1457,7 @@ mod tests {
                 right_px: [right_raw.0, right_raw.1],
             };
 
-            let back = raw_to_matched_point(&raw, &synth, (LW, LH), (RW, RH))
+            let back = raw_to_matched_point(&raw, &synth, &synth, (LW, LH), (RW, RH))
                 .expect("inverse should converge");
             // `.left` is the right camera plane; `.right` the left camera plane.
             assert!((back.left[0] - mp.left[0]).abs() < 1e-6);
@@ -1359,6 +1496,7 @@ mod tests {
             &points,
             &layout_from(&truth()),
             &camera_params(0.0),
+            &camera_params(0.0),
             RECOMMENDED_MIN_MATCHES,
             RECOMMENDED_MIN_SPREAD,
         );
@@ -1382,6 +1520,7 @@ mod tests {
             &points,
             &layout_from(&truth()),
             &camera_params(0.0),
+            &camera_params(0.0),
             RECOMMENDED_MIN_MATCHES,
             RECOMMENDED_MIN_SPREAD,
         );
@@ -1403,6 +1542,7 @@ mod tests {
             &few,
             &layout_from(&truth()),
             &camera_params(0.0),
+            &camera_params(0.0),
             RECOMMENDED_MIN_MATCHES,
             RECOMMENDED_MIN_SPREAD,
         );
@@ -1412,6 +1552,7 @@ mod tests {
         let empty = conditioning(
             &[],
             &layout_from(&truth()),
+            &camera_params(0.0),
             &camera_params(0.0),
             RECOMMENDED_MIN_MATCHES,
             RECOMMENDED_MIN_SPREAD,
@@ -1431,6 +1572,7 @@ mod tests {
         let c = conditioning(
             &points,
             &layout,
+            &camera_params(0.0),
             &camera_params(0.0),
             RECOMMENDED_MIN_MATCHES,
             RECOMMENDED_MIN_SPREAD,
@@ -1502,7 +1644,7 @@ mod tests {
         let wh = (base.width, base.height);
         let mut matched = Vec::with_capacity(points.len());
         for raw in points {
-            match raw_to_matched_point(raw, &params, wh, wh) {
+            match raw_to_matched_point(raw, &params, &params, wh, wh) {
                 Some(mp) => matched.push(mp),
                 None => return OUT_OF_DOMAIN_COST,
             }
@@ -1777,6 +1919,7 @@ mod tests {
             &raw,
             &layout_from(&truth()),
             &camera_params(0.0),
+            &camera_params(0.0),
             RECOMMENDED_MIN_MATCHES,
             RECOMMENDED_MIN_SPREAD,
         );
@@ -1800,7 +1943,8 @@ mod tests {
 
         let raw = observation_pool(&t, true_k1, 400, 7, 0.25);
         let cfg = IntrinsicsConfig::default();
-        let r = refine_intrinsics(&raw, &layout_from(&t), &base, &cfg).expect("driver should run");
+        let r = refine_intrinsics(&raw, &layout_from(&t), &base, &base, &cfg)
+            .expect("driver should run");
 
         assert!(r.accepted, "a genuine refinement must be accepted: {r:?}");
         assert_eq!(r.reason, RefinementReason::Accepted);
@@ -1849,8 +1993,8 @@ mod tests {
         }
 
         let base = camera_params(0.0);
-        let r =
-            refine_intrinsics(&points, &layout_from(&t), &base, &cfg).expect("driver should run");
+        let r = refine_intrinsics(&points, &layout_from(&t), &base, &base, &cfg)
+            .expect("driver should run");
 
         assert!(!r.accepted, "a held-out regression must be rejected: {r:?}");
         assert_eq!(r.reason, RefinementReason::GuardRejected);
@@ -1876,6 +2020,7 @@ mod tests {
             &points,
             &layout_from(&truth()),
             &base,
+            &base,
             &IntrinsicsConfig::default(),
         )
         .expect("a conditioning refusal is a typed result, not an error");
@@ -1894,8 +2039,14 @@ mod tests {
         let before = base.clone();
         let raw = observation_pool(&t, 0.15, 400, 5, 0.25);
 
-        let _ = refine_intrinsics(&raw, &layout_from(&t), &base, &IntrinsicsConfig::default())
-            .expect("driver should run");
+        let _ = refine_intrinsics(
+            &raw,
+            &layout_from(&t),
+            &base,
+            &base,
+            &IntrinsicsConfig::default(),
+        )
+        .expect("driver should run");
 
         assert_eq!(base.d[0].to_bits(), before.d[0].to_bits());
         assert_eq!(base.fx.to_bits(), before.fx.to_bits());
@@ -1915,7 +2066,8 @@ mod tests {
         let raw = observation_pool(&t, 0.15, 400, 9, 0.25);
         let cfg = IntrinsicsConfig::default();
 
-        let r = refine_intrinsics(&raw, &layout_from(&t), &base, &cfg).expect("driver should run");
+        let r = refine_intrinsics(&raw, &layout_from(&t), &base, &base, &cfg)
+            .expect("driver should run");
 
         assert!(r.accepted, "this setup must be accepted: {r:?}");
         assert!(
@@ -1937,8 +2089,14 @@ mod tests {
         let base = camera_params(true_k1); // already at the optimum
         let raw = observation_pool(&t, true_k1, 400, 3, 0.0); // clean data
 
-        let r = refine_intrinsics(&raw, &layout_from(&t), &base, &IntrinsicsConfig::default())
-            .expect("driver should run");
+        let r = refine_intrinsics(
+            &raw,
+            &layout_from(&t),
+            &base,
+            &base,
+            &IntrinsicsConfig::default(),
+        )
+        .expect("driver should run");
 
         assert!(
             !r.accepted,
