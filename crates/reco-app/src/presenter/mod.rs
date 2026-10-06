@@ -274,12 +274,41 @@ pub fn startup_fallback_reason(
     }
 }
 
+/// Which top-level screen the webview is showing (UI-SPEC Screen Router).
+///
+/// Phase 3 adds a persistent workflow rail that routes between three screens.
+/// Import and Calibrate are **opaque webview screens**; the native child view
+/// must be suspended while either is active so no black/idle surface shows
+/// through (UI-SPEC Screen Router & Layout Contract). Preview is the only
+/// screen on which the native view is live.
+///
+/// The frontend reports the active screen as part of its chrome state and Rust
+/// decides visibility ([`SurfacePresenter::set_visible`]) — the webview never
+/// hides or sizes the native view itself (UI-SPEC "Geometry authority").
+///
+/// Serde snake_case so it round-trips through the typed `set_chrome` command
+/// without stringly-typed handling; an unknown value is rejected at the IPC
+/// boundary (T-03-11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum Screen {
+    /// The import screen — the landing screen (opaque; native view suspended).
+    #[default]
+    Import,
+    /// The guided-calibration wizard (opaque; native view suspended).
+    Calibrate,
+    /// The Phase 2 preview experience (native view live).
+    Preview,
+}
+
 /// The webview chrome's collapsible state (UI-SPEC Surface Layout Contract).
 ///
 /// This is the Rust-side source of truth for the *native* viewport geometry;
-/// the frontend reports its chrome state (panel/drawer open/closed) and Rust
-/// recomputes [`ViewportRect::for_chrome`]. The frontend must never compute the
-/// native rect itself (UI-SPEC "Geometry authority").
+/// the frontend reports its chrome state (active screen, panel/drawer
+/// open/closed) and Rust recomputes [`ViewportRect::for_chrome`] and the native
+/// view's visibility. The frontend must never compute the native rect itself
+/// (UI-SPEC "Geometry authority").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ChromeState {
     /// Whether the right controls panel is expanded (vs. the 40px rail).
@@ -293,6 +322,11 @@ pub struct ChromeState {
     /// Defaults to collapsed (`false`), which the UI-SPEC fixes as the drawer's
     /// default (drawer height 0). Opening it shrinks the native viewport.
     pub drawer_expanded: bool,
+    /// Which top-level screen is active (UI-SPEC Screen Router).
+    ///
+    /// Defaults to [`Screen::Import`] so the app lands on Import and the native
+    /// view starts suspended until the operator reaches Preview.
+    pub active_screen: Screen,
 }
 
 impl ChromeState {
@@ -739,6 +773,26 @@ pub trait SurfacePresenter {
     fn show_preview_window(&self) -> Result<(), PresenterError> {
         Ok(())
     }
+
+    /// Show or hide this presenter's native view (UI-SPEC Screen Router, E6).
+    ///
+    /// Import and Calibrate are opaque webview screens, so the native child view
+    /// must be suspended while either is active — otherwise a black or idle
+    /// native rectangle shows through (UI-SPEC Screen Router & Layout Contract).
+    /// The worker calls this only on an actual screen change (in `set_chrome` /
+    /// resize), never per tick, so it is not a hot path.
+    ///
+    /// Default no-op so a presenter with no window of its own inside the main
+    /// window (readback, separate window, fallback) compiles unchanged;
+    /// implementors that own a child window override it. Must be **idempotent**
+    /// (a request matching the current state issues no platform request) and a
+    /// **no-op after the window is released**.
+    // Wired by the worker's screen-driven `set_chrome` in plan 03-04 Task 2;
+    // the guard is removed there once the consumer exists.
+    #[allow(dead_code)]
+    fn set_visible(&mut self, visible: bool) {
+        let _ = visible;
+    }
 }
 
 /// Build a [`ViewportConfig`] matching the presenter's panorama viewport.
@@ -811,6 +865,7 @@ mod tests {
             &ChromeState {
                 panel_expanded: true,
                 drawer_expanded: false,
+                ..ChromeState::default()
             },
         );
         assert_eq!(
@@ -824,6 +879,7 @@ mod tests {
         let chrome = ChromeState {
             panel_expanded: true,
             drawer_expanded: true,
+            ..ChromeState::default()
         };
         let rect = ViewportRect::for_chrome(1280, 800, &chrome);
         assert_eq!(rect.width, 1280 - 280);
@@ -837,6 +893,7 @@ mod tests {
         let expanded = ChromeState {
             panel_expanded: true,
             drawer_expanded: true,
+            ..ChromeState::default()
         };
         let rect = ViewportRect::for_chrome(100, 100, &expanded);
         assert_eq!(rect.width, 0);
@@ -858,6 +915,56 @@ mod tests {
         assert!(!chrome.drawer_expanded);
         assert_eq!(chrome.panel_width(), CONTROLS_PANEL_COLLAPSED_WIDTH);
         assert_eq!(chrome.drawer_height(), 0);
+    }
+
+    #[test]
+    fn screen_defaults_to_import_and_serializes_snake_case() {
+        // UI-SPEC Screen Router: Import is the landing screen, so the default
+        // must be Import (the native view starts suspended). The typed command
+        // boundary round-trips the screen as snake_case (T-03-11).
+        assert_eq!(Screen::default(), Screen::Import);
+        assert_eq!(
+            serde_json::to_string(&Screen::Import).unwrap(),
+            "\"import\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Screen::Calibrate).unwrap(),
+            "\"calibrate\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Screen::Preview).unwrap(),
+            "\"preview\""
+        );
+        // Round-trips back from the wire form the frontend sends.
+        let parsed: Screen = serde_json::from_str("\"preview\"").unwrap();
+        assert_eq!(parsed, Screen::Preview);
+    }
+
+    #[test]
+    fn chrome_state_defaults_to_the_import_screen() {
+        assert_eq!(ChromeState::default().active_screen, Screen::Import);
+    }
+
+    #[test]
+    fn for_chrome_is_unchanged_for_the_preview_screen() {
+        // The active screen is a visibility concern, not a geometry one: the
+        // rect logic is identical whichever screen is active (UI-SPEC: only
+        // visibility changes on non-Preview screens). Locks that `for_chrome`
+        // never reads `active_screen`.
+        let import = ViewportRect::for_chrome(1280, 800, &ChromeState::default());
+        let preview = ViewportRect::for_chrome(
+            1280,
+            800,
+            &ChromeState {
+                active_screen: Screen::Preview,
+                ..ChromeState::default()
+            },
+        );
+        assert_eq!(import, preview);
+        assert_eq!(
+            (preview.x, preview.y, preview.width, preview.height),
+            (0, 0, 1240, 728)
+        );
     }
 
     #[test]

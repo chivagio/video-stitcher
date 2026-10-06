@@ -156,6 +156,36 @@ impl PointerState {
     }
 }
 
+/// Whether the child window is currently mapped (shown) on the X server.
+///
+/// Kept as state so [`SurfacePresenter::set_visible`] is **idempotent**: a
+/// request that matches the current state issues no X request, and a request
+/// after the window has been released is a no-op (there is no window to map).
+/// Extracted so this contract is unit-testable without a live X server, the
+/// same way [`PointerState`] isolates the event mapping.
+// Wired by the worker's screen-driven `set_chrome` in plan 03-04 Task 2; the
+// guard is removed there once the consumer exists.
+#[allow(dead_code)]
+#[derive(Debug, Default, Clone, Copy)]
+struct VisibilityState {
+    /// The last requested visibility. `false` means unmapped.
+    visible: bool,
+}
+
+#[allow(dead_code)]
+impl VisibilityState {
+    /// Whether the child window is currently mapped.
+    fn is_visible(&self) -> bool {
+        self.visible
+    }
+
+    /// Record a requested visibility. Callers compare
+    /// [`is_visible`](Self::is_visible) first so the transition is idempotent.
+    fn set(&mut self, visible: bool) {
+        self.visible = visible;
+    }
+}
+
 /// Install an X error handler that logs and swallows the benign teardown errors
 /// our foreign child window can provoke, instead of letting GDK abort.
 ///
@@ -243,6 +273,14 @@ pub struct X11Presenter {
     /// See [`SurfacePresenter::take_pointer_gesture`]. Reset as each gesture is
     /// returned, so a drain never reports the same motion twice.
     pointer_state: PointerState,
+    /// Whether the child window is currently mapped (shown).
+    ///
+    /// See [`SurfacePresenter::set_visible`]. The child is mapped at
+    /// construction, so this starts `true`.
+    // Wired by the worker's screen-driven `set_chrome` in plan 03-04 Task 2;
+    // the guard is removed there once the consumer exists.
+    #[allow(dead_code)]
+    visibility: VisibilityState,
 }
 
 // SAFETY: the Xlib `Display*` is only touched from the thread that creates the
@@ -434,6 +472,7 @@ impl X11Presenter {
             device: None,
             queue: None,
             pointer_state: PointerState::default(),
+            visibility: VisibilityState { visible: true },
         })
     }
 
@@ -950,6 +989,43 @@ impl SurfacePresenter for X11Presenter {
     fn release_presenter_window(&mut self) {
         self.release_child_window();
     }
+
+    /// Show/hide the native child view on the X server (UI-SPEC Screen Router, E6).
+    ///
+    /// Import and Calibrate are opaque webview screens, so the child view is
+    /// unmapped (`XUnmapWindow`) while either is active and mapped
+    /// (`XMapWindow`) again on Preview. Unmapping — rather than resizing to
+    /// zero or destroying — keeps the surface and its device bindings intact,
+    /// so returning to Preview is immediate and needs no reconfigure.
+    ///
+    /// Idempotent ([`VisibilityState`]) and a no-op after
+    /// [`X11Presenter::release_child_window`] destroyed the window (there is
+    /// nothing to map).
+    fn set_visible(&mut self, visible: bool) {
+        if self.visibility.is_visible() == visible {
+            // State already matches: no X request (idempotent).
+            return;
+        }
+        self.visibility.set(visible);
+        let Some(child) = self.child_window else {
+            // Released window: record the state, issue nothing.
+            return;
+        };
+        // SAFETY: `display` is the live connection that owns `child` (both come
+        // from the same parent connection), and `child` is a valid X11 window
+        // for this presenter's lifetime (destroyed only in
+        // `release_child_window`/`Drop`, which clear `child_window` first).
+        // `XUnmapWindow`/`XMapWindow` only change the window's map state; the
+        // surface built on it survives.
+        unsafe {
+            if visible {
+                (self.xlib.XMapWindow)(self.display, child.get());
+            } else {
+                (self.xlib.XUnmapWindow)(self.display, child.get());
+            }
+            (self.xlib.XFlush)(self.display);
+        }
+    }
 }
 
 impl Drop for X11Presenter {
@@ -1110,5 +1186,38 @@ mod tests {
             "the second drain must measure from the position the first ended at"
         );
         assert!(state.pressed, "the button is still held across drains");
+    }
+
+    /// `set_visible`'s idempotence contract: the stored flag toggles on a
+    /// change and a matching request is a no-op, so the worker's screen-driven
+    /// call never issues a redundant X request (T-03-12). The X map/unmap
+    /// itself needs a live X server, so this pins the pure state machine the
+    /// presenter delegates to (mirroring how `PointerState` is tested).
+    #[test]
+    fn visibility_state_toggles_and_is_idempotent() {
+        let mut visibility = VisibilityState { visible: true };
+        // The exact predicate `set_visible` uses: a request is a change only
+        // when it differs from the current state. A `false` result means the
+        // presenter returns without issuing an X request (T-03-12).
+        let needs_change = |v: &VisibilityState, requested: bool| v.is_visible() != requested;
+
+        assert!(visibility.is_visible(), "starts mapped");
+        assert!(
+            needs_change(&visibility, false),
+            "hiding a shown window is a change"
+        );
+        visibility.set(false);
+        assert!(!visibility.is_visible(), "the flag records the hidden state");
+        assert!(
+            !needs_change(&visibility, false),
+            "repeated hide is a no-op"
+        );
+        assert!(
+            needs_change(&visibility, true),
+            "showing a hidden window is a change"
+        );
+        visibility.set(true);
+        assert!(visibility.is_visible(), "the flag records the shown state");
+        assert!(!needs_change(&visibility, true), "repeated show is a no-op");
     }
 }

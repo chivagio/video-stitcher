@@ -898,6 +898,7 @@ fn handle_command<B: EngineBackend>(
                 crate::presenter::ChromeState {
                     panel_expanded,
                     drawer_expanded,
+                    ..crate::presenter::ChromeState::default()
                 },
                 events,
             );
@@ -4383,6 +4384,7 @@ mod tests {
             &crate::presenter::ChromeState {
                 panel_expanded: true,
                 drawer_expanded: false,
+                ..crate::presenter::ChromeState::default()
             },
         );
         let line = native_geometry_line(rect, Some((1000, 728)), rect_chrome_expanded());
@@ -4398,6 +4400,7 @@ mod tests {
         crate::presenter::ChromeState {
             panel_expanded: true,
             drawer_expanded: false,
+            ..crate::presenter::ChromeState::default()
         }
     }
 
