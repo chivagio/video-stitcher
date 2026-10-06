@@ -643,4 +643,71 @@ mod sync_info_tests {
             "audio sync must capture a confidence value"
         );
     }
+
+    #[test]
+    fn manual_offset_records_manual_provenance() {
+        // MANU-02 / CALB-06: a manual offset is recorded as `Manual` (never
+        // IMU or audio), carries the signed frame count, and reports no
+        // confidence.
+        let mut p = pipeline();
+        p.set_sync_offset(-7);
+        assert_eq!(p.sync_method, SyncMethod::Manual);
+        assert_eq!(p.sync_offset(), -7, "the signed offset must be kept");
+        assert!(
+            p.sync_confidence().is_none(),
+            "a manual offset reports no confidence"
+        );
+    }
+
+    #[test]
+    fn audio_and_imu_paths_record_their_provenance() {
+        // MANU-02 / CALB-06: the audio path records `Audio` with a confidence;
+        // the IMU path records `Imu` with none — the provenance chain the
+        // manual flow preserves.
+        let mut audio = pipeline();
+        let samples: Vec<i16> = (0..8000)
+            .map(|i| ((i as f64 * 0.05).sin() * 10_000.0) as i16)
+            .collect();
+        audio.audio_sync(&samples, &samples, 44100).unwrap();
+        assert_eq!(audio.sync_method, SyncMethod::Audio);
+        assert!(
+            audio.sync_confidence().is_some(),
+            "the audio path must capture a confidence"
+        );
+
+        let mut imu = pipeline();
+        imu.has_native_gyro = true;
+        imu.left_telemetry = Some(Ok(synthetic_telemetry()));
+        imu.right_telemetry = Some(Ok(synthetic_telemetry()));
+        assert!(
+            imu.imu_sync().unwrap().is_some(),
+            "synthetic gyro must yield an offset"
+        );
+        assert_eq!(imu.sync_method, SyncMethod::Imu);
+        assert!(
+            imu.sync_confidence().is_none(),
+            "the IMU path computes no confidence"
+        );
+    }
+
+    /// A synthetic native-gyro telemetry stream with enough varying samples for
+    /// `estimate_sync_offset` to correlate (no real media, no files).
+    fn synthetic_telemetry() -> telemetry::TelemetryData {
+        telemetry::TelemetryData {
+            camera_type: "test".to_string(),
+            camera_model: None,
+            gyro: (0..200)
+                .map(|i| telemetry::ImuSample {
+                    t: i as f64 / 200.0,
+                    x: (i as f64 * 0.10).sin(),
+                    y: (i as f64 * 0.13).cos(),
+                    z: (i as f64 * 0.07).sin(),
+                })
+                .collect(),
+            accel: Vec::new(),
+            lens_profile: None,
+            quaternions: Vec::new(),
+            lens_info: None,
+        }
+    }
 }

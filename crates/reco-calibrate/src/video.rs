@@ -460,4 +460,17 @@ mod tests {
                 &AtomicBool,
             ) -> Result<CalibrationResult, CalibrateVideosError>;
     }
+
+    #[test]
+    fn detect_audio_sync_errors_on_an_unreadable_path() {
+        // MANU-02: "unavailable" must be a typed `Err`, never a silent
+        // `Ok(0)`, so the UI can distinguish it from a genuine zero offset and
+        // require an explicit manual offset.
+        let missing = Path::new("/nonexistent/reco/definitely-not-a-clip.mp4");
+        let result = detect_audio_sync(missing, missing, 44100);
+        assert!(
+            result.is_err(),
+            "an unreadable clip must be an error, got {result:?}"
+        );
+    }
 }
