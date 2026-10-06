@@ -33,6 +33,24 @@
     ).sort(),
   );
 
+  /**
+   * Whether `candidate` is the slot's current selection (IN-02).
+   *
+   * The selected value arrives in a `lens_override_applied` payload and the
+   * candidate in a separate `lens_candidates` payload, so object identity
+   * (`slot.lens.value === candidate`) is always false. Compare stable fields.
+   */
+  function isSelected(candidate: LensCandidate): boolean {
+    const v = slot.lens.value;
+    return (
+      v !== null &&
+      v.camera === candidate.camera &&
+      v.lens === candidate.lens &&
+      v.width === candidate.width &&
+      v.height === candidate.height
+    );
+  }
+
   const filtered = $derived(
     slot.candidates.filter((c) => {
       if (brand !== null && !c.camera.startsWith(brand)) return false;
@@ -153,7 +171,7 @@
                 type="button"
                 class="candidate"
                 role="option"
-                aria-selected={slot.lens.value === candidate}
+                aria-selected={isSelected(candidate)}
                 title={`${candidate.camera} ${candidate.lens}`}
                 onclick={() => select(candidate)}
               >
