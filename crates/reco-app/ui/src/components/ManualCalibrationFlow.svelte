@@ -8,6 +8,7 @@
 -->
 <script lang="ts">
   import { manual, MANUAL_STEPS, type ManualStep } from "../lib/manual.svelte";
+  import TimeAlignStep from "./TimeAlignStep.svelte";
   import FramePickStep from "./FramePickStep.svelte";
   import SolveStatus from "./SolveStatus.svelte";
   import ActionButton from "./ActionButton.svelte";
@@ -24,6 +25,16 @@
   };
 
   let { onExit }: { onExit: () => void } = $props();
+
+  // Step 1's Next is gated on an explicit offset confirmation when the audio
+  // estimate is absent or low (MANU-02); every other step's Next is bounded by
+  // the last step.
+  const nextDisabled = $derived(
+    manual.stepIndex === MANUAL_STEPS.length - 1 ||
+      (manual.step === "time-align" &&
+        manual.syncGateRequired &&
+        !manual.syncConfirmed),
+  );
 
   function handleExit(): void {
     void manual.exit();
@@ -63,7 +74,9 @@
   </nav>
 
   <div class="step-body">
-    {#if manual.step === "frame"}
+    {#if manual.step === "time-align"}
+      <TimeAlignStep />
+    {:else if manual.step === "frame"}
       <FramePickStep />
     {:else}
       <div class="step-placeholder">
@@ -84,7 +97,7 @@
     </ActionButton>
     <ActionButton
       variant="primary"
-      disabled={manual.stepIndex === MANUAL_STEPS.length - 1}
+      disabled={nextDisabled}
       onClick={() => manual.next()}
     >
       Next
