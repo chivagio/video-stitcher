@@ -380,6 +380,8 @@ fn k1_bounds_penalty(k1: f64, (lo, hi): (f64, f64)) -> f64 {
 ///
 /// * [`CalibrateError::InsufficientMatches`] with `min = 1` for an empty
 ///   observation set — a defined non-result, never a zero-`k1` answer.
+/// * [`CalibrateError::InvalidConfig`] if `k1_bound` is not finite and positive
+///   (a zero-width bound collapses the 1-D simplex; IN-03).
 /// * [`CalibrateError::OptimizerFailed`] if Nelder-Mead returns no best
 ///   parameter.
 /// * [`CalibrateError::InvalidConfig`] if the solver cannot be constructed
@@ -391,6 +393,15 @@ pub fn optimize_intrinsics(
     right_base: &CameraParams,
     cfg: &IntrinsicsConfig,
 ) -> Result<IntrinsicsRefinement, CalibrateError> {
+    // A non-positive or non-finite bound collapses the 1-D simplex to two
+    // identical vertices, which Nelder-Mead cannot explore (IN-03).
+    if !cfg.k1_bound.is_finite() || cfg.k1_bound <= 0.0 {
+        return Err(CalibrateError::InvalidConfig(format!(
+            "k1_bound must be finite and positive, got {}",
+            cfg.k1_bound
+        )));
+    }
+
     if points.is_empty() {
         return Err(CalibrateError::InsufficientMatches { got: 0, min: 1 });
     }
@@ -1464,6 +1475,35 @@ mod tests {
                 assert_eq!(min, 1);
             }
             other => panic!("expected InsufficientMatches, got {other:?}"),
+        }
+    }
+
+    /// IN-03: a zero-width (or non-finite) `k1_bound` is rejected before the
+    /// solver runs — the 1-D simplex would otherwise be two identical vertices.
+    #[test]
+    fn invalid_k1_bound_is_a_typed_error() {
+        let layout = layout_from(&truth());
+        let base = camera_params(0.0);
+
+        for bound in [0.0_f64, -0.1, f64::INFINITY, f64::NAN] {
+            let cfg = IntrinsicsConfig {
+                k1_bound: bound,
+                ..IntrinsicsConfig::default()
+            };
+            let err = optimize_intrinsics(&spread_matches(40), &layout, &base, &base, &cfg)
+                .expect_err("an invalid k1_bound must be refused");
+            assert!(
+                matches!(err, CalibrateError::InvalidConfig(_)),
+                "bound {bound}: expected InvalidConfig, got {err:?}"
+            );
+
+            // The composed driver propagates the same typed config error.
+            let err = refine_intrinsics(&spread_matches(40), &layout, &base, &base, &cfg)
+                .expect_err("the driver must propagate the config error");
+            assert!(
+                matches!(err, CalibrateError::InvalidConfig(_)),
+                "bound {bound}: expected InvalidConfig from the driver, got {err:?}"
+            );
         }
     }
 
