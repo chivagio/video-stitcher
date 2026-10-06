@@ -7,15 +7,21 @@
   existing profile.
 -->
 <script lang="ts">
-  import {
-    manual,
-    MANUAL_STEPS,
-    MANUAL_STEP_NAMES,
-  } from "../lib/manual.svelte";
+  import { manual, MANUAL_STEPS, type ManualStep } from "../lib/manual.svelte";
   import FramePickStep from "./FramePickStep.svelte";
   import SolveStatus from "./SolveStatus.svelte";
   import ActionButton from "./ActionButton.svelte";
   import InlineNotice from "./InlineNotice.svelte";
+
+  // The locked step names (UI-SPEC Copywriting Contract), in flow order:
+  // Time-align · Frame · Pin · Bend · Validate.
+  const STEP_LABELS: Record<ManualStep, string> = {
+    "time-align": "Time-align",
+    frame: "Frame",
+    pin: "Pin",
+    bend: "Bend",
+    validate: "Validate",
+  };
 
   let { onExit }: { onExit: () => void } = $props();
 
@@ -49,7 +55,7 @@
             onclick={() => manual.goToStep(step)}
           >
             <span class="step-index">{i + 1}</span>
-            <span class="step-name">{MANUAL_STEP_NAMES[step]}</span>
+            <span class="step-name">{STEP_LABELS[step]}</span>
           </button>
         </li>
       {/each}
@@ -62,7 +68,7 @@
     {:else}
       <div class="step-placeholder">
         <p class="placeholder-text">
-          {MANUAL_STEP_NAMES[manual.step]} — not yet configured.
+          {STEP_LABELS[manual.step]} — not yet configured.
         </p>
       </div>
     {/if}

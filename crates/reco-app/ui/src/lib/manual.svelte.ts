@@ -33,15 +33,6 @@ export const MANUAL_STEPS: ManualStep[] = [
   "validate",
 ];
 
-/** The locked step names (UI-SPEC Copywriting Contract). */
-export const MANUAL_STEP_NAMES: Record<ManualStep, string> = {
-  "time-align": "Time-align",
-  frame: "Frame",
-  pin: "Pin",
-  bend: "Bend",
-  validate: "Validate",
-};
-
 /** One camera's rendered preview frame (mirror `events::ManualPreviewFrame`). */
 export interface ManualPreview {
   /** RGBA bytes (`width * height * 4`). */
