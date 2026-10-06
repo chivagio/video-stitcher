@@ -536,6 +536,65 @@ pub struct DebugReport {
     pub points_capped: bool,
 }
 
+/// The solved plane layout as a transport-agnostic view (MANU-03).
+///
+/// Mirrors the seven `PlaneLayout` fields so the webview can read the solved
+/// rig without importing an engine type (`reco-core`). Produced by the manual
+/// solve and carried on [`WorkerEvent::ManualSolveResult`].
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PlaneLayoutView {
+    /// Distance of the virtual camera from the origin along both axes.
+    pub camera_axis_offset: f64,
+    /// Overlap ratio between the two planes (`0.0`..=`1.0`).
+    pub intersect: f64,
+    /// Y-axis translation of the right plane.
+    pub x_ty: f64,
+    /// Z-axis rotation of the right plane (radians).
+    pub x_rz: f64,
+    /// X-axis rotation of the left plane (radians).
+    pub z_rx: f64,
+    /// X-axis rotation of the right plane (radians).
+    pub x_rx: f64,
+    /// Z-axis rotation of the left plane (radians).
+    pub z_rz: f64,
+}
+
+impl PlaneLayoutView {
+    /// Project an engine [`PlaneLayout`](reco_core::calibration::PlaneLayout)
+    /// into its transport-agnostic view.
+    #[must_use]
+    pub fn from_layout(layout: &reco_core::calibration::PlaneLayout) -> Self {
+        Self {
+            camera_axis_offset: layout.camera_axis_offset,
+            intersect: layout.intersect,
+            x_ty: layout.x_ty,
+            x_rz: layout.x_rz,
+            z_rx: layout.z_rx,
+            x_rx: layout.x_rx,
+            z_rz: layout.z_rz,
+        }
+    }
+}
+
+/// One correspondence pin as it crosses to the webview (MANU-03).
+///
+/// `left_px`/`right_px` are natural-order pixel coordinates (the operator's
+/// click points), never optimizer-plane coordinates — the swap lives only in
+/// the engine helper (prohibition: never re-derive the swap in the UI).
+/// `verified` is true for a pin seeded from a post-RANSAC automatic match and
+/// false for one the operator placed (MANU-04).
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ManualPinView {
+    /// Stable per-session pin id (used by move/remove commands).
+    pub id: u32,
+    /// Clicked point on the left frame, `[x, y]` pixels.
+    pub left_px: [f64; 2],
+    /// Corresponding point on the right frame, `[x, y]` pixels.
+    pub right_px: [f64; 2],
+    /// Whether the pin was seeded from a verified automatic match.
+    pub verified: bool,
+}
+
 /// An event emitted by the engine worker and rendered in the webview log pane.
 ///
 /// `Clone + Send + 'static` so it can cross the worker→UI channel; the
@@ -798,6 +857,36 @@ pub enum WorkerEvent {
         busy: bool,
         /// Whether the preview shows the last solved (stale) result.
         stale: bool,
+    },
+
+    /// The manual session's current correspondence pins (MANU-03).
+    ///
+    /// Emitted immediately on every pin mutation and on `manual_begin` when the
+    /// session starts with seeded pins. `seeded` is true on the first emit when
+    /// the editor was pre-populated from verified automatic matches (MANU-04),
+    /// so the surface can show the pre-populated notice.
+    ManualPins {
+        /// The pins in stable creation order.
+        pins: Vec<ManualPinView>,
+        /// Whether these pins were seeded from verified automatic matches.
+        seeded: bool,
+    },
+
+    /// A debounced background manual solve landed (MANU-03).
+    ///
+    /// Carries the solved [`PlaneLayoutView`] plus the pin/auto contribution
+    /// counts. The preview parameters are only marked fresh after this event;
+    /// between a pin drop and this landing the state is
+    /// [`ManualSolveState`]` { busy: true, stale: true }`.
+    ManualSolveResult {
+        /// The solved plane layout.
+        layout: PlaneLayoutView,
+        /// Residual seam-weighted reprojection error at the optimum.
+        residual: f64,
+        /// Number of manual pins that contributed to the solve.
+        pins_used: usize,
+        /// Number of pre-populated automatic matches that contributed.
+        auto_used: usize,
     },
 
     /// The manual flow's audio auto-sync estimate (MANU-02).
@@ -1088,6 +1177,33 @@ impl WorkerEvent {
                     } else {
                         "solved"
                     }
+                ),
+            },
+            // The pin list crosses as a structured payload; the log line is a
+            // bounded summary (never the pixel coordinates of every pin).
+            WorkerEvent::ManualPins { pins, seeded } => LogLine {
+                level: Level::Info,
+                message: if *seeded {
+                    format!(
+                        "manual pins: {} seeded from verified automatic matches",
+                        pins.len()
+                    )
+                } else {
+                    format!("manual pins: {}", pins.len())
+                },
+            },
+            // A landed solve is INFO. The degenerate/insufficient case never
+            // produces this event — the worker emits a WARN log line and a stale
+            // solve state instead, so no garbage rig is ever presented.
+            WorkerEvent::ManualSolveResult {
+                residual,
+                pins_used,
+                auto_used,
+                ..
+            } => LogLine {
+                level: Level::Info,
+                message: format!(
+                    "manual solve finished: residual {residual:.6} ({pins_used} pins, {auto_used} auto)"
                 ),
             },
             // Audio sync is INFO when a confident estimate exists and WARN when
@@ -1992,5 +2108,57 @@ mod tests {
         let line = event.to_log_line();
         assert_eq!(line.level, Level::Info);
         assert!(line.message.contains(SYNC_OFFSET_SEMANTICS), "{line:?}");
+    }
+
+    #[test]
+    fn manual_pins_and_solve_result_roundtrip_and_project() {
+        // MANU-03 / MANU-04: the pin list carries natural-order pixel coords and
+        // a per-pin verified mark; a landed solve carries the typed layout view.
+        let pins = WorkerEvent::ManualPins {
+            pins: vec![ManualPinView {
+                id: 0,
+                left_px: [10.0, 20.0],
+                right_px: [30.0, 40.0],
+                verified: true,
+            }],
+            seeded: true,
+        };
+        let json = serde_json::to_string(&pins).unwrap();
+        assert!(
+            json.contains("\"kind\":\"manual_pins\""),
+            "unexpected json: {json}"
+        );
+        assert!(
+            json.contains("\"verified\":true"),
+            "verified must ride: {json}"
+        );
+        assert_eq!(serde_json::from_str::<WorkerEvent>(&json).unwrap(), pins);
+        let seeded_line = pins.to_log_line();
+        assert_eq!(seeded_line.level, Level::Info);
+        assert!(seeded_line.message.contains("seeded"), "{seeded_line:?}");
+
+        let result = WorkerEvent::ManualSolveResult {
+            layout: PlaneLayoutView {
+                camera_axis_offset: 0.24,
+                intersect: 0.55,
+                x_ty: 0.01,
+                x_rz: 0.0,
+                z_rx: 0.0,
+                x_rx: 0.0,
+                z_rz: 0.0,
+            },
+            residual: 0.000004,
+            pins_used: 10,
+            auto_used: 32,
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(
+            json.contains("\"kind\":\"manual_solve_result\""),
+            "unexpected json: {json}"
+        );
+        assert_eq!(serde_json::from_str::<WorkerEvent>(&json).unwrap(), result);
+        let line = result.to_log_line();
+        assert_eq!(line.level, Level::Info);
+        assert!(line.message.contains("10 pins"), "{line:?}");
     }
 }

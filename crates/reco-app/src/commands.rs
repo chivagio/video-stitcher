@@ -660,6 +660,89 @@ pub async fn manual_set_sync(
     state.send(WorkerCommand::ManualSetSync { offset_frames })
 }
 
+/// Reject a non-finite pin coordinate at the command boundary (T-04.1-10).
+///
+/// The worker clamps coordinates to the frame bounds, but a `NaN`/`inf` survives
+/// `f64::clamp` and would poison the solve. This is the boundary check; the
+/// worker owns the bounds clamp.
+fn validate_pin_point(px: [f64; 2], field: &str) -> Result<(), WorkerError> {
+    if px.iter().any(|v| !v.is_finite()) {
+        return Err(WorkerError::InvalidInput {
+            field: field.to_string(),
+            reason: "pin coordinates must be finite".to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Add one correspondence pin to the manual session (MANU-03).
+///
+/// Thin, same contract as [`manual_begin`]: validate the points are finite, then
+/// post `ManualAddPin`. The worker clamps them to the frame bounds, emits the
+/// updated pin list plus an instant preview, and arms the debounced background
+/// solve.
+///
+/// # Errors
+///
+/// * [`WorkerError::InvalidInput`] if a coordinate is not finite.
+/// * [`WorkerError::ChannelClosed`] if the worker has already exited.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn manual_add_pin(
+    state: tauri::State<'_, WorkerHandle>,
+    left_px: [f64; 2],
+    right_px: [f64; 2],
+) -> Result<(), WorkerError> {
+    validate_pin_point(left_px, "left_px")?;
+    validate_pin_point(right_px, "right_px")?;
+    state.send(WorkerCommand::ManualAddPin { left_px, right_px })
+}
+
+/// Move one side of an existing pin (MANU-03).
+///
+/// Thin, same contract as [`manual_add_pin`]; re-arms the debounced solve.
+///
+/// # Errors
+///
+/// * [`WorkerError::InvalidInput`] if the coordinate is not finite.
+/// * [`WorkerError::ChannelClosed`] if the worker has already exited.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn manual_move_pin(
+    state: tauri::State<'_, WorkerHandle>,
+    id: u32,
+    side: crate::events::ManualSide,
+    px: [f64; 2],
+) -> Result<(), WorkerError> {
+    validate_pin_point(px, "px")?;
+    state.send(WorkerCommand::ManualMovePin { id, side, px })
+}
+
+/// Remove one pin (MANU-03).
+///
+/// Thin, same contract as [`manual_begin`].
+///
+/// # Errors
+///
+/// Returns [`WorkerError::ChannelClosed`] if the worker has already exited.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn manual_remove_pin(
+    state: tauri::State<'_, WorkerHandle>,
+    id: u32,
+) -> Result<(), WorkerError> {
+    state.send(WorkerCommand::ManualRemovePin { id })
+}
+
+/// Remove every pin from the manual session (MANU-03).
+///
+/// Thin, same contract as [`manual_begin`].
+///
+/// # Errors
+///
+/// Returns [`WorkerError::ChannelClosed`] if the worker has already exited.
+#[tauri::command]
+pub async fn manual_clear_pins(state: tauri::State<'_, WorkerHandle>) -> Result<(), WorkerError> {
+    state.send(WorkerCommand::ManualClearPins)
+}
+
 /// Cancel a running calibration (CALB-02 / D3-11).
 ///
 /// # The documented control-plane bypass
@@ -972,6 +1055,44 @@ pub enum WorkerCommand {
         /// The operator-chosen offset in frames (signed).
         offset_frames: i64,
     },
+
+    /// Add one correspondence pin to the manual session (MANU-03).
+    ///
+    /// The worker clamps both points to the session's frame bounds (T-04.1-10),
+    /// emits the updated `ManualPins` plus an instant preview, marks the solve
+    /// busy, and arms a debounced background solve. The solve never runs from
+    /// this command directly.
+    ManualAddPin {
+        /// Clicked point on the left frame, `[x, y]` pixels.
+        left_px: [f64; 2],
+        /// Corresponding point on the right frame, `[x, y]` pixels.
+        right_px: [f64; 2],
+    },
+
+    /// Move one side of an existing pin (MANU-03).
+    ///
+    /// Re-arms the debounced background solve exactly like [`Self::ManualAddPin`].
+    ManualMovePin {
+        /// The pin's stable id.
+        id: u32,
+        /// Which side of the pin moved.
+        side: crate::events::ManualSide,
+        /// The new point on that side, `[x, y]` pixels.
+        px: [f64; 2],
+    },
+
+    /// Remove one pin (MANU-03).
+    ///
+    /// Removing the last pin leaves an empty set, which never triggers a solve.
+    ManualRemovePin {
+        /// The pin's stable id.
+        id: u32,
+    },
+
+    /// Remove every pin from the manual session (MANU-03).
+    ///
+    /// An empty set never triggers a solve (the UI shows the empty prompt).
+    ManualClearPins,
 
     /// Stop the worker loop and return.
     Shutdown,
@@ -1451,6 +1572,23 @@ mod tests {
         handle
             .send(WorkerCommand::ManualSetSync { offset_frames: -7 })
             .unwrap();
+        handle
+            .send(WorkerCommand::ManualAddPin {
+                left_px: [1.0, 2.0],
+                right_px: [3.0, 4.0],
+            })
+            .unwrap();
+        handle
+            .send(WorkerCommand::ManualMovePin {
+                id: 2,
+                side: crate::events::ManualSide::Right,
+                px: [5.0, 6.0],
+            })
+            .unwrap();
+        handle
+            .send(WorkerCommand::ManualRemovePin { id: 2 })
+            .unwrap();
+        handle.send(WorkerCommand::ManualClearPins).unwrap();
         assert_eq!(rx.recv().unwrap(), WorkerCommand::ManualBegin { frame: 12 });
         assert_eq!(
             rx.recv().unwrap(),
@@ -1462,5 +1600,31 @@ mod tests {
             rx.recv().unwrap(),
             WorkerCommand::ManualSetSync { offset_frames: -7 }
         );
+        assert_eq!(
+            rx.recv().unwrap(),
+            WorkerCommand::ManualAddPin {
+                left_px: [1.0, 2.0],
+                right_px: [3.0, 4.0]
+            }
+        );
+        assert_eq!(
+            rx.recv().unwrap(),
+            WorkerCommand::ManualMovePin {
+                id: 2,
+                side: crate::events::ManualSide::Right,
+                px: [5.0, 6.0]
+            }
+        );
+        assert_eq!(rx.recv().unwrap(), WorkerCommand::ManualRemovePin { id: 2 });
+        assert_eq!(rx.recv().unwrap(), WorkerCommand::ManualClearPins);
+    }
+
+    #[test]
+    fn validate_pin_point_rejects_non_finite_coordinates() {
+        // T-04.1-10: a NaN/inf pin would survive the worker's bounds clamp and
+        // poison the solve, so the boundary rejects it.
+        assert!(validate_pin_point([1.0, 2.0], "px").is_ok());
+        assert!(validate_pin_point([f64::NAN, 2.0], "px").is_err());
+        assert!(validate_pin_point([1.0, f64::INFINITY], "px").is_err());
     }
 }

@@ -17,7 +17,13 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import type { SyncMethod, WorkerEventTyped } from "./types";
+import type {
+  ManualPinView,
+  ManualSide,
+  PlaneLayoutView,
+  SyncMethod,
+  WorkerEventTyped,
+} from "./types";
 import { WORKER_EVENT_TYPED } from "./types";
 import { formatWorkerError } from "./errors";
 
@@ -75,6 +81,18 @@ class ManualStore {
   stale = $state(false);
   /** The last typed rejection, or null. */
   error = $state<string | null>(null);
+
+  /** The current correspondence pins (worker-authoritative, MANU-03). */
+  pins = $state<ManualPinView[]>([]);
+  /** Whether the pins were seeded from verified automatic matches (MANU-04). */
+  seeded = $state(false);
+  /** The last landed solve result, or null (MANU-03). */
+  solveResult = $state<{
+    layout: PlaneLayoutView;
+    residual: number;
+    pins_used: number;
+    auto_used: number;
+  } | null>(null);
 
   /** The audio auto-sync confidence, or null when unavailable (MANU-02). */
   audioConfidence = $state<number | null>(null);
@@ -137,6 +155,18 @@ class ManualStore {
         this.stale = event.data.stale;
         break;
       }
+      case "manual_pins": {
+        this.pins = event.data.pins;
+        // `seeded` is true only on the first emit of a pre-populated session.
+        // Once the operator edits, later emits carry false — but the notice
+        // should persist for the session, so never clear a true back to false.
+        if (event.data.seeded) this.seeded = true;
+        break;
+      }
+      case "manual_solve_result": {
+        this.solveResult = event.data;
+        break;
+      }
       case "audio_sync_result": {
         const { offset_frames, confidence, offset_semantics } = event.data;
         this.audioConfidence = confidence;
@@ -184,6 +214,9 @@ class ManualStore {
     this.syncOffset = 0;
     this.syncMethod = "none";
     this.syncConfirmed = false;
+    this.pins = [];
+    this.seeded = false;
+    this.solveResult = null;
     try {
       await invoke("manual_begin", { frame });
     } catch (e) {
@@ -243,6 +276,48 @@ class ManualStore {
   }
 
   /**
+   * Add one correspondence pin (MANU-03).
+   *
+   * Posts `manual_add_pin`; the worker clamps the points, mirrors the updated
+   * pin list, renders an instant preview, and arms the debounced solve. The
+   * store never derives the pin list or runs a solve itself.
+   */
+  async addPin(left: [number, number], right: [number, number]): Promise<void> {
+    try {
+      await invoke("manual_add_pin", { left_px: left, right_px: right });
+    } catch (e) {
+      this.error = formatWorkerError(e);
+    }
+  }
+
+  /** Move one side of an existing pin (MANU-03). */
+  async movePin(id: number, side: ManualSide, px: [number, number]): Promise<void> {
+    try {
+      await invoke("manual_move_pin", { id, side, px });
+    } catch (e) {
+      this.error = formatWorkerError(e);
+    }
+  }
+
+  /** Remove one pin (MANU-03). */
+  async removePin(id: number): Promise<void> {
+    try {
+      await invoke("manual_remove_pin", { id });
+    } catch (e) {
+      this.error = formatWorkerError(e);
+    }
+  }
+
+  /** Remove every pin (MANU-03). An empty set never triggers a solve. */
+  async clearPins(): Promise<void> {
+    try {
+      await invoke("manual_clear_pins");
+    } catch (e) {
+      this.error = formatWorkerError(e);
+    }
+  }
+
+  /**
    * Close the manual session (MANU-01).
    *
    * Clears the local preview and posts `manual_exit`; the worker drops the
@@ -260,6 +335,9 @@ class ManualStore {
     this.syncMethod = "none";
     this.syncConfirmed = false;
     this.offsetSemantics = "";
+    this.pins = [];
+    this.seeded = false;
+    this.solveResult = null;
     try {
       await invoke("manual_exit");
     } catch {

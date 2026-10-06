@@ -91,6 +91,10 @@ fn main() -> anyhow::Result<()> {
             commands::manual_exit,
             commands::manual_detect_sync,
             commands::manual_set_sync,
+            commands::manual_add_pin,
+            commands::manual_move_pin,
+            commands::manual_remove_pin,
+            commands::manual_clear_pins,
             commands::cancel_calibration
         ])
         .setup(|app| {

@@ -62,6 +62,29 @@ export type InputRole = "left" | "right";
 /** Which camera a manual preview frame belongs to (mirror `events::ManualSide`, MANU-03). */
 export type ManualSide = "left" | "right";
 
+/** One correspondence pin as it crosses from the worker (mirror `events::ManualPinView`, MANU-03). */
+export interface ManualPinView {
+  /** Stable per-session pin id (used by move/remove commands). */
+  id: number;
+  /** Clicked point on the left frame, `[x, y]` pixels. */
+  left_px: [number, number];
+  /** Corresponding point on the right frame, `[x, y]` pixels. */
+  right_px: [number, number];
+  /** Whether the pin was seeded from a verified automatic match (MANU-04). */
+  verified: boolean;
+}
+
+/** The solved plane layout view (mirror `events::PlaneLayoutView`, MANU-03). */
+export interface PlaneLayoutView {
+  camera_axis_offset: number;
+  intersect: number;
+  x_ty: number;
+  x_rz: number;
+  z_rx: number;
+  x_rx: number;
+  z_rz: number;
+}
+
 /** Whether a metadata value was probed directly or derived (IMPT-02). */
 export type Provenance = "probed" | "estimated";
 
@@ -309,6 +332,16 @@ export type WorkerEventTyped =
       data: { side: ManualSide; rgba: number[]; width: number; height: number };
     }
   | { kind: "manual_solve_state"; data: { busy: boolean; stale: boolean } }
+  | { kind: "manual_pins"; data: { pins: ManualPinView[]; seeded: boolean } }
+  | {
+      kind: "manual_solve_result";
+      data: {
+        layout: PlaneLayoutView;
+        residual: number;
+        pins_used: number;
+        auto_used: number;
+      };
+    }
   | {
       kind: "audio_sync_result";
       data: {

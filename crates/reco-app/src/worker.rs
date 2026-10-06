@@ -65,7 +65,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -368,6 +368,30 @@ impl EventSink {
         let _ = self.tx.send(WorkerEvent::ManualSolveState { busy, stale });
     }
 
+    /// Emit the manual session's current correspondence pins (MANU-03).
+    ///
+    /// The pin list rides the typed channel; the process log carries only a
+    /// bounded summary, never every pin's coordinates.
+    fn manual_pins(&self, pins: Vec<crate::events::ManualPinView>, seeded: bool) {
+        let _ = self.tx.send(WorkerEvent::ManualPins { pins, seeded });
+    }
+
+    /// Emit a landed debounced manual solve (MANU-03).
+    fn manual_solve_result(
+        &self,
+        layout: crate::events::PlaneLayoutView,
+        residual: f64,
+        pins_used: usize,
+        auto_used: usize,
+    ) {
+        let _ = self.tx.send(WorkerEvent::ManualSolveResult {
+            layout,
+            residual,
+            pins_used,
+            auto_used,
+        });
+    }
+
     /// Emit the manual flow's audio auto-sync estimate (MANU-02).
     ///
     /// `confidence: None` is the "unavailable" signal. The fixed semantics
@@ -417,6 +441,14 @@ fn normalize_field_roi(
         right: clean(right),
     }
 }
+
+/// The debounce window for the background manual solve (MANU-03).
+///
+/// A pin mutation re-arms this window; one solve fires once the window elapses
+/// with no further mutation. The solve is never run per pointer-move — that is
+/// the whole point of the debounce (T-04.1-11). The window is a UX choice the
+/// plan leaves to the agent; 400 ms sits in the research's 300–500 ms band.
+pub(crate) const MANUAL_SOLVE_DEBOUNCE: Duration = Duration::from_millis(400);
 
 /// Extract one reference frame's YUV planes from a clip (MANU-03).
 ///
@@ -979,6 +1011,50 @@ pub trait EngineBackend: Send {
         events: &EventSink,
     ) -> Result<(), WorkerError>;
 
+    /// Add one correspondence pin and arm the debounced solve (MANU-03).
+    ///
+    /// The backend clamps the points to its session frame bounds (T-04.1-10),
+    /// emits the updated `ManualPins` plus an instant preview, marks the solve
+    /// busy/stale, and arms [`Self::manual_solve_deadline`]. It never runs the
+    /// solve itself (the worker loop does, once the debounce elapses).
+    fn manual_add_pin(
+        &mut self,
+        left_px: [f64; 2],
+        right_px: [f64; 2],
+        events: &EventSink,
+    ) -> Result<(), WorkerError>;
+
+    /// Move one side of an existing pin and re-arm the debounced solve
+    /// (MANU-03).
+    fn manual_move_pin(
+        &mut self,
+        id: u32,
+        side: crate::events::ManualSide,
+        px: [f64; 2],
+        events: &EventSink,
+    ) -> Result<(), WorkerError>;
+
+    /// Remove one pin and re-arm the debounced solve (MANU-03).
+    fn manual_remove_pin(&mut self, id: u32, events: &EventSink) -> Result<(), WorkerError>;
+
+    /// Remove every pin (MANU-03). An empty set never arms a solve.
+    fn manual_clear_pins(&mut self, events: &EventSink) -> Result<(), WorkerError>;
+
+    /// The instant the armed debounced manual solve should fire, or `None`
+    /// when no solve is armed (MANU-03).
+    ///
+    /// The worker loop blocks on the command channel only until this deadline,
+    /// so a pin drop's background solve lands without a busy spin. The solve is
+    /// **never** called from a pin command directly.
+    fn manual_solve_deadline(&self) -> Option<std::time::Instant>;
+
+    /// Run the armed manual solve now, emit `ManualSolveResult` + the fresh
+    /// state, and clear the deadline (MANU-03).
+    ///
+    /// An empty or degenerate pin set is a defined non-result: it emits a WARN
+    /// log line and the stale state, never a garbage rig.
+    fn manual_solve(&mut self, events: &EventSink) -> Result<(), WorkerError>;
+
     /// Begin a preview **session**: build/ensure the renderer, paint the idle
     /// frame, and start the transport, but do NOT run a frame loop.
     ///
@@ -1412,6 +1488,26 @@ fn handle_command<B: EngineBackend>(
                 events.failed(e);
             }
         }
+        WorkerCommand::ManualAddPin { left_px, right_px } => {
+            if let Err(e) = backend.manual_add_pin(left_px, right_px, events) {
+                events.failed(e);
+            }
+        }
+        WorkerCommand::ManualMovePin { id, side, px } => {
+            if let Err(e) = backend.manual_move_pin(id, side, px, events) {
+                events.failed(e);
+            }
+        }
+        WorkerCommand::ManualRemovePin { id } => {
+            if let Err(e) = backend.manual_remove_pin(id, events) {
+                events.failed(e);
+            }
+        }
+        WorkerCommand::ManualClearPins => {
+            if let Err(e) = backend.manual_clear_pins(events) {
+                events.failed(e);
+            }
+        }
         WorkerCommand::Export => {
             interrupted.store(false, Ordering::SeqCst);
             match backend.export(events, interrupted) {
@@ -1513,6 +1609,17 @@ fn worker_loop<B: EngineBackend>(
             }
         }
 
+        // Fire a due debounced manual solve (MANU-03). The solve is NEVER run
+        // from a pin command directly — only here, once the debounce window has
+        // elapsed with no further pin mutation (T-04.1-11). The backend clears
+        // its own deadline when the solve runs.
+        if let Some(deadline) = backend.manual_solve_deadline()
+            && std::time::Instant::now() >= deadline
+            && let Err(e) = backend.manual_solve(&events)
+        {
+            events.failed(e);
+        }
+
         // Native pose input: the presenter's own window owns the preview
         // rectangle, so its gestures are drained here — after the command drain
         // (so a SetView/SetChrome in the same batch is already applied) and
@@ -1548,19 +1655,43 @@ fn worker_loop<B: EngineBackend>(
             continue;
         }
 
-        match rx.recv() {
-            Ok(cmd) => {
-                let keep_going = handle_command(cmd, &mut backend, &events, &interrupted);
-                if !keep_going {
-                    return;
-                }
-                if backend.recovery_pending()
-                    && let Err(e) = backend.recover(&events)
-                {
-                    events.failed(e);
+        // Block for the next command. When a debounced manual solve is armed,
+        // bound the wait by its deadline so the solve fires on time; on timeout
+        // the loop re-enters, the due-check above runs the solve, and the
+        // channel blocks normally again (no busy spin).
+        match backend.manual_solve_deadline() {
+            Some(deadline) => {
+                let timeout = deadline.saturating_duration_since(std::time::Instant::now());
+                match rx.recv_timeout(timeout) {
+                    Ok(cmd) => {
+                        let keep_going = handle_command(cmd, &mut backend, &events, &interrupted);
+                        if !keep_going {
+                            return;
+                        }
+                        if backend.recovery_pending()
+                            && let Err(e) = backend.recover(&events)
+                        {
+                            events.failed(e);
+                        }
+                    }
+                    Err(RecvTimeoutError::Timeout) => continue,
+                    Err(RecvTimeoutError::Disconnected) => return,
                 }
             }
-            Err(_) => return,
+            None => match rx.recv() {
+                Ok(cmd) => {
+                    let keep_going = handle_command(cmd, &mut backend, &events, &interrupted);
+                    if !keep_going {
+                        return;
+                    }
+                    if backend.recovery_pending()
+                        && let Err(e) = backend.recover(&events)
+                    {
+                        events.failed(e);
+                    }
+                }
+                Err(_) => return,
+            },
         }
     }
 }
@@ -1691,6 +1822,53 @@ struct ManualSession {
     /// `None` until the operator nudges; `Manual` afterwards — preserving the
     /// CALB-06 provenance chain (IMU → audio → manual).
     sync_method: crate::events::SyncMethod,
+    /// Total frames in the right clip, so the sync offset can clamp the right
+    /// reference frame index (MANU-02 / MANU-03).
+    right_frames_total: u64,
+    /// The manual correspondence pins, in stable creation order (MANU-03).
+    pins: Vec<SessionPin>,
+    /// The next pin id to hand out (monotonic; never reused within a session).
+    next_pin_id: u32,
+    /// Verified (post-RANSAC) automatic matches retained from the last
+    /// calibration, used as the solve's `auto` set and the seed source
+    /// (MANU-04). Empty when no calibration result exists.
+    auto_seed: Vec<reco_calibrate::types::MatchedPoint>,
+}
+
+/// One correspondence pin held by the manual session (MANU-03).
+#[derive(Debug, Clone, Copy)]
+struct SessionPin {
+    /// Stable id, handed to the webview and used by move/remove commands.
+    id: u32,
+    /// Clicked point on the left frame, `[x, y]` pixels.
+    left_px: [f64; 2],
+    /// Corresponding point on the right frame, `[x, y]` pixels.
+    right_px: [f64; 2],
+    /// Whether the pin was seeded from a verified automatic match (MANU-04).
+    verified: bool,
+}
+
+impl SessionPin {
+    /// Project the session pin into the typed view the webview consumes.
+    fn view(&self) -> crate::events::ManualPinView {
+        crate::events::ManualPinView {
+            id: self.id,
+            left_px: self.left_px,
+            right_px: self.right_px,
+            verified: self.verified,
+        }
+    }
+}
+
+/// Clamp a pin point to a frame's pixel bounds (T-04.1-10).
+///
+/// The command boundary rejects non-finite coordinates; this clamps a finite
+/// point into `[0, w-1] × [0, h-1]` so an out-of-bounds pin can never reach the
+/// solve.
+fn clamp_pin_px(px: [f64; 2], w: u32, h: u32) -> [f64; 2] {
+    let max_x = w.saturating_sub(1) as f64;
+    let max_y = h.saturating_sub(1) as f64;
+    [px[0].clamp(0.0, max_x), px[1].clamp(0.0, max_y)]
 }
 
 /// The engine objects exclusively owned by the worker thread (FOUND-03).
@@ -1769,6 +1947,13 @@ pub struct GpuEngineBackend {
     /// Retains exactly one reference-frame YUV pair for the session's duration
     /// (T-04.1-02); `None` when no manual session is open.
     manual: Option<ManualSession>,
+    /// Verified (post-RANSAC) matches retained from the last successful
+    /// calibration, used to pre-populate the pin editor (MANU-04). Empty until a
+    /// calibration result exists.
+    verified_seed: Vec<reco_calibrate::types::MatchedPoint>,
+    /// The instant the armed debounced manual solve should fire, or `None`
+    /// (MANU-03). Set by a pin mutation; cleared by [`Self::manual_solve`].
+    manual_solve_at: Option<std::time::Instant>,
     /// The open decode source, if `Import` has run.
     ///
     /// Drops **first** (declaration order): the CLI documents that the decode
@@ -1950,6 +2135,8 @@ impl GpuEngineBackend {
             has_result: false,
             calibration: None,
             manual: None,
+            verified_seed: Vec::new(),
+            manual_solve_at: None,
             source: None,
             input_size: None,
             presenter,
@@ -2612,6 +2799,15 @@ impl EngineBackend for GpuEngineBackend {
         match result {
             Ok(calibration_result) => {
                 let scorecard = crate::calibration::project_scorecard(&calibration_result);
+                // Retain the reference frame's post-RANSAC matches so a later
+                // manual session can pre-populate its pins from geometrically
+                // verified matches ONLY (MANU-04). Rejected candidates are never
+                // kept. The first frame is the calibration's reference frame.
+                self.verified_seed = calibration_result
+                    .per_frame
+                    .first()
+                    .map(|fm| fm.points.clone())
+                    .unwrap_or_default();
                 // Adopt the result as the preview source too (D3-15 / WR-05),
                 // so the scorecard and the rendered stitch describe one profile.
                 self.adopt_calibration(calibration_result.calibration.clone());
@@ -2746,14 +2942,44 @@ impl EngineBackend for GpuEngineBackend {
         let (left_path, right_path) = self.manual_frame_paths()?;
         let probe = reco_io::ffmpeg::calibration_io::probe_video(std::path::Path::new(&left_path))
             .map_err(|e| WorkerError::Engine(e.to_string()))?;
+        let right_probe =
+            reco_io::ffmpeg::calibration_io::probe_video(std::path::Path::new(&right_path))
+                .map_err(|e| WorkerError::Engine(e.to_string()))?;
         let frames_total = probe.total_frames.max(1);
+        let right_frames_total = right_probe.total_frames.max(1);
         // T-04.1-01: clamp the operator-supplied index against the probed frame
         // count BEFORE extraction, so an out-of-range index cannot reach the
         // decoder.
         let frame = frame.min(frames_total.saturating_sub(1));
+        // The offset starts at 0, so the right reference frame is the same index.
+        let right_index = frame.min(right_frames_total.saturating_sub(1));
         let left_frame = extract_manual_frame(&left_path, frame)?;
-        let right_frame = extract_manual_frame(&right_path, frame)?;
+        let right_frame = extract_manual_frame(&right_path, right_index)?;
         let (left_params, right_params) = self.manual_params(&left_frame, &right_frame);
+
+        // Pre-populate the pin editor from geometrically verified (post-RANSAC)
+        // automatic matches only (MANU-04). `verified_seed` holds only matches
+        // that survived every filter; raw/rejected candidates are never offered.
+        let (lw, lh) = (left_frame.width, left_frame.height);
+        let (rw, rh) = (right_frame.width, right_frame.height);
+        let auto_seed = self.verified_seed.clone();
+        let mut next_pin_id = 0_u32;
+        let pins: Vec<SessionPin> =
+            reco_calibrate::manual::seed_pins_from_verified(&auto_seed, (lw, lh), (rw, rh))
+                .into_iter()
+                .map(|p| {
+                    let id = next_pin_id;
+                    next_pin_id = next_pin_id.wrapping_add(1);
+                    SessionPin {
+                        id,
+                        left_px: p.left_px,
+                        right_px: p.right_px,
+                        verified: true,
+                    }
+                })
+                .collect();
+        let seeded = !pins.is_empty();
+
         self.manual = Some(ManualSession {
             frame,
             frames_total,
@@ -2765,8 +2991,15 @@ impl EngineBackend for GpuEngineBackend {
             // confirms a nudge (MANU-02).
             sync_offset: 0,
             sync_method: crate::events::SyncMethod::None,
+            right_frames_total,
+            pins,
+            next_pin_id,
+            auto_seed,
         });
+        // A fresh session never has a solve armed; an empty set never solves.
+        self.manual_solve_at = None;
         events.manual_session_started(frame, probe.fps, frames_total);
+        events.manual_pins(self.manual_pin_views(), seeded);
         self.render_manual_preview(events)?;
         Ok(())
     }
@@ -2778,11 +3011,11 @@ impl EngineBackend for GpuEngineBackend {
                 reason: "no manual session is open — begin one first".to_string(),
             });
         }
-        let frames_total = self
+        let (frames_total, right_frames_total) = self
             .manual
             .as_ref()
-            .map(|session| session.frames_total)
-            .unwrap_or(1);
+            .map(|session| (session.frames_total, session.right_frames_total))
+            .unwrap_or((1, 1));
         let frame = frame.min(frames_total.saturating_sub(1));
         let changed = self
             .manual
@@ -2791,7 +3024,10 @@ impl EngineBackend for GpuEngineBackend {
         if changed {
             let (left_path, right_path) = self.manual_frame_paths()?;
             let left_frame = extract_manual_frame(&left_path, frame)?;
-            let right_frame = extract_manual_frame(&right_path, frame)?;
+            // The right reference frame carries the session's sync offset so the
+            // pair is aligned on the operator's chosen offset (MANU-02).
+            let right_index = self.right_frame_index(frame, right_frames_total);
+            let right_frame = extract_manual_frame(&right_path, right_index)?;
             if let Some(session) = self.manual.as_mut() {
                 session.frame = frame;
                 session.left_frame = left_frame;
@@ -2859,16 +3095,164 @@ impl EngineBackend for GpuEngineBackend {
         // Record Manual provenance on the session so the later pin/bend solves
         // use the operator's offset (MANU-02). A missing session is not fatal:
         // the offset still crosses to the UI, and beginning a session resets it.
+        let mut reextract_right = false;
         if let Some(session) = self.manual.as_mut() {
+            let changed = session.sync_offset != offset_frames;
             session.sync_offset = offset_frames;
             session.sync_method = crate::events::SyncMethod::Manual;
+            reextract_right = changed;
             log::info!(
                 "manual sync offset {} frames recorded on the session ({:?})",
                 session.sync_offset,
                 session.sync_method,
             );
         }
+        // The offset changes which right frame pairs with the chosen left frame,
+        // so re-extract the right reference frame and re-render (MANU-02/03).
+        if reextract_right {
+            self.reextract_right_reference()?;
+            self.render_manual_preview(events)?;
+        }
         events.manual_sync_set(offset_frames, crate::events::SyncMethod::Manual);
+        Ok(())
+    }
+
+    fn manual_add_pin(
+        &mut self,
+        left_px: [f64; 2],
+        right_px: [f64; 2],
+        events: &EventSink,
+    ) -> Result<(), WorkerError> {
+        let (lw, lh, rw, rh) = match self.manual.as_ref() {
+            Some(session) => (
+                session.left_frame.width,
+                session.left_frame.height,
+                session.right_frame.width,
+                session.right_frame.height,
+            ),
+            None => {
+                return Err(WorkerError::InvalidInput {
+                    field: "pin".to_string(),
+                    reason: "no manual session is open — begin one first".to_string(),
+                });
+            }
+        };
+        // T-04.1-10: clamp to the frame bounds so an out-of-bounds pin cannot
+        // reach the solve. Non-finite coordinates are rejected at the command
+        // boundary; `clamp` leaves a finite value finite.
+        if let Some(session) = self.manual.as_mut() {
+            let id = session.next_pin_id;
+            session.next_pin_id = session.next_pin_id.wrapping_add(1);
+            session.pins.push(SessionPin {
+                id,
+                left_px: clamp_pin_px(left_px, lw, lh),
+                right_px: clamp_pin_px(right_px, rw, rh),
+                verified: false,
+            });
+        }
+        self.after_pin_mutation(events)
+    }
+
+    fn manual_move_pin(
+        &mut self,
+        id: u32,
+        side: crate::events::ManualSide,
+        px: [f64; 2],
+        events: &EventSink,
+    ) -> Result<(), WorkerError> {
+        let (lw, lh, rw, rh) = match self.manual.as_ref() {
+            Some(session) => (
+                session.left_frame.width,
+                session.left_frame.height,
+                session.right_frame.width,
+                session.right_frame.height,
+            ),
+            None => {
+                return Err(WorkerError::InvalidInput {
+                    field: "pin".to_string(),
+                    reason: "no manual session is open — begin one first".to_string(),
+                });
+            }
+        };
+        if let Some(session) = self.manual.as_mut()
+            && let Some(pin) = session.pins.iter_mut().find(|p| p.id == id)
+        {
+            match side {
+                crate::events::ManualSide::Left => pin.left_px = clamp_pin_px(px, lw, lh),
+                crate::events::ManualSide::Right => pin.right_px = clamp_pin_px(px, rw, rh),
+            }
+            // A pin the operator moved is no longer a verified automatic match.
+            pin.verified = false;
+        }
+        self.after_pin_mutation(events)
+    }
+
+    fn manual_remove_pin(&mut self, id: u32, events: &EventSink) -> Result<(), WorkerError> {
+        if let Some(session) = self.manual.as_mut() {
+            session.pins.retain(|p| p.id != id);
+        }
+        self.after_pin_mutation(events)
+    }
+
+    fn manual_clear_pins(&mut self, events: &EventSink) -> Result<(), WorkerError> {
+        if let Some(session) = self.manual.as_mut() {
+            session.pins.clear();
+        }
+        self.after_pin_mutation(events)
+    }
+
+    fn manual_solve_deadline(&self) -> Option<std::time::Instant> {
+        self.manual_solve_at
+    }
+
+    fn manual_solve(&mut self, events: &EventSink) -> Result<(), WorkerError> {
+        // Clear the armed deadline first: this solve is the debounced one.
+        self.manual_solve_at = None;
+        let Some(session) = self.manual.as_ref() else {
+            // No session: nothing to solve, preview stays stale.
+            events.manual_solve_state(false, true);
+            return Ok(());
+        };
+        let (lw, lh) = (session.left_frame.width, session.left_frame.height);
+        let (rw, rh) = (session.right_frame.width, session.right_frame.height);
+        let pins: Vec<reco_calibrate::manual::ManualPin> = session
+            .pins
+            .iter()
+            .map(|p| reco_calibrate::manual::ManualPin {
+                left_px: p.left_px,
+                right_px: p.right_px,
+            })
+            .collect();
+        // The retained verified matches are the solve's `auto` set; they are
+        // already swap-correct plane coordinates, appended without re-swapping.
+        let auto = session.auto_seed.clone();
+
+        // The swap lives only in the engine helper — never re-derived here.
+        let config = reco_calibrate::types::CalibrationConfig::default();
+        match reco_calibrate::manual::solve_manual_calibration(
+            &pins,
+            &auto,
+            (lw, lh),
+            (rw, rh),
+            &config,
+        ) {
+            Ok(result) => {
+                events.manual_solve_result(
+                    crate::events::PlaneLayoutView::from_layout(&result.layout),
+                    result.residual,
+                    result.pins_used,
+                    result.auto_used,
+                );
+                self.render_manual_preview(events)?;
+                events.manual_solve_state(false, false);
+            }
+            Err(e) => {
+                // Degenerate/insufficient: a defined non-result. Keep the last
+                // good result (stale) and WARN — never present a garbage rig.
+                events.manual_solve_state(false, true);
+                events.log(Level::Warn, format!("manual solve: {e}"));
+            }
+        }
         Ok(())
     }
 
@@ -3805,6 +4189,76 @@ impl GpuEngineBackend {
         }
         Ok(())
     }
+
+    /// The session's pins projected into the typed webview view (MANU-03).
+    fn manual_pin_views(&self) -> Vec<crate::events::ManualPinView> {
+        self.manual
+            .as_ref()
+            .map(|session| session.pins.iter().map(SessionPin::view).collect())
+            .unwrap_or_default()
+    }
+
+    /// The right-clip frame index for a chosen left frame, with the session's
+    /// sync offset applied (MANU-02).
+    ///
+    /// The engine's convention (`pipeline::frame_indices`) is right = left +
+    /// offset: a positive offset skips right frames (the right stream is ahead),
+    /// a negative offset skips left frames. Clamped to the right clip's frame
+    /// count so the index can never reach past the decoder.
+    fn right_frame_index(&self, left_frame: u64, right_frames_total: u64) -> u64 {
+        let offset = self
+            .manual
+            .as_ref()
+            .map(|session| session.sync_offset)
+            .unwrap_or(0);
+        let idx = left_frame as i64 + offset;
+        idx.clamp(0, right_frames_total.saturating_sub(1) as i64) as u64
+    }
+
+    /// Re-extract the right reference frame at the session's current sync offset
+    /// and retain it (MANU-02 / MANU-03).
+    fn reextract_right_reference(&mut self) -> Result<(), WorkerError> {
+        let (frame, right_frames_total) = match self.manual.as_ref() {
+            Some(session) => (session.frame, session.right_frames_total),
+            None => return Ok(()),
+        };
+        let right_index = self.right_frame_index(frame, right_frames_total);
+        let (_left_path, right_path) = self.manual_frame_paths()?;
+        let right_frame = extract_manual_frame(&right_path, right_index)?;
+        if let Some(session) = self.manual.as_mut() {
+            session.right_frame = right_frame;
+        }
+        Ok(())
+    }
+
+    /// Emit the pin list, an instant preview, and the busy/stale state after a
+    /// pin mutation, and arm the debounced solve (MANU-03).
+    ///
+    /// An empty set is a defined non-result: it never arms a solve (MANU-03
+    /// empty edge probe) and shows the stale state with a WARN. A non-empty set
+    /// arms the debounce; the worker loop runs the solve once it elapses. The
+    /// solve is never run from this path directly (T-04.1-11).
+    fn after_pin_mutation(&mut self, events: &EventSink) -> Result<(), WorkerError> {
+        events.manual_pins(self.manual_pin_views(), false);
+        // Instant preview under the current real parameters.
+        self.render_manual_preview(events)?;
+        let empty = self
+            .manual
+            .as_ref()
+            .is_some_and(|session| session.pins.is_empty());
+        if empty {
+            self.manual_solve_at = None;
+            events.manual_solve_state(false, true);
+            events.log(
+                Level::Warn,
+                "manual solve skipped: no pins — click the left frame to start",
+            );
+        } else {
+            self.manual_solve_at = Some(std::time::Instant::now() + MANUAL_SOLVE_DEBOUNCE);
+            events.manual_solve_state(true, true);
+        }
+        Ok(())
+    }
 }
 
 impl GpuEngineBackend {
@@ -4107,7 +4561,21 @@ mod tests {
         /// so a worker test can observe the screen-driven visibility without a
         /// GPU. Shared because the backend is moved onto the worker thread.
         screen_visible: Arc<std::sync::Mutex<Option<bool>>>,
+        /// Whether a manual session is open in the mock (MANU-03).
+        manual_open: bool,
+        /// The mock's manual pins (MANU-03).
+        manual_pins: Vec<super::SessionPin>,
+        /// The mock's next pin id (MANU-03).
+        manual_next_id: u32,
+        /// The mock's armed debounced-solve deadline (MANU-03).
+        manual_solve_at: Option<std::time::Instant>,
     }
+
+    /// The mock's debounce window (MANU-03): short, so a worker test observes
+    /// the immediate pins/state and a later solve without a 400 ms wait. The
+    /// debounce itself (never solving from a pin command) is what is under test,
+    /// not the exact window — which is agent discretion.
+    const MOCK_SOLVE_DEBOUNCE: Duration = Duration::from_millis(20);
 
     impl MockBackend {
         fn new(ops: Arc<std::sync::Mutex<Vec<&'static str>>>) -> Self {
@@ -4140,6 +4608,10 @@ mod tests {
                 has_result: false,
                 calibration_cancel: Arc::new(AtomicBool::new(false)),
                 screen_visible: Arc::new(std::sync::Mutex::new(None)),
+                manual_open: false,
+                manual_pins: Vec::new(),
+                manual_next_id: 0,
+                manual_solve_at: None,
             }
         }
 
@@ -4176,6 +4648,29 @@ mod tests {
 
         fn record(&self, op: &'static str) {
             self.ops.lock().unwrap().push(op);
+        }
+
+        /// The mock's pins projected into the typed webview view (MANU-03).
+        fn mock_pin_views(&self) -> Vec<crate::events::ManualPinView> {
+            self.manual_pins
+                .iter()
+                .map(super::SessionPin::view)
+                .collect()
+        }
+
+        /// Mirror the real backend's post-mutation protocol (MANU-03): emit the
+        /// pins + instant preview, then arm the (short) debounce for a non-empty
+        /// set or show the stale state for an empty one. Never solves directly.
+        fn after_mock_pin_mutation(&mut self, events: &EventSink) {
+            events.manual_pins(self.mock_pin_views(), false);
+            events.manual_preview_frame(crate::events::ManualSide::Left, vec![0u8; 8], 2, 1);
+            if self.manual_pins.is_empty() {
+                self.manual_solve_at = None;
+                events.manual_solve_state(false, true);
+            } else {
+                self.manual_solve_at = Some(std::time::Instant::now() + MOCK_SOLVE_DEBOUNCE);
+                events.manual_solve_state(true, true);
+            }
         }
 
         /// Recompute and emit the readiness report, using the SAME pure decision
@@ -4425,10 +4920,15 @@ mod tests {
             // the session-started payload plus one preview frame per camera with
             // the correct RGBA geometry, so the protocol test can assert the
             // `width * height * 4` invariant.
+            self.manual_open = true;
+            self.manual_pins.clear();
+            self.manual_next_id = 0;
+            self.manual_solve_at = None;
             events.manual_session_started(frame, 30.0, 5);
             // A 2×1 frame => `2 * 1 * 4 = 8` RGBA bytes.
             events.manual_preview_frame(crate::events::ManualSide::Left, vec![0u8; 8], 2, 1);
             events.manual_preview_frame(crate::events::ManualSide::Right, vec![0u8; 8], 2, 1);
+            events.manual_pins(Vec::new(), false);
             events.manual_solve_state(false, false);
             Ok(())
         }
@@ -4441,6 +4941,9 @@ mod tests {
 
         fn manual_exit(&mut self, events: &EventSink) -> Result<(), WorkerError> {
             self.record("manual_exit");
+            self.manual_open = false;
+            self.manual_pins.clear();
+            self.manual_solve_at = None;
             events.manual_solve_state(false, false);
             Ok(())
         }
@@ -4460,6 +4963,85 @@ mod tests {
         ) -> Result<(), WorkerError> {
             self.record("manual_set_sync");
             events.manual_sync_set(offset_frames, crate::events::SyncMethod::Manual);
+            Ok(())
+        }
+
+        fn manual_add_pin(
+            &mut self,
+            left_px: [f64; 2],
+            right_px: [f64; 2],
+            events: &EventSink,
+        ) -> Result<(), WorkerError> {
+            self.record("manual_add_pin");
+            let id = self.manual_next_id;
+            self.manual_next_id = self.manual_next_id.wrapping_add(1);
+            self.manual_pins.push(super::SessionPin {
+                id,
+                left_px,
+                right_px,
+                verified: false,
+            });
+            self.after_mock_pin_mutation(events);
+            Ok(())
+        }
+
+        fn manual_move_pin(
+            &mut self,
+            id: u32,
+            side: crate::events::ManualSide,
+            px: [f64; 2],
+            events: &EventSink,
+        ) -> Result<(), WorkerError> {
+            self.record("manual_move_pin");
+            if let Some(pin) = self.manual_pins.iter_mut().find(|p| p.id == id) {
+                match side {
+                    crate::events::ManualSide::Left => pin.left_px = px,
+                    crate::events::ManualSide::Right => pin.right_px = px,
+                }
+                pin.verified = false;
+            }
+            self.after_mock_pin_mutation(events);
+            Ok(())
+        }
+
+        fn manual_remove_pin(&mut self, id: u32, events: &EventSink) -> Result<(), WorkerError> {
+            self.record("manual_remove_pin");
+            self.manual_pins.retain(|p| p.id != id);
+            self.after_mock_pin_mutation(events);
+            Ok(())
+        }
+
+        fn manual_clear_pins(&mut self, events: &EventSink) -> Result<(), WorkerError> {
+            self.record("manual_clear_pins");
+            self.manual_pins.clear();
+            self.after_mock_pin_mutation(events);
+            Ok(())
+        }
+
+        fn manual_solve_deadline(&self) -> Option<std::time::Instant> {
+            self.manual_solve_at
+        }
+
+        fn manual_solve(&mut self, events: &EventSink) -> Result<(), WorkerError> {
+            self.record("manual_solve");
+            self.manual_solve_at = None;
+            // Mirror the real backend's protocol without a solver: a landed
+            // result crosses as a typed layout view plus the fresh state.
+            events.manual_solve_result(
+                crate::events::PlaneLayoutView {
+                    camera_axis_offset: 0.24,
+                    intersect: 0.55,
+                    x_ty: 0.01,
+                    x_rz: 0.0,
+                    z_rx: 0.0,
+                    x_rx: 0.0,
+                    z_rz: 0.0,
+                },
+                0.000004,
+                self.manual_pins.len(),
+                0,
+            );
+            events.manual_solve_state(false, false);
             Ok(())
         }
 
@@ -5073,6 +5655,73 @@ mod tests {
             .expect("ManualSetSync must emit a ManualSyncSet");
         assert_eq!(set.0, -4);
         assert_eq!(set.1, crate::events::SyncMethod::Manual);
+    }
+
+    #[test]
+    fn manual_add_pin_emits_immediate_pins_and_state_then_a_debounced_solve() {
+        // MANU-03: a pin drop emits the pin list and a busy/stale state
+        // immediately, then a debounced background solve lands a ManualSolveResult
+        // WITHOUT the pin command running the solve itself (T-04.1-11).
+        let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (worker, events) = EngineWorker::spawn(MockBackend::new(Arc::clone(&ops)));
+        let handle = worker.handle();
+        handle
+            .send(WorkerCommand::ManualBegin { frame: 0 })
+            .unwrap();
+        handle
+            .send(WorkerCommand::ManualAddPin {
+                left_px: [10.0, 10.0],
+                right_px: [20.0, 20.0],
+            })
+            .unwrap();
+
+        // Collect events until the solve lands (bounded so a regression cannot
+        // hang the suite).
+        let mut seen = Vec::new();
+        let start = std::time::Instant::now();
+        let mut landed = false;
+        while start.elapsed() < Duration::from_secs(2) {
+            match events.recv_timeout(Duration::from_millis(100)) {
+                Ok(evt) => {
+                    landed = matches!(evt, WorkerEvent::ManualSolveResult { .. });
+                    seen.push(evt);
+                    if landed {
+                        break;
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        handle.send(WorkerCommand::Shutdown).unwrap();
+
+        assert!(
+            seen.iter().any(|e| matches!(
+                e,
+                WorkerEvent::ManualPins { pins, seeded: false } if pins.len() == 1
+            )),
+            "a pin add must emit ManualPins immediately: {seen:?}"
+        );
+        assert!(
+            seen.iter().any(|e| matches!(
+                e,
+                WorkerEvent::ManualSolveState {
+                    busy: true,
+                    stale: true
+                }
+            )),
+            "a pin add must mark the solve busy/stale: {seen:?}"
+        );
+        assert!(
+            landed,
+            "a debounced ManualSolveResult must land after the pin add: {seen:?}"
+        );
+        // The solve ran in the loop, never from the pin command.
+        let recorded = ops.lock().unwrap().clone();
+        assert!(
+            recorded.contains(&"manual_add_pin") && recorded.contains(&"manual_solve"),
+            "the loop must run the solve, not the pin command: {recorded:?}"
+        );
     }
 
     #[test]
