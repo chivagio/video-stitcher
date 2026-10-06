@@ -743,6 +743,109 @@ pub async fn manual_clear_pins(state: tauri::State<'_, WorkerHandle>) -> Result<
     state.send(WorkerCommand::ManualClearPins)
 }
 
+/// Reject a non-finite handle value at the command boundary (T-04.1-13).
+///
+/// The worker clamps each handle to its travel range, but a `NaN`/`inf` survives
+/// `f64::clamp` and would poison the stored `CameraParams`/layout. This is the
+/// boundary check; the worker owns the travel clamp.
+fn validate_manual_scalar(value: f64, field: &str) -> Result<(), WorkerError> {
+    if !value.is_finite() {
+        return Err(WorkerError::InvalidInput {
+            field: field.to_string(),
+            reason: "handle value must be finite".to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Apply an on-image lens-handle edit to one camera (MANU-05).
+///
+/// Thin, same contract as [`manual_begin`]: validate the values are finite, then
+/// post `ManualSetLens`. The worker clamps each value to its travel range,
+/// enforces `fy = fx`, persists the edited `CameraParams` into the calibration,
+/// re-renders the instant preview without re-solving, and arms the debounced
+/// background re-solve.
+///
+/// # Errors
+///
+/// * [`WorkerError::InvalidInput`] if a value is not finite.
+/// * [`WorkerError::ChannelClosed`] if the worker has already exited.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn manual_set_lens(
+    state: tauri::State<'_, WorkerHandle>,
+    side: crate::events::ManualSide,
+    fx: f64,
+    cx: f64,
+    cy: f64,
+    k1: f64,
+) -> Result<(), WorkerError> {
+    validate_manual_scalar(fx, "fx")?;
+    validate_manual_scalar(cx, "cx")?;
+    validate_manual_scalar(cy, "cy")?;
+    validate_manual_scalar(k1, "k1")?;
+    state.send(WorkerCommand::ManualSetLens {
+        side,
+        fx,
+        cx,
+        cy,
+        k1,
+    })
+}
+
+/// Apply a constrained layout-handle edit (MANU-06).
+///
+/// Thin, same contract as [`manual_begin`]: validate the values are finite, then
+/// post `ManualSetLayout`. The worker clamps each value to its travel range and
+/// confirms the edit with a debounced background solve.
+///
+/// # Errors
+///
+/// * [`WorkerError::InvalidInput`] if a value is not finite.
+/// * [`WorkerError::ChannelClosed`] if the worker has already exited.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn manual_set_layout(
+    state: tauri::State<'_, WorkerHandle>,
+    cam_d: f64,
+    intersect: f64,
+    x_ty: f64,
+    x_rz: f64,
+) -> Result<(), WorkerError> {
+    validate_manual_scalar(cam_d, "cam_d")?;
+    validate_manual_scalar(intersect, "intersect")?;
+    validate_manual_scalar(x_ty, "x_ty")?;
+    validate_manual_scalar(x_rz, "x_rz")?;
+    state.send(WorkerCommand::ManualSetLayout {
+        cam_d,
+        intersect,
+        x_ty,
+        x_rz,
+    })
+}
+
+/// Restore the lens intrinsics captured at `manual_begin` (MANU-05).
+///
+/// Thin, same contract as [`manual_begin`].
+///
+/// # Errors
+///
+/// Returns [`WorkerError::ChannelClosed`] if the worker has already exited.
+#[tauri::command]
+pub async fn manual_reset_lens(state: tauri::State<'_, WorkerHandle>) -> Result<(), WorkerError> {
+    state.send(WorkerCommand::ManualResetLens)
+}
+
+/// Restore the rig layout captured at `manual_begin` (MANU-06).
+///
+/// Thin, same contract as [`manual_begin`].
+///
+/// # Errors
+///
+/// Returns [`WorkerError::ChannelClosed`] if the worker has already exited.
+#[tauri::command]
+pub async fn manual_reset_rig(state: tauri::State<'_, WorkerHandle>) -> Result<(), WorkerError> {
+    state.send(WorkerCommand::ManualResetRig)
+}
+
 /// Cancel a running calibration (CALB-02 / D3-11).
 ///
 /// # The documented control-plane bypass
@@ -1093,6 +1196,49 @@ pub enum WorkerCommand {
     ///
     /// An empty set never triggers a solve (the UI shows the empty prompt).
     ManualClearPins,
+
+    /// Apply an on-image lens-handle edit to one camera (MANU-05).
+    ///
+    /// The worker clamps each value against the baseline captured at
+    /// `manual_begin` (k1 ±0.3, cx/cy ±10% of the frame, fx ±15% floored at
+    /// 5 px), enforces `fy = fx`, persists the edited `CameraParams` into
+    /// `current_calibration.left`/`.right`, re-renders the instant preview under
+    /// the edited intrinsics **without re-solving**, and arms the debounced
+    /// background re-solve. The solve never runs from this command.
+    ManualSetLens {
+        /// Which camera's intrinsics the edit applies to.
+        side: crate::events::ManualSide,
+        /// Requested focal length x in pixels (scale mode; `fy` mirrors it).
+        fx: f64,
+        /// Requested principal point x in pixels.
+        cx: f64,
+        /// Requested principal point y in pixels.
+        cy: f64,
+        /// Requested first-order distortion coefficient.
+        k1: f64,
+    },
+
+    /// Apply a constrained layout-handle edit (MANU-06).
+    ///
+    /// Each value is clamped to its travel range (x_ty ±0.1, x_rz ±0.3 rad,
+    /// intersect 0–1, cam_d 0.1–0.30), written into `current_calibration.layout`,
+    /// re-rendered instantly, and confirmed by a debounced background solve.
+    ManualSetLayout {
+        /// Requested `camera_axis_offset` (cam_d).
+        cam_d: f64,
+        /// Requested overlap ratio `intersect`.
+        intersect: f64,
+        /// Requested right-plane Y translation `x_ty`.
+        x_ty: f64,
+        /// Requested right-plane Z rotation `x_rz` (radians).
+        x_rz: f64,
+    },
+
+    /// Restore the lens intrinsics captured at `manual_begin` (MANU-05).
+    ManualResetLens,
+
+    /// Restore the rig layout captured at `manual_begin` (MANU-06).
+    ManualResetRig,
 
     /// Stop the worker loop and return.
     Shutdown,

@@ -392,6 +392,33 @@ impl EventSink {
         });
     }
 
+    /// Emit the manual session's edited real parameters (MANU-05 / MANU-06).
+    ///
+    /// The editable intrinsic subset plus the current layout ride the typed
+    /// channel; the process log carries a bounded summary.
+    fn manual_params(
+        &self,
+        left: crate::events::CameraParamsView,
+        right: crate::events::CameraParamsView,
+        layout: crate::events::PlaneLayoutView,
+    ) {
+        let _ = self.tx.send(WorkerEvent::ManualParams {
+            left,
+            right,
+            layout,
+        });
+    }
+
+    /// Emit the layout change a background re-solve produced (MANU-05 / MANU-06).
+    fn manual_layout_delta(&self, cam_d: f64, intersect: f64, x_ty: f64, x_rz: f64) {
+        let _ = self.tx.send(WorkerEvent::ManualLayoutDelta {
+            cam_d,
+            intersect,
+            x_ty,
+            x_rz,
+        });
+    }
+
     /// Emit the manual flow's audio auto-sync estimate (MANU-02).
     ///
     /// `confidence: None` is the "unavailable" signal. The fixed semantics
@@ -450,6 +477,102 @@ fn normalize_field_roi(
 /// plan leaves to the agent; 400 ms sits in the research's 300–500 ms band.
 pub(crate) const MANUAL_SOLVE_DEBOUNCE: Duration = Duration::from_millis(400);
 
+/// Lens-handle travel clamps (MANU-05), carried from the retired Slint GUI
+/// (`crates/reco-gui/src/main.rs:1044-1059`). Each handle moves exactly one
+/// parameter within these bounds; the boundary is stated in the UI.
+///
+/// `k1` is the dominant first-order radial term; `cx`/`cy` are the only
+/// lateral/vertical signatures; `fx` is radial/edge-only and therefore an
+/// explicit scale mode with `fy = fx`.
+pub(crate) const K1_CLAMP: f64 = 0.3;
+/// Fraction of the frame width/height a center-handle drag may travel (MANU-05).
+pub(crate) const CENTER_CLAMP_FRAC: f64 = 0.1;
+/// Fraction of the baseline focal length a scale-handle drag may travel (MANU-05).
+pub(crate) const FX_CLAMP_FRAC: f64 = 0.15;
+/// Floor on the focal-length clamp span, in pixels (MANU-05).
+pub(crate) const FX_CLAMP_FLOOR_PX: f64 = 5.0;
+/// Layout-handle travel clamps (MANU-06).
+pub(crate) const X_TY_CLAMP: f64 = 0.1;
+/// Layout roll clamp in radians (~17°) (MANU-06).
+pub(crate) const X_RZ_CLAMP: f64 = 0.3;
+/// Camera-distance range (MANU-06).
+pub(crate) const CAM_D_RANGE: (f64, f64) = (0.1, 0.30);
+
+/// Clamp an on-image lens-handle edit against a baseline `CameraParams`
+/// (MANU-05).
+///
+/// Returns the edited params and whether any requested value was clamped — the
+/// latter drives the UI's clamp WARN. `fy` is always forced to the clamped `fx`
+/// (square pixels): a free `fy` would be a second, near-redundant radial knob
+/// (research B4). `k2..k4` are never touched by a handle; they stay at the
+/// baseline profile values.
+fn clamp_lens_edit(
+    baseline: &reco_core::calibration::CameraParams,
+    fx: f64,
+    cx: f64,
+    cy: f64,
+    k1: f64,
+) -> (reco_core::calibration::CameraParams, bool) {
+    let f_baseline = baseline.fx.max(baseline.fy);
+    let fx_span = (f_baseline * FX_CLAMP_FRAC).max(FX_CLAMP_FLOOR_PX);
+    let cx_span = (baseline.width.max(1) as f64 * CENTER_CLAMP_FRAC).max(FX_CLAMP_FLOOR_PX);
+    let cy_span = (baseline.height.max(1) as f64 * CENTER_CLAMP_FRAC).max(FX_CLAMP_FLOOR_PX);
+
+    let fx_c = fx.clamp(baseline.fx - fx_span, baseline.fx + fx_span);
+    let cx_c = cx.clamp(baseline.cx - cx_span, baseline.cx + cx_span);
+    let cy_c = cy.clamp(baseline.cy - cy_span, baseline.cy + cy_span);
+    let k1_c = k1.clamp(baseline.d[0] - K1_CLAMP, baseline.d[0] + K1_CLAMP);
+
+    let clamped = fx_c != fx || cx_c != cx || cy_c != cy || k1_c != k1;
+    let mut d = baseline.d;
+    d[0] = k1_c;
+    (
+        reco_core::calibration::CameraParams {
+            width: baseline.width,
+            height: baseline.height,
+            fx: fx_c,
+            // Square pixels: the scale mode drives fx and fy together.
+            fy: fx_c,
+            cx: cx_c,
+            cy: cy_c,
+            d,
+        },
+        clamped,
+    )
+}
+
+/// Clamp a constrained layout-handle edit (MANU-06).
+///
+/// Returns the clamped layout plus whether any requested value was clamped.
+/// Each handle moves exactly one parameter; no free 2-D manipulation is offered.
+fn clamp_layout_edit(
+    cam_d: f64,
+    intersect: f64,
+    x_ty: f64,
+    x_rz: f64,
+    current: &reco_core::calibration::PlaneLayout,
+) -> (reco_core::calibration::PlaneLayout, bool) {
+    let cam_d_c = cam_d.clamp(CAM_D_RANGE.0, CAM_D_RANGE.1);
+    let intersect_c = intersect.clamp(0.0, 1.0);
+    let x_ty_c = x_ty.clamp(-X_TY_CLAMP, X_TY_CLAMP);
+    let x_rz_c = x_rz.clamp(-X_RZ_CLAMP, X_RZ_CLAMP);
+    let clamped = cam_d_c != cam_d || intersect_c != intersect || x_ty_c != x_ty || x_rz_c != x_rz;
+    (
+        reco_core::calibration::PlaneLayout {
+            camera_axis_offset: cam_d_c,
+            intersect: intersect_c,
+            x_ty: x_ty_c,
+            x_rz: x_rz_c,
+            // The constrained v1 handle set never moves these; keep the
+            // profile values.
+            z_rx: current.z_rx,
+            x_rx: current.x_rx,
+            z_rz: current.z_rz,
+        },
+        clamped,
+    )
+}
+
 /// Extract one reference frame's YUV planes from a clip (MANU-03).
 ///
 /// Mirrors the `worker.rs` frame-extraction seam (`extract_frames(path, &[i])`)
@@ -482,6 +605,24 @@ fn default_camera_params(width: u32, height: u32) -> reco_core::calibration::Cam
         cx: width as f64 / 2.0,
         cy: height as f64 / 2.0,
         d: [0.0; 4],
+    }
+}
+
+/// A neutral layout used as the manual session's baseline when no profile is
+/// loaded (MANU-06).
+///
+/// The manual flow is always reachable without a `.json`, so a session still
+/// needs a defined layout to reset to and to compute a re-solve delta against.
+/// Values match the engine's typical test rig (`manual.rs` `truth`).
+fn default_plane_layout() -> reco_core::calibration::PlaneLayout {
+    reco_core::calibration::PlaneLayout {
+        camera_axis_offset: 0.24,
+        intersect: 0.55,
+        x_ty: 0.0,
+        x_rz: 0.0,
+        z_rx: 0.0,
+        x_rx: 0.0,
+        z_rz: 0.0,
     }
 }
 
@@ -1040,6 +1181,48 @@ pub trait EngineBackend: Send {
     /// Remove every pin (MANU-03). An empty set never arms a solve.
     fn manual_clear_pins(&mut self, events: &EventSink) -> Result<(), WorkerError>;
 
+    /// Apply an on-image lens-handle edit to one camera's real intrinsics
+    /// (MANU-05).
+    ///
+    /// The backend clamps each value against the baseline captured at
+    /// `manual_begin` (k1 ±0.3, cx/cy ±10% of the frame, fx ±15% floored at
+    /// 5 px), enforces `fy = fx`, writes the edited `CameraParams` into the
+    /// session and `current_calibration.left`/`.right` (so it survives a preview
+    /// rebuild and save), re-renders the instant preview **without re-solving**
+    /// (the layout stays frozen), emits `ManualParams`, and arms the shared
+    /// debounced background re-solve. It never solves synchronously (T-04.1-11)
+    /// and never solves lens intrinsics in the engine (MANU-05 prohibition).
+    fn manual_set_lens(
+        &mut self,
+        side: crate::events::ManualSide,
+        fx: f64,
+        cx: f64,
+        cy: f64,
+        k1: f64,
+        events: &EventSink,
+    ) -> Result<(), WorkerError>;
+
+    /// Apply a constrained layout-handle edit (MANU-06).
+    ///
+    /// Each value is clamped to its travel range (x_ty ±0.1, x_rz ±0.3 rad,
+    /// intersect 0–1, cam_d 0.1–0.30), written into `current_calibration.layout`,
+    /// re-rendered instantly, and confirmed by a debounced background solve. One
+    /// handle moves exactly one parameter; no free 2-D manipulation is offered.
+    fn manual_set_layout(
+        &mut self,
+        cam_d: f64,
+        intersect: f64,
+        x_ty: f64,
+        x_rz: f64,
+        events: &EventSink,
+    ) -> Result<(), WorkerError>;
+
+    /// Restore the lens intrinsics captured at `manual_begin` (MANU-05).
+    fn manual_reset_lens(&mut self, events: &EventSink) -> Result<(), WorkerError>;
+
+    /// Restore the rig layout captured at `manual_begin` (MANU-06).
+    fn manual_reset_rig(&mut self, events: &EventSink) -> Result<(), WorkerError>;
+
     /// The instant the armed debounced manual solve should fire, or `None`
     /// when no solve is armed (MANU-03).
     ///
@@ -1508,6 +1691,37 @@ fn handle_command<B: EngineBackend>(
                 events.failed(e);
             }
         }
+        WorkerCommand::ManualSetLens {
+            side,
+            fx,
+            cx,
+            cy,
+            k1,
+        } => {
+            if let Err(e) = backend.manual_set_lens(side, fx, cx, cy, k1, events) {
+                events.failed(e);
+            }
+        }
+        WorkerCommand::ManualSetLayout {
+            cam_d,
+            intersect,
+            x_ty,
+            x_rz,
+        } => {
+            if let Err(e) = backend.manual_set_layout(cam_d, intersect, x_ty, x_rz, events) {
+                events.failed(e);
+            }
+        }
+        WorkerCommand::ManualResetLens => {
+            if let Err(e) = backend.manual_reset_lens(events) {
+                events.failed(e);
+            }
+        }
+        WorkerCommand::ManualResetRig => {
+            if let Err(e) = backend.manual_reset_rig(events) {
+                events.failed(e);
+            }
+        }
         WorkerCommand::Export => {
             interrupted.store(false, Ordering::SeqCst);
             match backend.export(events, interrupted) {
@@ -1833,6 +2047,20 @@ struct ManualSession {
     /// calibration, used as the solve's `auto` set and the seed source
     /// (MANU-04). Empty when no calibration result exists.
     auto_seed: Vec<reco_calibrate::types::MatchedPoint>,
+    /// The left camera's baseline intrinsics captured at `manual_begin`
+    /// (MANU-05). `ManualResetLens` restores these; handle clamps are computed
+    /// from them.
+    baseline_left_params: reco_core::calibration::CameraParams,
+    /// The right camera's baseline intrinsics captured at `manual_begin`
+    /// (MANU-05).
+    baseline_right_params: reco_core::calibration::CameraParams,
+    /// The layout baseline captured at `manual_begin` (MANU-06).
+    /// `ManualResetRig` restores it.
+    baseline_layout: reco_core::calibration::PlaneLayout,
+    /// The layout currently in effect (MANU-06): the baseline, then any
+    /// constrained layout-handle edit. The preview is rendered under it and the
+    /// debounced re-solve's delta is measured against it.
+    current_layout: reco_core::calibration::PlaneLayout,
 }
 
 /// One correspondence pin held by the manual session (MANU-03).
@@ -1954,6 +2182,14 @@ pub struct GpuEngineBackend {
     /// The instant the armed debounced manual solve should fire, or `None`
     /// (MANU-03). Set by a pin mutation; cleared by [`Self::manual_solve`].
     manual_solve_at: Option<std::time::Instant>,
+    /// Whether the armed manual solve must re-run the engine calibration path
+    /// (re-undistort + re-detect + re-match) before re-solving (MANU-05).
+    ///
+    /// Set by a lens-handle edit, whose changed intrinsics invalidate the
+    /// retained auto matches; cleared by [`Self::manual_solve`]. A pin or layout
+    /// edit leaves it false, so those paths never pay the ~629 ms detection
+    /// cost (T-04.1-14).
+    manual_relens_pending: bool,
     /// The open decode source, if `Import` has run.
     ///
     /// Drops **first** (declaration order): the CLI documents that the decode
@@ -2137,6 +2373,7 @@ impl GpuEngineBackend {
             manual: None,
             verified_seed: Vec::new(),
             manual_solve_at: None,
+            manual_relens_pending: false,
             source: None,
             input_size: None,
             presenter,
@@ -2979,14 +3216,22 @@ impl EngineBackend for GpuEngineBackend {
                 })
                 .collect();
         let seeded = !pins.is_empty();
+        // The layout baseline the handles reset to and clamp against (MANU-06):
+        // the loaded/current profile's layout, else a neutral rig.
+        let baseline_layout = self
+            .current_calibration
+            .as_ref()
+            .or(self.calibration.as_ref())
+            .map(|c| c.layout.clone())
+            .unwrap_or_else(default_plane_layout);
 
         self.manual = Some(ManualSession {
             frame,
             frames_total,
             left_frame,
             right_frame,
-            left_params,
-            right_params,
+            left_params: left_params.clone(),
+            right_params: right_params.clone(),
             // The offset starts at 0 with no provenance until the operator
             // confirms a nudge (MANU-02).
             sync_offset: 0,
@@ -2995,11 +3240,17 @@ impl EngineBackend for GpuEngineBackend {
             pins,
             next_pin_id,
             auto_seed,
+            baseline_left_params: left_params,
+            baseline_right_params: right_params,
+            current_layout: baseline_layout.clone(),
+            baseline_layout,
         });
         // A fresh session never has a solve armed; an empty set never solves.
         self.manual_solve_at = None;
+        self.manual_relens_pending = false;
         events.manual_session_started(frame, probe.fps, frames_total);
         events.manual_pins(self.manual_pin_views(), seeded);
+        self.emit_manual_params(events);
         self.render_manual_preview(events)?;
         Ok(())
     }
@@ -3201,6 +3452,152 @@ impl EngineBackend for GpuEngineBackend {
         self.after_pin_mutation(events)
     }
 
+    fn manual_set_lens(
+        &mut self,
+        side: crate::events::ManualSide,
+        fx: f64,
+        cx: f64,
+        cy: f64,
+        k1: f64,
+        events: &EventSink,
+    ) -> Result<(), WorkerError> {
+        // T-04.1-13: clamp at the worker boundary (the command boundary rejects
+        // non-finite values; `clamp` keeps a finite value finite).
+        let baseline = match self.manual.as_ref() {
+            Some(session) => match side {
+                crate::events::ManualSide::Left => session.baseline_left_params.clone(),
+                crate::events::ManualSide::Right => session.baseline_right_params.clone(),
+            },
+            None => {
+                return Err(WorkerError::InvalidInput {
+                    field: "lens".to_string(),
+                    reason: "no manual session is open — begin one first".to_string(),
+                });
+            }
+        };
+        let (edited, clamped) = clamp_lens_edit(&baseline, fx, cx, cy, k1);
+        // Write the edited intrinsics into the session (the preview source) and
+        // into `current_calibration.left`/`.right` so they survive a preview
+        // rebuild and save (MANU-05 persistence).
+        if let Some(session) = self.manual.as_mut() {
+            match side {
+                crate::events::ManualSide::Left => session.left_params = edited.clone(),
+                crate::events::ManualSide::Right => session.right_params = edited.clone(),
+            }
+        }
+        if let Some(cal) = self.current_calibration.as_mut() {
+            match side {
+                crate::events::ManualSide::Left => cal.left = edited,
+                crate::events::ManualSide::Right => cal.right = edited,
+            }
+        }
+        // Instant preview under the edited real parameters; the layout stays
+        // frozen (no solve here).
+        self.render_manual_preview(events)?;
+        self.emit_manual_params(events);
+        if clamped {
+            events.log(
+                Level::Warn,
+                "lens handle reached its safe travel limit — value clamped",
+            );
+        }
+        // Arm the shared debounced background re-solve. A lens edit invalidates
+        // the retained auto matches, so the solve re-runs the engine calibration
+        // path under the edited intrinsics (MANU-05). Never solved here.
+        self.manual_relens_pending = true;
+        self.manual_solve_at = Some(std::time::Instant::now() + MANUAL_SOLVE_DEBOUNCE);
+        events.manual_solve_state(true, true);
+        Ok(())
+    }
+
+    fn manual_set_layout(
+        &mut self,
+        cam_d: f64,
+        intersect: f64,
+        x_ty: f64,
+        x_rz: f64,
+        events: &EventSink,
+    ) -> Result<(), WorkerError> {
+        if self.manual.is_none() {
+            return Err(WorkerError::InvalidInput {
+                field: "layout".to_string(),
+                reason: "no manual session is open — begin one first".to_string(),
+            });
+        }
+        let current = self
+            .manual
+            .as_ref()
+            .map(|session| session.current_layout.clone())
+            .unwrap_or_else(default_plane_layout);
+        let (edited, clamped) = clamp_layout_edit(cam_d, intersect, x_ty, x_rz, &current);
+        if let Some(session) = self.manual.as_mut() {
+            session.current_layout = edited.clone();
+        }
+        // Persist the constrained edit into the calibration profile (MANU-06).
+        if let Some(cal) = self.current_calibration.as_mut() {
+            cal.layout = edited;
+        }
+        self.render_manual_preview(events)?;
+        self.emit_manual_params(events);
+        if clamped {
+            events.log(
+                Level::Warn,
+                "layout handle reached its safe travel limit — value clamped",
+            );
+        }
+        // A layout edit needs no re-detection (the intrinsics did not change), so
+        // it only arms a confirmation solve (T-04.1-14).
+        self.manual_relens_pending = false;
+        self.manual_solve_at = Some(std::time::Instant::now() + MANUAL_SOLVE_DEBOUNCE);
+        events.manual_solve_state(true, true);
+        Ok(())
+    }
+
+    fn manual_reset_lens(&mut self, events: &EventSink) -> Result<(), WorkerError> {
+        let Some(session) = self.manual.as_ref() else {
+            return Err(WorkerError::InvalidInput {
+                field: "lens".to_string(),
+                reason: "no manual session is open — begin one first".to_string(),
+            });
+        };
+        let (left, right) = (
+            session.baseline_left_params.clone(),
+            session.baseline_right_params.clone(),
+        );
+        if let Some(session) = self.manual.as_mut() {
+            session.left_params = left.clone();
+            session.right_params = right.clone();
+        }
+        if let Some(cal) = self.current_calibration.as_mut() {
+            cal.left = left;
+            cal.right = right;
+        }
+        self.render_manual_preview(events)?;
+        self.emit_manual_params(events);
+        events.info("manual lens reset to the profile baseline");
+        Ok(())
+    }
+
+    fn manual_reset_rig(&mut self, events: &EventSink) -> Result<(), WorkerError> {
+        let Some(session) = self.manual.as_ref() else {
+            return Err(WorkerError::InvalidInput {
+                field: "layout".to_string(),
+                reason: "no manual session is open — begin one first".to_string(),
+            });
+        };
+        let baseline = session.baseline_layout.clone();
+        if let Some(session) = self.manual.as_mut() {
+            session.current_layout = baseline.clone();
+        }
+        if let Some(cal) = self.current_calibration.as_mut() {
+            cal.layout = baseline;
+        }
+        self.render_manual_preview(events)?;
+        self.emit_manual_params(events);
+        events.info("manual rig reset to the profile baseline");
+        Ok(())
+    }
+
     fn manual_solve_deadline(&self) -> Option<std::time::Instant> {
         self.manual_solve_at
     }
@@ -3208,24 +3605,82 @@ impl EngineBackend for GpuEngineBackend {
     fn manual_solve(&mut self, events: &EventSink) -> Result<(), WorkerError> {
         // Clear the armed deadline first: this solve is the debounced one.
         self.manual_solve_at = None;
-        let Some(session) = self.manual.as_ref() else {
-            // No session: nothing to solve, preview stays stale.
-            events.manual_solve_state(false, true);
-            return Ok(());
+        let relens = std::mem::take(&mut self.manual_relens_pending);
+        // Extract the session inputs into owned values up front, so the
+        // immutable borrow does not span the mutable re-detect below.
+        let (lw, lh, rw, rh, pins, before, left_frame, right_frame, left_params, right_params) =
+            match self.manual.as_ref() {
+                Some(session) => (
+                    session.left_frame.width,
+                    session.left_frame.height,
+                    session.right_frame.width,
+                    session.right_frame.height,
+                    session
+                        .pins
+                        .iter()
+                        .map(|p| reco_calibrate::manual::ManualPin {
+                            left_px: p.left_px,
+                            right_px: p.right_px,
+                        })
+                        .collect::<Vec<_>>(),
+                    // The layout in effect before the solve; the delta is measured
+                    // against it and shown, never applied silently (MANU-05).
+                    session.current_layout.clone(),
+                    session.left_frame.clone(),
+                    session.right_frame.clone(),
+                    session.left_params.clone(),
+                    session.right_params.clone(),
+                ),
+                None => {
+                    // No session: nothing to solve, preview stays stale.
+                    events.manual_solve_state(false, true);
+                    return Ok(());
+                }
+            };
+        // A lens edit invalidates the retained auto matches: re-run the engine
+        // calibration path on the retained raw reference frame under the edited
+        // intrinsics and use the fresh post-RANSAC matches (MANU-05). A pin or
+        // layout edit reuses the retained matches (no ~629 ms re-detection).
+        let auto = if relens {
+            let config = reco_calibrate::types::CalibrationConfig::default();
+            match reco_calibrate::calibrate(
+                &self.gpu,
+                &[(left_frame, right_frame)],
+                &left_params,
+                &right_params,
+                &config,
+            ) {
+                Ok(result) => {
+                    let fresh = result
+                        .per_frame
+                        .first()
+                        .map(|fm| fm.points.clone())
+                        .unwrap_or_default();
+                    if let Some(session) = self.manual.as_mut() {
+                        session.auto_seed = fresh.clone();
+                    }
+                    fresh
+                }
+                Err(e) => {
+                    // The re-detect produced no usable matches: a defined
+                    // non-result. Keep the retained matches and WARN; the solve
+                    // below still runs on the pins (never a garbage rig).
+                    events.log(
+                        Level::Warn,
+                        format!("manual re-solve detection produced no matches: {e}"),
+                    );
+                    self.manual
+                        .as_ref()
+                        .map(|session| session.auto_seed.clone())
+                        .unwrap_or_default()
+                }
+            }
+        } else {
+            self.manual
+                .as_ref()
+                .map(|session| session.auto_seed.clone())
+                .unwrap_or_default()
         };
-        let (lw, lh) = (session.left_frame.width, session.left_frame.height);
-        let (rw, rh) = (session.right_frame.width, session.right_frame.height);
-        let pins: Vec<reco_calibrate::manual::ManualPin> = session
-            .pins
-            .iter()
-            .map(|p| reco_calibrate::manual::ManualPin {
-                left_px: p.left_px,
-                right_px: p.right_px,
-            })
-            .collect();
-        // The retained verified matches are the solve's `auto` set; they are
-        // already swap-correct plane coordinates, appended without re-swapping.
-        let auto = session.auto_seed.clone();
 
         // The swap lives only in the engine helper — never re-derived here.
         let config = reco_calibrate::types::CalibrationConfig::default();
@@ -3242,6 +3697,12 @@ impl EngineBackend for GpuEngineBackend {
                     result.residual,
                     result.pins_used,
                     result.auto_used,
+                );
+                events.manual_layout_delta(
+                    result.layout.camera_axis_offset - before.camera_axis_offset,
+                    result.layout.intersect - before.intersect,
+                    result.layout.x_ty - before.x_ty,
+                    result.layout.x_rz - before.x_rz,
                 );
                 self.render_manual_preview(events)?;
                 events.manual_solve_state(false, false);
@@ -4198,6 +4659,22 @@ impl GpuEngineBackend {
             .unwrap_or_default()
     }
 
+    /// Emit the session's edited real parameters (MANU-05 / MANU-06).
+    ///
+    /// The editable intrinsic subset plus the layout in effect; the webview
+    /// seeds its handles from this typed payload and never derives a parameter
+    /// locally. A no-op when no session is open.
+    fn emit_manual_params(&self, events: &EventSink) {
+        let Some(session) = self.manual.as_ref() else {
+            return;
+        };
+        events.manual_params(
+            crate::events::CameraParamsView::from_params(&session.left_params),
+            crate::events::CameraParamsView::from_params(&session.right_params),
+            crate::events::PlaneLayoutView::from_layout(&session.current_layout),
+        );
+    }
+
     /// The right-clip frame index for a chosen left frame, with the session's
     /// sync offset applied (MANU-02).
     ///
@@ -4569,6 +5046,22 @@ mod tests {
         manual_next_id: u32,
         /// The mock's armed debounced-solve deadline (MANU-03).
         manual_solve_at: Option<std::time::Instant>,
+        /// The mock's edited left intrinsics (MANU-05).
+        manual_left_params: reco_core::calibration::CameraParams,
+        /// The mock's edited right intrinsics (MANU-05).
+        manual_right_params: reco_core::calibration::CameraParams,
+        /// The mock's baseline left intrinsics captured at `manual_begin`
+        /// (MANU-05).
+        manual_baseline_left: reco_core::calibration::CameraParams,
+        /// The mock's baseline right intrinsics captured at `manual_begin`
+        /// (MANU-05).
+        manual_baseline_right: reco_core::calibration::CameraParams,
+        /// The mock's layout in effect (MANU-06).
+        manual_layout: reco_core::calibration::PlaneLayout,
+        /// The mock's layout baseline captured at `manual_begin` (MANU-06).
+        manual_baseline_layout: reco_core::calibration::PlaneLayout,
+        /// Whether the mock's armed solve should re-detect (MANU-05).
+        manual_relens_pending: bool,
     }
 
     /// The mock's debounce window (MANU-03): short, so a worker test observes
@@ -4612,6 +5105,13 @@ mod tests {
                 manual_pins: Vec::new(),
                 manual_next_id: 0,
                 manual_solve_at: None,
+                manual_left_params: super::default_camera_params(2, 1),
+                manual_right_params: super::default_camera_params(2, 1),
+                manual_baseline_left: super::default_camera_params(2, 1),
+                manual_baseline_right: super::default_camera_params(2, 1),
+                manual_layout: super::default_plane_layout(),
+                manual_baseline_layout: super::default_plane_layout(),
+                manual_relens_pending: false,
             }
         }
 
@@ -4671,6 +5171,16 @@ mod tests {
                 self.manual_solve_at = Some(std::time::Instant::now() + MOCK_SOLVE_DEBOUNCE);
                 events.manual_solve_state(true, true);
             }
+        }
+
+        /// Emit the mock's edited real parameters (MANU-05 / MANU-06), mirroring
+        /// the real backend's typed payload.
+        fn emit_mock_manual_params(&self, events: &EventSink) {
+            events.manual_params(
+                crate::events::CameraParamsView::from_params(&self.manual_left_params),
+                crate::events::CameraParamsView::from_params(&self.manual_right_params),
+                crate::events::PlaneLayoutView::from_layout(&self.manual_layout),
+            );
         }
 
         /// Recompute and emit the readiness report, using the SAME pure decision
@@ -4924,11 +5434,29 @@ mod tests {
             self.manual_pins.clear();
             self.manual_next_id = 0;
             self.manual_solve_at = None;
+            self.manual_relens_pending = false;
+            // Capture the baseline from the mock's current calibration (if any)
+            // so a reset test can prove restoration (MANU-05 / MANU-06).
+            let (left, right, layout) = match self.current_calibration.as_ref() {
+                Some(cal) => (cal.left.clone(), cal.right.clone(), cal.layout.clone()),
+                None => (
+                    super::default_camera_params(2, 1),
+                    super::default_camera_params(2, 1),
+                    super::default_plane_layout(),
+                ),
+            };
+            self.manual_baseline_left = left.clone();
+            self.manual_baseline_right = right.clone();
+            self.manual_left_params = left;
+            self.manual_right_params = right;
+            self.manual_baseline_layout = layout.clone();
+            self.manual_layout = layout;
             events.manual_session_started(frame, 30.0, 5);
             // A 2×1 frame => `2 * 1 * 4 = 8` RGBA bytes.
             events.manual_preview_frame(crate::events::ManualSide::Left, vec![0u8; 8], 2, 1);
             events.manual_preview_frame(crate::events::ManualSide::Right, vec![0u8; 8], 2, 1);
             events.manual_pins(Vec::new(), false);
+            self.emit_mock_manual_params(events);
             events.manual_solve_state(false, false);
             Ok(())
         }
@@ -5018,6 +5546,120 @@ mod tests {
             Ok(())
         }
 
+        fn manual_set_lens(
+            &mut self,
+            side: crate::events::ManualSide,
+            fx: f64,
+            cx: f64,
+            cy: f64,
+            k1: f64,
+            events: &EventSink,
+        ) -> Result<(), WorkerError> {
+            self.record("manual_set_lens");
+            if !self.manual_open {
+                return Err(WorkerError::InvalidInput {
+                    field: "lens".to_string(),
+                    reason: "no manual session is open — begin one first".to_string(),
+                });
+            }
+            let baseline = match side {
+                crate::events::ManualSide::Left => self.manual_baseline_left.clone(),
+                crate::events::ManualSide::Right => self.manual_baseline_right.clone(),
+            };
+            let (edited, clamped) = super::clamp_lens_edit(&baseline, fx, cx, cy, k1);
+            match side {
+                crate::events::ManualSide::Left => self.manual_left_params = edited.clone(),
+                crate::events::ManualSide::Right => self.manual_right_params = edited.clone(),
+            }
+            if let Some(cal) = self.current_calibration.as_mut() {
+                match side {
+                    crate::events::ManualSide::Left => cal.left = edited,
+                    crate::events::ManualSide::Right => cal.right = edited,
+                }
+            }
+            events.manual_preview_frame(crate::events::ManualSide::Left, vec![0u8; 8], 2, 1);
+            self.emit_mock_manual_params(events);
+            if clamped {
+                events.log(Level::Warn, "lens handle reached its safe travel limit");
+            }
+            self.manual_relens_pending = true;
+            self.manual_solve_at = Some(std::time::Instant::now() + MOCK_SOLVE_DEBOUNCE);
+            events.manual_solve_state(true, true);
+            Ok(())
+        }
+
+        fn manual_set_layout(
+            &mut self,
+            cam_d: f64,
+            intersect: f64,
+            x_ty: f64,
+            x_rz: f64,
+            events: &EventSink,
+        ) -> Result<(), WorkerError> {
+            self.record("manual_set_layout");
+            if !self.manual_open {
+                return Err(WorkerError::InvalidInput {
+                    field: "layout".to_string(),
+                    reason: "no manual session is open — begin one first".to_string(),
+                });
+            }
+            let (edited, clamped) =
+                super::clamp_layout_edit(cam_d, intersect, x_ty, x_rz, &self.manual_layout);
+            self.manual_layout = edited.clone();
+            if let Some(cal) = self.current_calibration.as_mut() {
+                cal.layout = edited;
+            }
+            events.manual_preview_frame(crate::events::ManualSide::Left, vec![0u8; 8], 2, 1);
+            self.emit_mock_manual_params(events);
+            if clamped {
+                events.log(Level::Warn, "layout handle reached its safe travel limit");
+            }
+            self.manual_relens_pending = false;
+            self.manual_solve_at = Some(std::time::Instant::now() + MOCK_SOLVE_DEBOUNCE);
+            events.manual_solve_state(true, true);
+            Ok(())
+        }
+
+        fn manual_reset_lens(&mut self, events: &EventSink) -> Result<(), WorkerError> {
+            self.record("manual_reset_lens");
+            if !self.manual_open {
+                return Err(WorkerError::InvalidInput {
+                    field: "lens".to_string(),
+                    reason: "no manual session is open — begin one first".to_string(),
+                });
+            }
+            let (left, right) = (
+                self.manual_baseline_left.clone(),
+                self.manual_baseline_right.clone(),
+            );
+            self.manual_left_params = left.clone();
+            self.manual_right_params = right.clone();
+            if let Some(cal) = self.current_calibration.as_mut() {
+                cal.left = left;
+                cal.right = right;
+            }
+            events.manual_preview_frame(crate::events::ManualSide::Left, vec![0u8; 8], 2, 1);
+            self.emit_mock_manual_params(events);
+            Ok(())
+        }
+
+        fn manual_reset_rig(&mut self, events: &EventSink) -> Result<(), WorkerError> {
+            self.record("manual_reset_rig");
+            if !self.manual_open {
+                return Err(WorkerError::InvalidInput {
+                    field: "layout".to_string(),
+                    reason: "no manual session is open — begin one first".to_string(),
+                });
+            }
+            self.manual_layout = self.manual_baseline_layout.clone();
+            if let Some(cal) = self.current_calibration.as_mut() {
+                cal.layout = self.manual_baseline_layout.clone();
+            }
+            events.manual_preview_frame(crate::events::ManualSide::Left, vec![0u8; 8], 2, 1);
+            self.emit_mock_manual_params(events);
+            Ok(())
+        }
+
         fn manual_solve_deadline(&self) -> Option<std::time::Instant> {
             self.manual_solve_at
         }
@@ -5025,21 +5667,25 @@ mod tests {
         fn manual_solve(&mut self, events: &EventSink) -> Result<(), WorkerError> {
             self.record("manual_solve");
             self.manual_solve_at = None;
+            let _ = std::mem::take(&mut self.manual_relens_pending);
             // Mirror the real backend's protocol without a solver: a landed
-            // result crosses as a typed layout view plus the fresh state.
-            events.manual_solve_result(
-                crate::events::PlaneLayoutView {
-                    camera_axis_offset: 0.24,
-                    intersect: 0.55,
-                    x_ty: 0.01,
-                    x_rz: 0.0,
-                    z_rx: 0.0,
-                    x_rx: 0.0,
-                    z_rz: 0.0,
-                },
-                0.000004,
-                self.manual_pins.len(),
-                0,
+            // result crosses as a typed layout view plus the layout delta and the
+            // fresh state.
+            let layout = crate::events::PlaneLayoutView {
+                camera_axis_offset: 0.24,
+                intersect: 0.55,
+                x_ty: 0.01,
+                x_rz: 0.0,
+                z_rx: 0.0,
+                x_rx: 0.0,
+                z_rz: 0.0,
+            };
+            events.manual_solve_result(layout, 0.000004, self.manual_pins.len(), 0);
+            events.manual_layout_delta(
+                layout.camera_axis_offset - self.manual_layout.camera_axis_offset,
+                layout.intersect - self.manual_layout.intersect,
+                layout.x_ty - self.manual_layout.x_ty,
+                layout.x_rz - self.manual_layout.x_rz,
             );
             events.manual_solve_state(false, false);
             Ok(())
@@ -5721,6 +6367,81 @@ mod tests {
         assert!(
             recorded.contains(&"manual_add_pin") && recorded.contains(&"manual_solve"),
             "the loop must run the solve, not the pin command: {recorded:?}"
+        );
+    }
+
+    #[test]
+    fn manual_lens_edit_emits_params_persists_and_triggers_a_debounced_solve_with_delta() {
+        // MANU-05: a lens-handle edit emits the edited real parameters
+        // immediately, persists them into the calibration profile, and arms one
+        // debounced background re-solve whose layout delta is emitted — without
+        // the edit command running the solve itself (T-04.1-11 / T-04.1-15).
+        let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut mock = MockBackend::new(Arc::clone(&ops));
+        // A current calibration so the edit has a profile to persist into.
+        mock.current_calibration = Some(sample_mock_calibration());
+        mock.has_result = true;
+        let (worker, events) = EngineWorker::spawn(mock);
+        let handle = worker.handle();
+        handle
+            .send(WorkerCommand::ManualBegin { frame: 0 })
+            .unwrap();
+        handle
+            .send(WorkerCommand::ManualSetLens {
+                side: crate::events::ManualSide::Left,
+                fx: 2000.0,
+                cx: 1.0,
+                cy: 1.0,
+                k1: 5.0,
+            })
+            .unwrap();
+
+        let mut seen = Vec::new();
+        let start = std::time::Instant::now();
+        let mut landed = false;
+        while start.elapsed() < Duration::from_secs(2) {
+            match events.recv_timeout(Duration::from_millis(100)) {
+                Ok(evt) => {
+                    landed = matches!(evt, WorkerEvent::ManualLayoutDelta { .. });
+                    seen.push(evt);
+                    if landed {
+                        break;
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        handle.send(WorkerCommand::Shutdown).unwrap();
+
+        assert!(
+            seen.iter()
+                .any(|e| matches!(e, WorkerEvent::ManualParams { .. })),
+            "a lens edit must emit ManualParams immediately: {seen:?}"
+        );
+        assert!(
+            seen.iter().any(|e| matches!(
+                e,
+                WorkerEvent::ManualSolveState {
+                    busy: true,
+                    stale: true
+                }
+            )),
+            "a lens edit must mark the solve busy/stale: {seen:?}"
+        );
+        assert!(
+            seen.iter()
+                .any(|e| matches!(e, WorkerEvent::ManualSolveResult { .. })),
+            "a debounced ManualSolveResult must land: {seen:?}"
+        );
+        assert!(
+            landed,
+            "the re-solve must emit a ManualLayoutDelta: {seen:?}"
+        );
+        let recorded = ops.lock().unwrap().clone();
+        assert!(
+            recorded.contains(&"manual_set_lens") && recorded.contains(&"manual_solve"),
+            "the loop must run the solve, not the edit command: {recorded:?}"
         );
     }
 

@@ -18,6 +18,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type {
+  CameraParamsView,
   ManualPinView,
   ManualSide,
   PlaneLayoutView,
@@ -26,6 +27,25 @@ import type {
 } from "./types";
 import { WORKER_EVENT_TYPED } from "./types";
 import { formatWorkerError } from "./errors";
+
+/**
+ * Handle travel clamps (MANU-05 / MANU-06), mirroring the worker's constants
+ * (`crates/reco-app/src/worker.rs`). The UI clamps before posting so a drag can
+ * never request an out-of-range value; the worker re-clamps and WARNs on the
+ * boundary (T-04.1-13).
+ */
+/** First-order distortion coefficient travel (rim handle). */
+export const K1_CLAMP = 0.3;
+/** Fraction of the frame width/height a center-handle drag may travel. */
+export const CENTER_CLAMP_FRAC = 0.1;
+/** Fraction of the baseline focal length a scale-handle drag may travel. */
+export const FX_CLAMP_FRAC = 0.15;
+/** Layout `x_ty` travel. */
+export const X_TY_CLAMP = 0.1;
+/** Layout `x_rz` travel in radians. */
+export const X_RZ_CLAMP = 0.3;
+/** Layout `camera_axis_offset` range. */
+export const CAM_D_RANGE: [number, number] = [0.1, 0.3];
 
 /** The locked 5-step flow order (UI-SPEC Copywriting Contract). */
 export type ManualStep = "time-align" | "frame" | "pin" | "bend" | "validate";
@@ -93,6 +113,37 @@ class ManualStore {
     pins_used: number;
     auto_used: number;
   } | null>(null);
+
+  /**
+   * The edited real parameters (MANU-05 / MANU-06), or null before the first
+   * `manual_params`. The handles seed from this typed payload; the store never
+   * derives a parameter locally.
+   */
+  params = $state<{ left: CameraParamsView; right: CameraParamsView } | null>(
+    null,
+  );
+  /** The layout currently in effect (MANU-06), or null before the first event. */
+  layout = $state<PlaneLayoutView | null>(null);
+  /** The last background re-solve's layout delta, or null (MANU-05). */
+  layoutDelta = $state<{
+    cam_d: number;
+    intersect: number;
+    x_ty: number;
+    x_rz: number;
+  } | null>(null);
+  /** The number of handle edits on the undo stack (drives the Undo control). */
+  undoDepth = $state(0);
+
+  /**
+   * The handle-edit undo stack (MANU-05). One entry per committed handle edit,
+   * most recent last; `undoHandle` re-posts the prior value. A local stack is
+   * sufficient because every entry round-trips through the worker's typed
+   * `manual_params`.
+   */
+  #undoStack: Array<
+    | { kind: "lens"; side: ManualSide; params: CameraParamsView }
+    | { kind: "layout"; layout: PlaneLayoutView }
+  > = [];
 
   /** The audio auto-sync confidence, or null when unavailable (MANU-02). */
   audioConfidence = $state<number | null>(null);
@@ -167,6 +218,16 @@ class ManualStore {
         this.solveResult = event.data;
         break;
       }
+      case "manual_params": {
+        const { left, right, layout } = event.data;
+        this.params = { left, right };
+        this.layout = layout;
+        break;
+      }
+      case "manual_layout_delta": {
+        this.layoutDelta = event.data;
+        break;
+      }
       case "audio_sync_result": {
         const { offset_frames, confidence, offset_semantics } = event.data;
         this.audioConfidence = confidence;
@@ -217,6 +278,11 @@ class ManualStore {
     this.pins = [];
     this.seeded = false;
     this.solveResult = null;
+    this.params = null;
+    this.layout = null;
+    this.layoutDelta = null;
+    this.#undoStack = [];
+    this.undoDepth = 0;
     try {
       await invoke("manual_begin", { frame });
     } catch (e) {
@@ -317,6 +383,135 @@ class ManualStore {
     }
   }
 
+  /** Post a lens edit without touching the undo stack. */
+  async #postLens(
+    side: ManualSide,
+    values: { fx: number; cx: number; cy: number; k1: number },
+  ): Promise<void> {
+    try {
+      await invoke("manual_set_lens", {
+        side,
+        fx: values.fx,
+        cx: values.cx,
+        cy: values.cy,
+        k1: values.k1,
+      });
+    } catch (e) {
+      this.error = formatWorkerError(e);
+    }
+  }
+
+  /** Post a layout edit without touching the undo stack. */
+  async #postLayout(values: {
+    cam_d: number;
+    intersect: number;
+    x_ty: number;
+    x_rz: number;
+  }): Promise<void> {
+    try {
+      await invoke("manual_set_layout", values);
+    } catch (e) {
+      this.error = formatWorkerError(e);
+    }
+  }
+
+  /**
+   * Apply an on-image lens-handle edit to one camera (MANU-05).
+   *
+   * Pushes the pre-edit value onto the undo stack, then posts
+   * `manual_set_lens`. The worker clamps, enforces `fy = fx`, persists the
+   * edited `CameraParams`, re-renders the instant preview without re-solving,
+   * and arms the debounced background re-solve. The store never derives a
+   * parameter locally.
+   */
+  async setLens(
+    side: ManualSide,
+    values: { fx: number; cx: number; cy: number; k1: number },
+  ): Promise<void> {
+    if (this.params) {
+      this.#pushUndo({
+        kind: "lens",
+        side,
+        params: { ...(side === "left" ? this.params.left : this.params.right) },
+      });
+    }
+    await this.#postLens(side, values);
+  }
+
+  /**
+   * Apply a constrained layout-handle edit (MANU-06).
+   *
+   * Pushes the pre-edit layout onto the undo stack, then posts
+   * `manual_set_layout`. One handle moves one parameter; no free 2-D
+   * manipulation.
+   */
+  async setLayout(values: {
+    cam_d: number;
+    intersect: number;
+    x_ty: number;
+    x_rz: number;
+  }): Promise<void> {
+    if (this.layout) {
+      this.#pushUndo({ kind: "layout", layout: { ...this.layout } });
+    }
+    await this.#postLayout(values);
+  }
+
+  /** Restore the lens intrinsics captured at session open (MANU-05). */
+  async resetLens(): Promise<void> {
+    this.#undoStack = [];
+    this.undoDepth = 0;
+    try {
+      await invoke("manual_reset_lens");
+    } catch (e) {
+      this.error = formatWorkerError(e);
+    }
+  }
+
+  /** Restore the rig layout captured at session open (MANU-06). */
+  async resetRig(): Promise<void> {
+    this.#undoStack = [];
+    this.undoDepth = 0;
+    try {
+      await invoke("manual_reset_rig");
+    } catch (e) {
+      this.error = formatWorkerError(e);
+    }
+  }
+
+  /** Push a handle edit onto the undo stack (bounded to the last 32). */
+  #pushUndo(
+    entry:
+      | { kind: "lens"; side: ManualSide; params: CameraParamsView }
+      | { kind: "layout"; layout: PlaneLayoutView },
+  ): void {
+    this.#undoStack.push(entry);
+    if (this.#undoStack.length > 32) this.#undoStack.shift();
+    this.undoDepth = this.#undoStack.length;
+  }
+
+  /** Undo the most recent handle edit (MANU-05). No-op on an empty stack. */
+  undoHandle(): void {
+    const entry = this.#undoStack.pop();
+    this.undoDepth = this.#undoStack.length;
+    if (!entry) return;
+    if (entry.kind === "lens") {
+      void this.#postLens(entry.side, {
+        fx: entry.params.fx,
+        cx: entry.params.cx,
+        cy: entry.params.cy,
+        k1: entry.params.k1,
+      });
+    } else {
+      void this.#postLayout({
+        cam_d: entry.layout.camera_axis_offset,
+        intersect: entry.layout.intersect,
+        x_ty: entry.layout.x_ty,
+        x_rz: entry.layout.x_rz,
+      });
+    }
+  }
+
   /**
    * Close the manual session (MANU-01).
    *
@@ -338,6 +533,11 @@ class ManualStore {
     this.pins = [];
     this.seeded = false;
     this.solveResult = null;
+    this.params = null;
+    this.layout = null;
+    this.layoutDelta = null;
+    this.#undoStack = [];
+    this.undoDepth = 0;
     try {
       await invoke("manual_exit");
     } catch {

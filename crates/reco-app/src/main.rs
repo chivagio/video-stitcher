@@ -95,6 +95,10 @@ fn main() -> anyhow::Result<()> {
             commands::manual_move_pin,
             commands::manual_remove_pin,
             commands::manual_clear_pins,
+            commands::manual_set_lens,
+            commands::manual_set_layout,
+            commands::manual_reset_lens,
+            commands::manual_reset_rig,
             commands::cancel_calibration
         ])
         .setup(|app| {

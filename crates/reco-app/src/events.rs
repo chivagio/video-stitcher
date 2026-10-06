@@ -576,6 +576,42 @@ impl PlaneLayoutView {
     }
 }
 
+/// The editable subset of a camera's intrinsics as it crosses to the webview
+/// (MANU-05).
+///
+/// Only the four values an on-image handle can move are carried: the rim drives
+/// `k1`, the center crosshair drives `cx`/`cy`, and the explicit scale mode
+/// drives `fx` (with `fy = fx`). `k2..k4` live behind the `Advanced lens`
+/// disclosure and are never on-image. Produced by the worker after a handle edit
+/// or reset and carried on [`WorkerEvent::ManualParams`].
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CameraParamsView {
+    /// Focal length along the x-axis, in pixels (scale mode; `fy` mirrors it).
+    pub fx: f64,
+    /// Focal length along the y-axis, in pixels (always equal to `fx`).
+    pub fy: f64,
+    /// Principal point x-coordinate, in pixels (center handle).
+    pub cx: f64,
+    /// Principal point y-coordinate, in pixels (center handle).
+    pub cy: f64,
+    /// First-order fisheye distortion coefficient (rim handle).
+    pub k1: f64,
+}
+
+impl CameraParamsView {
+    /// Project the editable subset of a `CameraParams` into its webview view.
+    #[must_use]
+    pub fn from_params(params: &reco_core::calibration::CameraParams) -> Self {
+        Self {
+            fx: params.fx,
+            fy: params.fy,
+            cx: params.cx,
+            cy: params.cy,
+            k1: params.d[0],
+        }
+    }
+}
+
 /// One correspondence pin as it crosses to the webview (MANU-03).
 ///
 /// `left_px`/`right_px` are natural-order pixel coordinates (the operator's
@@ -887,6 +923,40 @@ pub enum WorkerEvent {
         pins_used: usize,
         /// Number of pre-populated automatic matches that contributed.
         auto_used: usize,
+    },
+
+    /// The manual session's edited real parameters (MANU-05 / MANU-06).
+    ///
+    /// Emitted after every handle edit, reset, or `manual_begin`, carrying the
+    /// edited `CameraParams` (the editable subset) plus the current layout. The
+    /// webview seeds its handles from this typed payload and never derives a
+    /// parameter locally. Projected to an INFO [`LogLine`]; a clamp or a
+    /// degenerate re-solve is a separate WARN line, not this event.
+    ManualParams {
+        /// The left camera's editable intrinsics after the edit.
+        left: CameraParamsView,
+        /// The right camera's editable intrinsics after the edit.
+        right: CameraParamsView,
+        /// The layout currently in effect (frozen while a lens handle is dragged).
+        layout: PlaneLayoutView,
+    },
+
+    /// The layout change a background re-solve produced after an edit
+    /// (MANU-05 / MANU-06).
+    ///
+    /// A lens-handle edit freezes the layout during the drag; the debounced
+    /// background re-solve then lands a solved layout, and this delta (solved −
+    /// the layout in effect before the solve) makes the trade-off visible rather
+    /// than applying it silently. Projected to an INFO [`LogLine`].
+    ManualLayoutDelta {
+        /// Solved `camera_axis_offset` minus the pre-solve value.
+        cam_d: f64,
+        /// Solved `intersect` minus the pre-solve value.
+        intersect: f64,
+        /// Solved `x_ty` minus the pre-solve value.
+        x_ty: f64,
+        /// Solved `x_rz` minus the pre-solve value.
+        x_rz: f64,
     },
 
     /// The manual flow's audio auto-sync estimate (MANU-02).
@@ -1204,6 +1274,42 @@ impl WorkerEvent {
                 level: Level::Info,
                 message: format!(
                     "manual solve finished: residual {residual:.6} ({pins_used} pins, {auto_used} auto)"
+                ),
+            },
+            // A handle edit is INFO; a clamp or a degenerate re-solve is a
+            // separate WARN line emitted by the worker (never this event).
+            WorkerEvent::ManualParams {
+                left,
+                right,
+                layout,
+            } => LogLine {
+                level: Level::Info,
+                message: format!(
+                    "manual params: left k1 {:.3} fx {:.1} cx {:.1} cy {:.1}; \
+                     right k1 {:.3} fx {:.1} cx {:.1} cy {:.1}; \
+                     cam_d {:.3} intersect {:.3}",
+                    left.k1,
+                    left.fx,
+                    left.cx,
+                    left.cy,
+                    right.k1,
+                    right.fx,
+                    right.cx,
+                    right.cy,
+                    layout.camera_axis_offset,
+                    layout.intersect,
+                ),
+            },
+            WorkerEvent::ManualLayoutDelta {
+                cam_d,
+                intersect,
+                x_ty,
+                x_rz,
+            } => LogLine {
+                level: Level::Info,
+                message: format!(
+                    "manual layout delta from re-solve: cam_d {cam_d:+.4} \
+                     intersect {intersect:+.4} x_ty {x_ty:+.4} x_rz {x_rz:+.4}"
                 ),
             },
             // Audio sync is INFO when a confident estimate exists and WARN when
@@ -2160,5 +2266,62 @@ mod tests {
         let line = result.to_log_line();
         assert_eq!(line.level, Level::Info);
         assert!(line.message.contains("10 pins"), "{line:?}");
+    }
+
+    #[test]
+    fn manual_params_and_layout_delta_roundtrip_and_project() {
+        // MANU-05 / MANU-06: a handle edit carries the editable intrinsic subset
+        // plus the current layout; the re-solve delta carries the four layout
+        // fields the requirement names.
+        let params = WorkerEvent::ManualParams {
+            left: CameraParamsView {
+                fx: 900.0,
+                fy: 900.0,
+                cx: 960.0,
+                cy: 540.0,
+                k1: 0.25,
+            },
+            right: CameraParamsView {
+                fx: 880.0,
+                fy: 880.0,
+                cx: 950.0,
+                cy: 545.0,
+                k1: 0.1,
+            },
+            layout: PlaneLayoutView {
+                camera_axis_offset: 0.24,
+                intersect: 0.55,
+                x_ty: 0.01,
+                x_rz: 0.0,
+                z_rx: 0.0,
+                x_rx: 0.0,
+                z_rz: 0.0,
+            },
+        };
+        let json = serde_json::to_string(&params).unwrap();
+        assert!(
+            json.contains("\"kind\":\"manual_params\""),
+            "unexpected json: {json}"
+        );
+        assert_eq!(serde_json::from_str::<WorkerEvent>(&json).unwrap(), params);
+        let line = params.to_log_line();
+        assert_eq!(line.level, Level::Info);
+        assert!(line.message.contains("k1 0.250"), "{line:?}");
+
+        let delta = WorkerEvent::ManualLayoutDelta {
+            cam_d: 0.01,
+            intersect: -0.02,
+            x_ty: 0.003,
+            x_rz: 0.0,
+        };
+        let json = serde_json::to_string(&delta).unwrap();
+        assert!(
+            json.contains("\"kind\":\"manual_layout_delta\""),
+            "unexpected json: {json}"
+        );
+        assert_eq!(serde_json::from_str::<WorkerEvent>(&json).unwrap(), delta);
+        let line = delta.to_log_line();
+        assert_eq!(line.level, Level::Info);
+        assert!(line.message.contains("cam_d +0.0100"), "{line:?}");
     }
 }

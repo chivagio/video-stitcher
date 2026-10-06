@@ -74,6 +74,26 @@ export interface ManualPinView {
   verified: boolean;
 }
 
+/**
+ * The editable subset of a camera's intrinsics (mirror `events::CameraParamsView`, MANU-05).
+ *
+ * Only the values an on-image handle can move: the rim drives `k1`, the center
+ * crosshair drives `cx`/`cy`, and the explicit scale mode drives `fx` (with
+ * `fy = fx`). `k2..k4` live behind the `Advanced lens` disclosure.
+ */
+export interface CameraParamsView {
+  /** Focal length along the x-axis, in pixels (scale mode; `fy` mirrors it). */
+  fx: number;
+  /** Focal length along the y-axis, in pixels (always equal to `fx`). */
+  fy: number;
+  /** Principal point x-coordinate, in pixels (center handle). */
+  cx: number;
+  /** Principal point y-coordinate, in pixels (center handle). */
+  cy: number;
+  /** First-order fisheye distortion coefficient (rim handle). */
+  k1: number;
+}
+
 /** The solved plane layout view (mirror `events::PlaneLayoutView`, MANU-03). */
 export interface PlaneLayoutView {
   camera_axis_offset: number;
@@ -340,6 +360,23 @@ export type WorkerEventTyped =
         residual: number;
         pins_used: number;
         auto_used: number;
+      };
+    }
+  | {
+      kind: "manual_params";
+      data: {
+        left: CameraParamsView;
+        right: CameraParamsView;
+        layout: PlaneLayoutView;
+      };
+    }
+  | {
+      kind: "manual_layout_delta";
+      data: {
+        cam_d: number;
+        intersect: number;
+        x_ty: number;
+        x_rz: number;
       };
     }
   | {
