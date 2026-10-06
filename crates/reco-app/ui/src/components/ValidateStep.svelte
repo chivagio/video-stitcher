@@ -28,11 +28,14 @@
 
   // Keep the selector inside the clip, and default it to a frame other than the
   // calibration frame (single-frame calibration must not be sold as truth).
+  // Validate that defaulted frame once on entry so the step never opens on an
+  // empty black canvas (E2).
   $effect(() => {
     const max = maxFrame;
     if (!initialised && manual.framesTotal > 0) {
       initialised = true;
       selectedFrame = manual.frame < max ? manual.frame + 1 : max;
+      void manual.validate(selectedFrame);
     }
     if (selectedFrame > max) selectedFrame = max;
   });
