@@ -137,7 +137,7 @@
             Field ROI
           </button>
           {#if fieldRoiOpen}
-            <FieldRoiEditor report={calibration.debug} />
+            <FieldRoiEditor report={calibration.debug} canSave={importStore.hasResult} />
           {/if}
         </section>
       {/if}

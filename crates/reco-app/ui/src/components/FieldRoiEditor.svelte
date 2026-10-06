@@ -19,7 +19,10 @@
   import Icon from "./Icon.svelte";
   import InlineNotice from "./InlineNotice.svelte";
 
-  let { report = null }: { report?: DebugReport | null } = $props();
+  let {
+    report = null,
+    canSave = true,
+  }: { report?: DebugReport | null; canSave?: boolean } = $props();
 
   let canvasEl = $state<HTMLCanvasElement | null>(null);
   /** When on, dragging the polygon body moves the whole polygon. */
@@ -526,10 +529,21 @@
     <ActionButton variant="secondary" onClick={() => fieldRoi.clear()}>
       <Icon name="close" /> Clear polygon
     </ActionButton>
-    <ActionButton variant="primary" onClick={() => void fieldRoi.apply()}>
+    <ActionButton
+      variant="primary"
+      disabled={!canSave}
+      onClick={() => void fieldRoi.apply()}
+    >
       <Icon name="save" /> Save field ROI
     </ActionButton>
   </div>
+
+  {#if !canSave}
+    <p class="roi-hint">
+      Run or load a calibration before saving a field ROI — there is no
+      calibration to attach it to yet.
+    </p>
+  {/if}
 
   {#if fieldRoi.saved}
     <InlineNotice level="info" message="Field ROI saved to the calibration profile." />
@@ -654,5 +668,11 @@
     display: flex;
     flex-wrap: wrap;
     gap: var(--space-sm);
+  }
+
+  .roi-hint {
+    margin: 0;
+    color: var(--color-log-info);
+    font-size: var(--text-body);
   }
 </style>
