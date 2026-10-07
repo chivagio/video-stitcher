@@ -26,6 +26,7 @@
 mod calibration;
 mod commands;
 mod events;
+mod export_naming;
 mod hardcoded;
 mod presenter;
 mod transport;
@@ -67,6 +68,7 @@ fn main() -> anyhow::Result<()> {
             commands::export_with,
             commands::cancel_export,
             commands::probe_encoders,
+            commands::preview_export_path,
             commands::play,
             commands::pause,
             commands::seek,

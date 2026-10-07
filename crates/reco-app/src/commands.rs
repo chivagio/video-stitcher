@@ -127,6 +127,24 @@ pub async fn probe_encoders(
     state.send(WorkerCommand::ProbeEncoders { codec })
 }
 
+/// Resolve and preview the deterministic output path for `settings` (EXPT-06).
+///
+/// Thin, same contract as [`import`]: post `PreviewExportPath { settings }` and
+/// return; the worker resolves the path (directory + input stem + variant +
+/// collision suffix) and emits a typed `ExportPathPreview`. The webview shows
+/// the worker's path verbatim and never constructs one itself (T-05-08).
+///
+/// # Errors
+///
+/// Returns [`WorkerError::ChannelClosed`] if the worker has already exited.
+#[tauri::command]
+pub async fn preview_export_path(
+    state: tauri::State<'_, WorkerHandle>,
+    settings: crate::events::ExportSettings,
+) -> Result<(), WorkerError> {
+    state.send(WorkerCommand::PreviewExportPath { settings })
+}
+
 /// Begin/continue playing the preview session (PREV-02).
 ///
 /// Thin, same contract as [`import`]: post `Play` and return. The worker owns
@@ -1126,6 +1144,16 @@ pub enum WorkerCommand {
     ProbeEncoders {
         /// The codec name to enumerate encoders for (`"h264"` / `"hevc"` / `"av1"`).
         codec: String,
+    },
+
+    /// Resolve and emit the deterministic output path preview (EXPT-06).
+    ///
+    /// A cheap job: the worker resolves the collision-free path for the current
+    /// settings (directory + input stem + variant) and emits an
+    /// `ExportPathPreview`. No encoder, no calibration, no file is written.
+    PreviewExportPath {
+        /// The typed export request the path is resolved for.
+        settings: crate::events::ExportSettings,
     },
 
     /// Forward a transport-agnostic input intent (pan / zoom / quality) to the

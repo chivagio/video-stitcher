@@ -1289,6 +1289,19 @@ pub enum WorkerEvent {
         /// The software encoder that will actually run.
         used: String,
     },
+
+    /// The deterministic output path the worker resolved for the current
+    /// settings, before any export runs (EXPT-06).
+    ///
+    /// The webview shows this path verbatim and never constructs one itself
+    /// (T-05-08): the worker owns the directory + stem + variant composition and
+    /// the collision suffix. Emitted by `preview_export_path` on every
+    /// preset/variant/output-dir change, and (via `ExportFinished.path`) after
+    /// the run.
+    ExportPathPreview {
+        /// The collision-free absolute output path the worker resolved.
+        path: String,
+    },
 }
 
 /// The UI-facing shape of an event-log line (UI-SPEC Event Log Contract).
@@ -1750,6 +1763,10 @@ impl WorkerEvent {
                 message: format!(
                     "Export encoder fallback: {requested} unavailable, using {used} (software)"
                 ),
+            },
+            WorkerEvent::ExportPathPreview { path } => LogLine {
+                level: Level::Info,
+                message: format!("export output path: {path}"),
             },
         }
     }
@@ -2987,5 +3004,23 @@ mod tests {
         );
         let event = WorkerEvent::Failed(WorkerError::ExportInProgress);
         assert_eq!(event.to_log_line().level, Level::Error);
+    }
+
+    #[test]
+    fn export_path_preview_roundtrips_and_projects_to_an_info_line() {
+        // EXPT-06: the worker-resolved path preview crosses typed and renders as
+        // an INFO line naming the resolved path (the webview never builds one).
+        let preview = WorkerEvent::ExportPathPreview {
+            path: "/out/clip_sbs_1.mp4".to_string(),
+        };
+        let json = serde_json::to_string(&preview).unwrap();
+        assert!(
+            json.contains("\"kind\":\"export_path_preview\""),
+            "json: {json}"
+        );
+        assert_eq!(serde_json::from_str::<WorkerEvent>(&json).unwrap(), preview);
+        let line = preview.to_log_line();
+        assert_eq!(line.level, Level::Info);
+        assert!(line.message.contains("/out/clip_sbs_1.mp4"), "{line:?}");
     }
 }

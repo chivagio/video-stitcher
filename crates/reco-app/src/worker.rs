@@ -588,6 +588,18 @@ impl EventSink {
         let _ = self.tx.send(event);
     }
 
+    /// Emit the worker-resolved output path preview (EXPT-06).
+    ///
+    /// The webview renders this path verbatim and never constructs one itself
+    /// (T-05-08); the worker owns the directory + stem + variant + collision
+    /// suffix. Mirrored to the process log at INFO.
+    fn export_path_preview(&self, path: impl Into<String>) {
+        let event = WorkerEvent::ExportPathPreview { path: path.into() };
+        let line = event.to_log_line();
+        log::info!("{}", line.message);
+        let _ = self.tx.send(event);
+    }
+
     /// Emit that a manual calibration session opened (MANU-01 / MANU-03).
     ///
     /// Mirrored to the process log at INFO; the structured payload rides the
@@ -1687,6 +1699,17 @@ pub trait EngineBackend: Send {
     /// The worker owns the probe; the webview never enumerates encoders itself.
     fn probe_encoders(&self, codec: &str, events: &EventSink);
 
+    /// Resolve and emit the deterministic output path preview for `settings`
+    /// (EXPT-06).
+    ///
+    /// Pure path resolution — no job, no encoder, no calibration required. The
+    /// worker owns the directory + stem + variant + collision suffix and emits
+    /// the resolved path as [`WorkerEvent::ExportPathPreview`]; the webview shows
+    /// it verbatim and never constructs one itself (T-05-08). Emitted on every
+    /// preset/variant/output-dir change so the operator sees the final path
+    /// before exporting.
+    fn preview_export_path(&self, settings: &crate::events::ExportSettings, events: &EventSink);
+
     /// Dispatch a transport-agnostic input intent to the worker's pose state.
     fn dispatch_intent(&mut self, intent: reco_control::ControlIntent);
 
@@ -2144,6 +2167,11 @@ fn handle_command<B: EngineBackend>(
         WorkerCommand::ProbeEncoders { codec } => {
             backend.probe_encoders(&codec, events);
         }
+        WorkerCommand::PreviewExportPath { settings } => {
+            // EXPT-06: pure path resolution — the worker owns the path the
+            // webview shows; no job, no encoder, no calibration required.
+            backend.preview_export_path(&settings, events);
+        }
         WorkerCommand::Intent(intent) => backend.dispatch_intent(intent),
         WorkerCommand::RepublishProjection => backend.republish_projection(events),
         WorkerCommand::Shutdown => {
@@ -2288,21 +2316,256 @@ fn no_encoder_placeholder() -> reco_io::ffmpeg::encoder::EncoderInfo {
     }
 }
 
-/// Resolve the output path from a directory, the source stem, and the variant.
+/// The directory an export writes to: the operator's choice, else the media
+/// directory, else the current directory (EXPT-06).
 ///
-/// Deterministic naming (CONTEXT): `<dir>/<stem><suffix>.mp4`. Plan 03 owns
-/// collision handling; this is the single resolution point the worker uses so
-/// the webview never writes a path the worker did not resolve (T-05-02).
-fn resolve_export_output(
-    output_dir: Option<&str>,
-    stem: &str,
-    variant: crate::events::ExportVariant,
-) -> std::path::PathBuf {
-    let dir = output_dir
+/// The worker owns this resolution so the webview never supplies a path
+/// (T-05-08). `hardcoded::media_dir()` is the documented default; a missing
+/// environment falls back to the working directory rather than failing the run.
+fn export_output_dir(settings: &crate::events::ExportSettings) -> std::path::PathBuf {
+    settings
+        .output_dir
+        .as_deref()
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-    let safe_stem = if stem.is_empty() { "export" } else { stem };
-    dir.join(format!("{safe_stem}{}.mp4", variant.suffix()))
+        .or_else(|| crate::hardcoded::media_dir().ok())
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+}
+
+/// Resolve the collision-free output path for `settings` and a left input
+/// (EXPT-06).
+///
+/// The stem is the left input's file stem (sanitized by
+/// [`crate::export_naming::resolve_output_path`]); an absent input uses the
+/// `"export"` fallback. This is the single resolution point shared by the
+/// export job and the path preview, so the path the operator sees is the path
+/// the worker writes.
+fn preview_path_for(
+    left_input: Option<&str>,
+    settings: &crate::events::ExportSettings,
+) -> Result<std::path::PathBuf, crate::export_naming::ExportNamingError> {
+    let stem = left_input
+        .and_then(|p| std::path::Path::new(p).file_stem())
+        .and_then(|s| s.to_str())
+        .unwrap_or("export")
+        .to_string();
+    let dir = export_output_dir(settings);
+    crate::export_naming::resolve_output_path(&dir, &stem, settings.variant)
+}
+
+/// Clamp an in/out trim window against the clip length (EXPT-03).
+///
+/// Returns the effective `(start, end)` plus whether anything was clamped. The
+/// contract (CONTEXT edge probes): a trim never exceeds the clip, and an
+/// `out <= in` window is clamped so an empty window is **never** exported —
+/// dropping the out point exports to the clip end and the caller announces the
+/// clamp with a WARN.
+fn clamp_trim(
+    start: Option<u64>,
+    end: Option<u64>,
+    total: Option<u64>,
+) -> (Option<u64>, Option<u64>, bool) {
+    let mut clamped = false;
+
+    let mut start = start;
+    if let (Some(s), Some(t)) = (start, total)
+        && t > 0
+        && s >= t
+    {
+        start = Some(t - 1);
+        clamped = true;
+    }
+
+    let mut end = end;
+    if let (Some(e), Some(t)) = (end, total)
+        && e > t
+    {
+        end = Some(t);
+        clamped = true;
+    }
+
+    // An out <= in window would export nothing; drop the out point so the run
+    // covers `start .. clip end` instead (announced by the caller).
+    let effective_start = start.unwrap_or(0);
+    if let Some(e) = end
+        && e <= effective_start
+    {
+        end = None;
+        clamped = true;
+    }
+
+    (start, end, clamped)
+}
+
+/// Build the CPU pack layout for a source-tile variant (EXPT-05).
+///
+/// `SideBySide` packs the two source tiles with `hstack`; `Stacked` packs them
+/// with `vstack` — the same layouts the GPU pack path uses. The tile dims are
+/// validated through the shared [`StackGridLayout`](reco_core::gpu::yuv_stack_packer::StackGridLayout)
+/// authority (research §2.2) so both pack paths enforce the identical YUV420P
+/// alignment, then mapped to the CPU [`GridLayout`](reco_io::stacked_video::GridLayout)
+/// the encoder consumes. `Panorama` is not a grid variant and returns `None`.
+fn variant_grid_layout(
+    variant: crate::events::ExportVariant,
+    tile_width: u32,
+    tile_height: u32,
+) -> Option<reco_io::stacked_video::GridLayout> {
+    use crate::events::ExportVariant;
+    use reco_core::gpu::yuv_stack_packer::StackGridLayout;
+
+    // Validate through the GPU layout authority (shared YUV420P rule).
+    let _validated = match variant {
+        ExportVariant::SideBySide => StackGridLayout::hstack(tile_width, tile_height, 2)?,
+        ExportVariant::Stacked => StackGridLayout::vstack(tile_width, tile_height, 2)?,
+        ExportVariant::Panorama => return None,
+    };
+
+    match variant {
+        ExportVariant::SideBySide => {
+            reco_io::stacked_video::GridLayout::hstack(tile_width, tile_height, 2)
+        }
+        ExportVariant::Stacked => {
+            reco_io::stacked_video::GridLayout::vstack(tile_width, tile_height, 2)
+        }
+        ExportVariant::Panorama => None,
+    }
+}
+
+/// Run a source-tile variant export through the existing stacked-video pack
+/// path and the same FFmpeg encoder (EXPT-05).
+///
+/// No second encoder: [`StackedEncoder`](reco_io::stacked_video::encoder::StackedEncoder)
+/// wraps the same `VideoEncoder` the panorama path uses, and
+/// [`pack_yuv420p`](reco_io::stacked_video::pack_yuv420p) is the existing CPU
+/// packer. The variant only changes the grid layout and the output path
+/// (research §2.2). The trim window is honored in source-frame indices, and the
+/// sync offset is applied by the source pairing exactly as a stitch does. Emits
+/// per-frame `ExportProgress`; the caller emits the terminal event.
+///
+/// `encoder_name` is the already-resolved encoder from the probe (never a raw
+/// webview string).
+#[allow(clippy::too_many_arguments)]
+fn run_stacked_variant(
+    left: &str,
+    right: &str,
+    output: &std::path::Path,
+    variant: crate::events::ExportVariant,
+    codec: reco_io::output::Codec,
+    quality: reco_io::output::Quality,
+    encoder_name: &str,
+    sync_offset: i64,
+    trim: (Option<u64>, Option<u64>),
+    events: &EventSink,
+    interrupted: &AtomicBool,
+) -> Result<(), WorkerError> {
+    use reco_core::source::FrameSource as _;
+
+    let mut source = reco_io::adapters::FfmpegFileSource::open_with_offset(
+        std::path::Path::new(left),
+        std::path::Path::new(right),
+        sync_offset,
+    )
+    .map_err(|e| WorkerError::Engine(e.to_string()))?;
+
+    let info = source.info();
+    let layout = variant_grid_layout(variant, info.width, info.height).ok_or_else(|| {
+        WorkerError::Engine(format!(
+            "the {variant:?} variant needs YUV420P-aligned source tiles, but the source is \
+             {}x{} (width must be divisible by 4, height must be even)",
+            info.width, info.height
+        ))
+    })?;
+
+    let (start, end) = trim;
+    if let Some(s) = start {
+        source
+            .seek(s)
+            .map_err(|e| WorkerError::Engine(e.to_string()))?;
+    }
+    let start_frame = start.unwrap_or(0);
+    let total = match end {
+        Some(e) => Some(e.saturating_sub(start_frame)),
+        None => info.total_frames.map(|t| t.saturating_sub(start_frame)),
+    };
+
+    let config = reco_io::stacked_video::encoder::StackedEncoderConfig {
+        fps: Some(info.fps_rational.unwrap_or((30, 1))),
+        inner: reco_io::ffmpeg::encoder::EncoderConfig {
+            // The variant is an `.mp4` deliverable, not the replay-recording
+            // default (Matroska); the encoder is the same, only the container
+            // differs.
+            container: reco_io::ffmpeg::encoder::Container::Mp4,
+            codec: codec.into(),
+            quality_preset: quality.into(),
+            encoder_name: Some(encoder_name.to_string()),
+            ..reco_io::stacked_video::encoder::StackedEncoderConfig::default().inner
+        },
+    };
+
+    let mut encoder = reco_io::stacked_video::encoder::StackedEncoder::new(layout, output, config)
+        .map_err(|e| WorkerError::Engine(e.to_string()))?;
+
+    let started = std::time::Instant::now();
+    let mut done = 0u64;
+    loop {
+        if interrupted.load(Ordering::SeqCst) {
+            // The caller reads the same flag and emits `ExportCancelled`.
+            return Ok(());
+        }
+        if let Some(e) = end
+            && start_frame + done >= e
+        {
+            break;
+        }
+        let Some(frame) = source
+            .next_frame()
+            .map_err(|e| WorkerError::Engine(e.to_string()))?
+        else {
+            break;
+        };
+        let reco_core::source::StereoFrame::Yuv420p(pair) = frame else {
+            return Err(WorkerError::Engine(
+                "the source delivered a non-CPU frame; the variant pack path needs YUV420P".into(),
+            ));
+        };
+        let left_tile = reco_core::source::YuvFrame {
+            y: pair.left.y,
+            u: pair.left.u,
+            v: pair.left.v,
+            width: info.width,
+            height: info.height,
+            timestamp_us: 0,
+        };
+        let right_tile = reco_core::source::YuvFrame {
+            y: pair.right.y,
+            u: pair.right.u,
+            v: pair.right.v,
+            width: info.width,
+            height: info.height,
+            timestamp_us: 0,
+        };
+        encoder
+            .push_all(&[&left_tile, &right_tile])
+            .map_err(|e| WorkerError::Engine(e.to_string()))?;
+
+        done += 1;
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        let percent = match total {
+            Some(t) if t > 0 => 100.0 * done as f64 / t as f64,
+            _ => 0.0,
+        };
+        events.export_progress(
+            done,
+            total,
+            elapsed_ms,
+            eta_ms(elapsed_ms, done, total),
+            percent,
+        );
+    }
+
+    encoder
+        .finish()
+        .map_err(|e| WorkerError::Engine(e.to_string()))?;
+    Ok(())
 }
 
 /// The worker loop: drain pending commands (FIFO), tick an active session, then
@@ -5285,19 +5548,16 @@ impl EngineBackend for GpuEngineBackend {
             }
         ));
 
-        // ── Resolve the deterministic output path (T-05-02) ──
-        let stem = std::path::Path::new(&left)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("export")
-            .to_string();
-        let output = match settings.output_dir.as_deref() {
-            Some(dir) => resolve_export_output(Some(dir), &stem, settings.variant),
-            None => {
-                let dir = std::path::Path::new(&left)
-                    .parent()
-                    .map(|p| p.display().to_string());
-                resolve_export_output(dir.as_deref(), &stem, settings.variant)
+        // ── Resolve the deterministic, collision-free output path (EXPT-06) ──
+        //
+        // The worker owns the path: `output_dir` (default the media directory)
+        // + the left input's stem + the variant suffix + a bounded collision
+        // suffix. An existing file is never overwritten (T-05-08 / T-05-10).
+        let output = match preview_path_for(Some(left.as_str()), settings) {
+            Ok(path) => path,
+            Err(e) => {
+                events.export_failed(e.to_string());
+                return Ok(());
             }
         };
 
@@ -5309,9 +5569,22 @@ impl EngineBackend for GpuEngineBackend {
                 30.0
             });
 
-        // ── Total output frames for the ETA (honest None when unknown) ──
+        // ── Clamp the trim window against the clip (EXPT-03 edge probes) ──
+        //
+        // A trim never exceeds the clip, and an `out <= in` window is clamped so
+        // an empty window is never exported — the clamp is announced, not silent.
         let source_total = self.loaded.as_ref().and_then(|t| t.total_frames());
-        let total = match (settings.start_frame, settings.end_frame, source_total) {
+        let (start_frame, end_frame, trim_clamped) =
+            clamp_trim(settings.start_frame, settings.end_frame, source_total);
+        if trim_clamped {
+            events.log(
+                Level::Warn,
+                "trim window out of range — clamped to the clip bounds (never an empty export)",
+            );
+        }
+
+        // ── Total output frames for the ETA (honest None when unknown) ──
+        let total = match (start_frame, end_frame, source_total) {
             (Some(s), Some(e), _) if e > s => Some(e - s),
             (Some(s), None, Some(t)) if t > s => Some(t - s),
             (None, Some(e), _) => Some(e),
@@ -5321,53 +5594,77 @@ impl EngineBackend for GpuEngineBackend {
 
         events.info(format!("export started: {}", output.display()));
 
-        // ── Build the job from typed settings (the ONLY encode path) ──
-        let mut job = reco_io::StitchJob::with_calibration(
-            left.as_str(),
-            right.as_str(),
-            cal.clone(),
-            output.as_path(),
-        )
-        .codec(codec)
-        .quality(quality)
-        .resolution(settings.width, settings.height)
-        .encoder_name(chosen.name.clone())
-        .sync_offset(cal.sync_offset);
-        if let Some(start) = settings.start_frame {
-            job = job.start_time(start as f64 / fps);
-        }
-        if let Some(end) = settings.end_frame {
-            job = job.end_time(end as f64 / fps);
-        }
+        // ── Dispatch on the variant (EXPT-05) ──
+        //
+        // Panorama runs the stitched `StitchJob` (the tracer's encode path);
+        // side-by-side / stacked run the existing stacked pack path — the same
+        // FFmpeg encoder, never a second encoder (research §2.2).
+        let variant_result: Result<String, WorkerError> = match settings.variant {
+            crate::events::ExportVariant::Panorama => {
+                let mut job = reco_io::StitchJob::with_calibration(
+                    left.as_str(),
+                    right.as_str(),
+                    cal.clone(),
+                    output.as_path(),
+                )
+                .codec(codec)
+                .quality(quality)
+                .resolution(settings.width, settings.height)
+                .encoder_name(chosen.name.clone())
+                .sync_offset(cal.sync_offset);
+                if let Some(start) = start_frame {
+                    job = job.start_time(start as f64 / fps);
+                }
+                if let Some(end) = end_frame {
+                    job = job.end_time(end as f64 / fps);
+                }
 
-        // Per-frame progress → typed ExportProgress with ETA (EXPT-04).
-        let tx = events.sender_clone();
-        job = job.on_progress(move |p: &reco_core::session::types::FrameProgress| {
-            let elapsed_ms = p.elapsed.as_millis() as u64;
-            let percent = match total {
-                Some(t) if t > 0 => 100.0 * p.frames_completed as f64 / t as f64,
-                _ => 0.0,
-            };
-            let _ = tx.send(WorkerEvent::ExportProgress {
-                frames_completed: p.frames_completed,
-                total,
-                elapsed_ms,
-                eta_ms: eta_ms(elapsed_ms, p.frames_completed, total),
-                percent,
-            });
-        });
+                // Per-frame progress → typed ExportProgress with ETA (EXPT-04).
+                let tx = events.sender_clone();
+                job = job.on_progress(move |p: &reco_core::session::types::FrameProgress| {
+                    let elapsed_ms = p.elapsed.as_millis() as u64;
+                    let percent = match total {
+                        Some(t) if t > 0 => 100.0 * p.frames_completed as f64 / t as f64,
+                        _ => 0.0,
+                    };
+                    let _ = tx.send(WorkerEvent::ExportProgress {
+                        frames_completed: p.frames_completed,
+                        total,
+                        elapsed_ms,
+                        eta_ms: eta_ms(elapsed_ms, p.frames_completed, total),
+                        percent,
+                    });
+                });
 
-        let result = job.run(interrupted);
+                job.run(interrupted)
+                    .map(|r| r.encoder_name)
+                    .map_err(|e| WorkerError::Engine(e.to_string()))
+            }
+            variant => run_stacked_variant(
+                left.as_str(),
+                right.as_str(),
+                output.as_path(),
+                variant,
+                codec,
+                quality,
+                chosen.name.as_str(),
+                cal.sync_offset,
+                (start_frame, end_frame),
+                events,
+                interrupted,
+            )
+            .map(|()| chosen.name.clone()),
+        };
 
         // The typed terminal event: cancel/finish/fail — never a claimed path on
         // cancel or failure (prohibition).
         if interrupted.load(Ordering::SeqCst) {
             events.export_cancelled();
         } else {
-            match result {
-                Ok(r) => events.export_finished(
+            match variant_result {
+                Ok(encoder) => events.export_finished(
                     output.display().to_string(),
-                    r.encoder_name,
+                    encoder,
                     chosen.is_hardware,
                     settings.variant,
                 ),
@@ -5403,6 +5700,21 @@ impl EngineBackend for GpuEngineBackend {
             });
         let auto_hardware = auto.is_hardware;
         events.encoder_list(encoders, auto, auto_hardware);
+    }
+
+    fn preview_export_path(&self, settings: &crate::events::ExportSettings, events: &EventSink) {
+        use crate::events::InputRole;
+        // Resolve the same left input the export will use (operator-chosen, else
+        // the hardcoded pair) so the preview matches the written path.
+        let left = self.input_paths.get(&InputRole::Left).cloned().or_else(|| {
+            crate::hardcoded::media_paths()
+                .ok()
+                .map(|p| p.left.display().to_string())
+        });
+        match preview_path_for(left.as_deref(), settings) {
+            Ok(path) => events.export_path_preview(path.display().to_string()),
+            Err(e) => events.log(Level::Warn, e.to_string()),
+        }
     }
 
     fn dispatch_intent(&mut self, intent: reco_control::ControlIntent) {
@@ -7521,6 +7833,18 @@ mod tests {
                 is_hardware: false,
             };
             events.encoder_list(vec![hw.clone(), sw], hw, true);
+        }
+
+        fn preview_export_path(
+            &self,
+            settings: &crate::events::ExportSettings,
+            events: &EventSink,
+        ) {
+            self.record("preview_export_path");
+            match preview_path_for(self.input_paths[0].as_deref(), settings) {
+                Ok(path) => events.export_path_preview(path.display().to_string()),
+                Err(e) => events.log(Level::Warn, e.to_string()),
+            }
         }
 
         fn dispatch_intent(&mut self, intent: reco_control::ControlIntent) {
@@ -11106,6 +11430,116 @@ mod tests {
                 .any(|e| matches!(e, WorkerEvent::ExportFinished { .. })),
             "a cancelled export must not report finished: {seen:?}"
         );
+    }
+
+    #[test]
+    fn clamp_trim_clamps_out_of_range_and_never_emits_an_empty_window() {
+        // EXPT-03 edge probes: a full clip is a no-op; an out <= in window is
+        // clamped (the out point is dropped) so an empty window is never
+        // exported; an out-of-range start/end is clamped to the clip.
+        assert_eq!(clamp_trim(None, None, Some(100)), (None, None, false));
+        assert_eq!(
+            clamp_trim(Some(10), Some(20), Some(100)),
+            (Some(10), Some(20), false)
+        );
+        assert_eq!(
+            clamp_trim(Some(30), Some(20), Some(100)),
+            (Some(30), None, true)
+        );
+        assert_eq!(
+            clamp_trim(Some(0), Some(0), Some(100)),
+            (Some(0), None, true)
+        );
+        assert_eq!(
+            clamp_trim(Some(150), None, Some(100)),
+            (Some(99), None, true)
+        );
+        assert_eq!(
+            clamp_trim(Some(10), Some(200), Some(100)),
+            (Some(10), Some(100), true)
+        );
+        // An unknown total leaves the window untouched.
+        assert_eq!(
+            clamp_trim(Some(10), Some(20), None),
+            (Some(10), Some(20), false)
+        );
+    }
+
+    #[test]
+    fn variant_grid_layout_packs_the_source_tiles_for_each_grid_variant() {
+        // EXPT-05: side-by-side packs the two source tiles horizontally, stacked
+        // vertically; the atlas dims follow from the tile dims. Panorama is not
+        // a grid variant.
+        let sbs =
+            variant_grid_layout(crate::events::ExportVariant::SideBySide, 1920, 1080).unwrap();
+        assert_eq!((sbs.packed_width(), sbs.packed_height()), (3840, 1080));
+        let stacked =
+            variant_grid_layout(crate::events::ExportVariant::Stacked, 1920, 1080).unwrap();
+        assert_eq!(
+            (stacked.packed_width(), stacked.packed_height()),
+            (1920, 2160)
+        );
+        assert!(variant_grid_layout(crate::events::ExportVariant::Panorama, 1920, 1080).is_none());
+        // A YUV420P-odd tile is rejected by the shared alignment rule.
+        assert!(variant_grid_layout(crate::events::ExportVariant::Stacked, 1921, 1080).is_none());
+    }
+
+    #[test]
+    fn preview_export_path_emits_the_worker_resolved_path() {
+        // EXPT-06: the preview is a worker-owned path; the store mirrors the
+        // typed `ExportPathPreview` and never constructs one itself.
+        let dir = std::env::temp_dir().join(format!(
+            "reco_preview_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir_str = dir.display().to_string();
+
+        let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (worker, events) = EngineWorker::spawn(MockBackend::new(Arc::clone(&ops)));
+        let handle = worker.handle();
+        let settings = crate::events::ExportSettings {
+            output_dir: Some(dir_str.clone()),
+            variant: crate::events::ExportVariant::SideBySide,
+            ..Default::default()
+        };
+        handle
+            .send(WorkerCommand::PreviewExportPath { settings })
+            .unwrap();
+
+        let mut path = None;
+        let start = std::time::Instant::now();
+        while start.elapsed() < Duration::from_secs(2) {
+            match events.recv_timeout(Duration::from_millis(100)) {
+                Ok(WorkerEvent::ExportPathPreview { path: p }) => {
+                    path = Some(p);
+                    break;
+                }
+                Ok(_) => continue,
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        handle.send(WorkerCommand::Shutdown).unwrap();
+
+        let path = path.expect("preview_export_path must emit ExportPathPreview");
+        assert!(
+            path.ends_with("_sbs.mp4"),
+            "the resolved path must carry the variant suffix: {path}"
+        );
+        assert!(
+            path.starts_with(&dir_str),
+            "the resolved path must live under the chosen directory: {path}"
+        );
+        assert!(
+            ops.lock().unwrap().contains(&"preview_export_path"),
+            "the mock preview handler must have run"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
