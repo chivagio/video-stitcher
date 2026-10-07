@@ -11,15 +11,24 @@
  * prohibition). The record list is capped at the carried 2000-line bound
  * (T-05-12).
  *
+ * It also drives the one-click diagnostics bundle (DIAG-03): `exportBundle`
+ * opens a native save dialog and posts `export_diagnostics_bundle`; the worker
+ * writes the redacted, local-only zip and emits `diagnostics_bundle_written`,
+ * whose path this store mirrors. No network path exists.
+ *
  * Pure UI (D-06): it only sends worker commands over Tauri IPC and renders
  * worker events. It never touches engine types or window lifecycle.
  */
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { save } from "@tauri-apps/plugin-dialog";
 import type { LogRecord, PreflightReport, SystemInfoView, WorkerEventTyped } from "./types";
 import { WORKER_EVENT_TYPED } from "./types";
 import { formatWorkerError } from "./errors";
+
+/** Extension offered in the diagnostics-bundle save dialog (DIAG-03). */
+const BUNDLE_EXTENSIONS = ["zip"];
 
 /** Maximum number of structured records retained in the DOM (carried bound). */
 export const MAX_LOG_RECORDS = 2000;
@@ -43,6 +52,13 @@ class SystemStore {
   error = $state<string | null>(null);
   /** The LogViewer's level filter. */
   levelFilter = $state<LogLevelFilter>("all");
+
+  /** The path of the last-written diagnostics bundle, or null (DIAG-03). */
+  bundlePath = $state<string | null>(null);
+  /** Whether a diagnostics-bundle export is in flight (DIAG-03). */
+  bundleExporting = $state(false);
+  /** The typed error text when a bundle export fails (DIAG-03). */
+  bundleError = $state<string | null>(null);
 
   /** Unlisten function for the typed worker-event listener. */
   #unlisten: (() => void) | null = null;
@@ -81,6 +97,24 @@ class SystemStore {
         }
         break;
       }
+      case "diagnostics_bundle_written": {
+        // The worker emits this only after the atomic write succeeded, so the
+        // path names a real, redacted, local bundle.
+        this.bundlePath = event.data.path;
+        this.bundleError = null;
+        this.bundleExporting = false;
+        break;
+      }
+      case "failed": {
+        // The generic failure carries no operation tag; only claim it when a
+        // bundle export is actually in flight (mirrors the project store's
+        // in-flight routing).
+        if (this.bundleExporting) {
+          this.bundleError = formatWorkerError(event.data);
+          this.bundleExporting = false;
+        }
+        break;
+      }
       default:
         break;
     }
@@ -102,6 +136,34 @@ class SystemStore {
       this.error = formatWorkerError(e);
     } finally {
       this.loading = false;
+    }
+  }
+
+  /**
+   * Export the one-click, redacted, local-only diagnostics bundle (DIAG-03).
+   *
+   * Opens the native save dialog for a `.zip`, then posts
+   * `export_diagnostics_bundle` with the chosen path. The worker gathers the
+   * retained logs, system info, and calibration artifacts, redacts the home
+   * path/account name, and writes a single local zip atomically — nothing
+   * touches the network. The success path is the typed
+   * `diagnostics_bundle_written` event, which stores the path; a cancelled
+   * dialog is a no-op, and a failure surfaces the typed text.
+   */
+  async exportBundle(): Promise<void> {
+    this.bundleError = null;
+    try {
+      const selected = await save({
+        defaultPath: "reco-diagnostics.zip",
+        filters: [{ name: "Diagnostics bundle", extensions: BUNDLE_EXTENSIONS }],
+      });
+      // `null` means the operator cancelled the dialog — a no-op.
+      if (typeof selected !== "string") return;
+      this.bundleExporting = true;
+      await invoke("export_diagnostics_bundle", { path: selected });
+    } catch (e) {
+      this.bundleExporting = false;
+      this.bundleError = formatWorkerError(e);
     }
   }
 

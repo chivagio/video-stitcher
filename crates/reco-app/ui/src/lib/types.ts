@@ -593,6 +593,10 @@ export type WorkerEventTyped =
       };
     }
   | { kind: "project_missing_inputs"; data: { missing: MissingInput[] } }
+  | {
+      kind: "diagnostics_bundle_written";
+      data: { path: string; files: number; redacted: boolean };
+    }
   | { kind: "log"; data: LogLine }
   | { kind: "failed"; data: unknown };
 

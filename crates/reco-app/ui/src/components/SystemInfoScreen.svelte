@@ -55,6 +55,39 @@
       />
     {/if}
 
+    <section class="panel" aria-labelledby="sys-diagnostics-heading">
+      <h3 id="sys-diagnostics-heading" class="panel-title">Diagnostics</h3>
+      <p class="diagnostics-hint">
+        Package the structured logs, system information, and calibration
+        artifacts into a single local zip for support. The bundle is redacted
+        and stays on this machine — nothing is uploaded.
+      </p>
+      <div class="diagnostics-actions">
+        <ActionButton
+          variant="secondary"
+          disabled={systemStore.bundleExporting}
+          onClick={() => void systemStore.exportBundle()}
+        >
+          <Icon name="save" />
+          {systemStore.bundleExporting
+            ? "Exporting…"
+            : "Export diagnostics bundle"}
+        </ActionButton>
+      </div>
+      {#if systemStore.bundlePath !== null}
+        <p class="diagnostics-success mono" role="status">
+          Diagnostics bundle saved to {systemStore.bundlePath} (redacted, local
+          only)
+        </p>
+      {/if}
+      {#if systemStore.bundleError !== null}
+        <InlineNotice
+          level="error"
+          message={`Couldn't export the diagnostics bundle: ${systemStore.bundleError}`}
+        />
+      {/if}
+    </section>
+
     <section class="panel" aria-labelledby="sys-gpu-heading">
       <h3 id="sys-gpu-heading" class="panel-title">Graphics</h3>
       {#if info === null}
@@ -362,6 +395,24 @@
   .preflight-remediation {
     grid-column: 3;
     color: var(--color-log-warn);
+    overflow-wrap: anywhere;
+  }
+
+  .diagnostics-hint {
+    margin: 0 0 var(--space-sm);
+    color: var(--color-log-info);
+    font-size: var(--text-body);
+  }
+
+  .diagnostics-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-sm);
+  }
+
+  .diagnostics-success {
+    margin: var(--space-sm) 0 0;
+    color: var(--color-success);
     overflow-wrap: anywhere;
   }
 </style>
