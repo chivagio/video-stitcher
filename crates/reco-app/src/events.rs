@@ -6,7 +6,7 @@
 //! (FOUND-03). It never hands an engine value to the UI thread and the UI
 //! never holds an engine lock across a tick. Instead the worker reports what
 //! happened as a stream of [`WorkerEvent`] values over an
-//! [`std::sync::mpsc`](std::sync::mpsc) channel; the Tauri bridge (Plan 04)
+//! [`std::sync::mpsc`] channel; the Tauri bridge (Plan 04)
 //! drains that channel on an async task and forwards each event to the webview
 //! via `app.emit`.
 //!
@@ -1085,7 +1085,7 @@ pub enum WorkerEvent {
     /// Carries the solved [`PlaneLayoutView`] plus the pin/auto contribution
     /// counts. The preview parameters are only marked fresh after this event;
     /// between a pin drop and this landing the state is
-    /// [`ManualSolveState`]` { busy: true, stale: true }`.
+    /// [`Self::ManualSolveState`]` { busy: true, stale: true }`.
     ManualSolveResult {
         /// The solved plane layout.
         layout: PlaneLayoutView,
@@ -1968,7 +1968,7 @@ impl WorkerEvent {
 /// A typed worker failure that crosses the command/event channel.
 ///
 /// `Clone + Send + Sync` (enforced by the assertion below) because it is moved
-/// through [`std::sync::mpsc`](std::sync::mpsc) and may be read by more than
+/// through [`std::sync::mpsc`] and may be read by more than
 /// one consumer. It never carries a raw OS or GPU handle — only owned data.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, thiserror::Error)]
 pub enum WorkerError {

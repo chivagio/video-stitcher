@@ -48,7 +48,7 @@ pub const READINESS_OVERLAP_WARN: f64 = 0.20;
 
 /// Severity-sorted readiness projection for the two selected inputs (CALB-05).
 ///
-/// Supersedes the Phase-3 [`check_compatibility`]: the same resolution/aspect/
+/// Supersedes the Phase-3 `check_compatibility`: the same resolution/aspect/
 /// fps/codec checks become severity-classified findings, joined by the sampled
 /// exposure/overlap estimates and lens-profile availability. Results are sorted
 /// blocking-shape first, informational last. Non-blocking by design — the

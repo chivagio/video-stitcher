@@ -238,7 +238,7 @@ pub fn undistorted_to_distorted(
 /// This is the point-wise inverse of [`undistorted_to_distorted`] under
 /// the **same** output-intrinsics convention (`out_fx = fx / 2`,
 /// `out_cx = (w + 2·cx) / 4`, …). It solves the KB4 polynomial for `θ`
-/// with the shared [`kb4::theta_from_theta_d`] Newton-Raphson core, so
+/// with the shared `kb4::theta_from_theta_d` Newton-Raphson core, so
 /// exactly one KB4 inverse exists in the engine.
 ///
 /// # Arguments

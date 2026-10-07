@@ -367,7 +367,7 @@ const SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// hazard citation. The event bridge task ends when the worker drops its event
 /// sender, so the process can exit.
 ///
-/// On [`tauri::WindowEvent::Resized`], a [`WorkerCommand::ResizeViewport`] is
+/// On [`tauri::WindowEvent::Resized`], a [`WorkerCommand::ResizeViewport`](worker::WorkerCommand::ResizeViewport) is
 /// posted through `resize_handle`; the worker recomputes the native viewport
 /// from the new size + reported chrome state and reconfigures the surface,
 /// without resetting the playhead or pose.

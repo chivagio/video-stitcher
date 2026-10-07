@@ -6,7 +6,7 @@
 //! `reco-app` presenter needs to implement the source↔panorama comparison
 //! toggle: no existing API draws two raw tiles into a *provided* view
 //! ([`LensPreviewRenderer`](crate::lens::preview::LensPreviewRenderer) allocates
-//! and returns its own texture and requires a whole [`GpuContext`]).
+//! and returns its own texture and requires a whole [`GpuContext`](crate::gpu::GpuContext)).
 //!
 //! The gap and this resolution are recorded in
 //! `crates/reco-app/FRICTION.md` (A2), per the project rule "document friction,

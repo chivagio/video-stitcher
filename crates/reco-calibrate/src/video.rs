@@ -62,7 +62,7 @@ pub struct CalibrateVideosOptions {
     pub sync_offset: Option<i64>,
     /// Explicit rolling-shutter indication (CALB-07).
     ///
-    /// `None` (default) leaves [`MatchConfig::rolling_shutter`] at its
+    /// `None` (default) leaves [`MatchConfig::rolling_shutter`](crate::types::MatchConfig::rolling_shutter) at its
     /// configured value (default `false`, inert). Set `Some(true)` for sources
     /// with a known rolling-shutter readout to enable the row-dependent
     /// vertical-disparity bound. The filter is never enabled silently.

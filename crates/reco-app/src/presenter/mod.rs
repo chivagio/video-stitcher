@@ -22,7 +22,7 @@
 //!
 //! # Device sharing, not device ownership
 //!
-//! D-03: the presenter owns its own [`wgpu::Surface`] but **shares the engine
+//! D-03: the presenter owns its own [`reco_core::wgpu::Surface`] but **shares the engine
 //! worker's device and queue**. The engine worker remains the single device
 //! owner (FOUND-03); the presenter is a render target the worker draws into.
 //! The presenter therefore never creates its own GPU device — it borrows the

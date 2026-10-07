@@ -496,7 +496,7 @@ pub fn normalize_to_plane(px: f64, py: f64, img_w: u32, img_h: u32) -> [f64; 2] 
 /// [`normalize_to_plane`].
 ///
 /// Used to reconstruct natural-order pixel pins from verified optimizer-space
-/// [`MatchedPoint`](crate::types::MatchedPoint) coordinates (MANU-04): a
+/// [`MatchedPoint`] coordinates (MANU-04): a
 /// verified match's plane coordinate maps back to the pixel the operator would
 /// have clicked. Undoes the `PLANE_WIDTH` scale and the `h/w` aspect scaling.
 #[must_use]

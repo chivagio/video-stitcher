@@ -1787,7 +1787,7 @@ pub trait EngineBackend: Send {
     /// Begin a preview **session**: build/ensure the renderer, paint the idle
     /// frame, and start the transport, but do NOT run a frame loop.
     ///
-    /// Replaces Phase 1's one-shot [`preview`](Self::preview) job: the worker
+    /// Replaces Phase 1's one-shot `preview` job: the worker
     /// loop then drives [`tick_session`](Self::tick_session) once per iteration
     /// so commands queued during a session are drained at the top of every tick
     /// (RESEARCH Pattern 3).
@@ -3461,7 +3461,7 @@ fn applied_audio_offset(offset_frames: i64, confidence: f64) -> (i64, crate::eve
 ///
 /// Field order is the drop order and is load-bearing (see the module header):
 /// the decode source drops before the renderer, which drops before the
-/// [`GpuContext`] (device). The presenter is the last field so its surface
+/// [`GpuContext`](reco_core::gpu::GpuContext) (device). The presenter is the last field so its surface
 /// outlives everything that configured it (a `wgpu::Surface` must outlive its
 /// configuration lifetime).
 pub struct GpuEngineBackend {
@@ -3563,7 +3563,7 @@ pub struct GpuEngineBackend {
     /// All verified (post-RANSAC) matches from the last successful calibration,
     /// flattened across every sampled frame.
     ///
-    /// Retained so the opt-in [`WorkerBackend::refine_lens`] action can
+    /// Retained so the opt-in [`EngineBackend::refine_lens`] action can
     /// aggregate enough observations to clear the `k1` conditioning gate
     /// (CR-01): the single-frame [`Self::verified_seed`] alone is far below
     /// `RECOMMENDED_MIN_MATCHES` on the real Xiaomi pair. Cleared on a profile
@@ -3687,7 +3687,7 @@ pub struct GpuEngineBackend {
 /// profile's current `k1` (research §2.2). `.right` is the LEFT camera's plane
 /// coord and `.left` the RIGHT's, per the optimizer's swap convention.
 ///
-/// Shared by [`WorkerBackend::refine_lens`] and the real-clip acceptance test so
+/// Shared by [`EngineBackend::refine_lens`] and the real-clip acceptance test so
 /// both derive observations identically (CR-01).
 fn raw_observations_from_verified(
     matches: &[reco_calibrate::types::MatchedPoint],
@@ -3725,7 +3725,7 @@ fn raw_observations_from_verified(
 
 /// Run the reduced `k1` refinement on retained verified matches.
 ///
-/// This is the single worker path shared by [`WorkerBackend::refine_lens`] and
+/// This is the single worker path shared by [`EngineBackend::refine_lens`] and
 /// the real-clip acceptance test: both derive observations with
 /// [`raw_observations_from_verified`] and refine with
 /// [`reco_calibrate::refine_intrinsics`], so the test cannot mask the runtime
@@ -4243,7 +4243,7 @@ fn install_device_lost_handlers(device: &reco_core::wgpu::Device, lost: Arc<Atom
 /// the intent→pose effect is testable without a GPU.
 ///
 /// [`reco_control::PoseIntent::Reset`] is special-cased to
-/// [`PoseControl::snap_to_rest`] (an immediate return to the configured rest
+/// [`reco_control::pose_control::PoseControl::snap_to_rest`] (an immediate return to the configured rest
 /// position) rather than the eased `IntentTranslator` hotkey path: "Reset view"
 /// is a deliberate snap, not a smoothing target (PREV-04 / CONTEXT "Reset
 /// view"). Every other intent keeps the shared vocabulary via

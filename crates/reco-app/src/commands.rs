@@ -2,7 +2,7 @@
 //!
 //! # The message-passing contract
 //!
-//! Every UI→engine interaction crosses an [`std::sync::mpsc`](std::sync::mpsc)
+//! Every UI→engine interaction crosses an [`std::sync::mpsc`]
 //! channel as a typed [`WorkerCommand`]. The `#[tauri::command]` handlers (Plan
 //! 04) are **thin**: they validate their arguments, build a [`WorkerCommand`],
 //! and call [`WorkerHandle::send`]. They never call an engine entry point or

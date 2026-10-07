@@ -832,7 +832,7 @@ fn solve_layout_warm(
 ///    ill-conditioned set returns `accepted == false` with a typed reason and
 ///    never reaches the solver;
 /// 2. splits the observations into a deterministic fit/held-out partition
-///    ([`split_fit_heldout`], ~80/20 from [`IntrinsicsConfig::seed`]);
+///    (`split_fit_heldout`, ~80/20 from [`IntrinsicsConfig::seed`]);
 /// 3. alternates (bounded by [`IntrinsicsConfig::max_rounds`]): a warm-started
 ///    layout solve on the fit set → [`optimize_intrinsics`] on the fit set at
 ///    that layout → a warm-started layout re-solve — stopping as soon as the
