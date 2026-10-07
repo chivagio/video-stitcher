@@ -2577,6 +2577,16 @@ fn preview_path_for(
     crate::export_naming::resolve_output_path(&dir, &stem, settings.variant)
 }
 
+/// Remove a partial export deliverable after a cancel or failure (WR-02).
+///
+/// [`preview_path_for`] only ever returns a path that did not exist, so any file
+/// at the resolved output is one this export created and is safe to remove. The
+/// removal error is ignored: the export is already terminating, and a leftover
+/// file must never turn a typed terminal event into a panic.
+fn remove_partial_output(path: &std::path::Path) {
+    let _ = std::fs::remove_file(path);
+}
+
 /// Clamp an in/out trim window against the clip length (EXPT-03).
 ///
 /// Returns the effective `(start, end)` plus whether anything was clamped. The
@@ -5946,6 +5956,12 @@ impl EngineBackend for GpuEngineBackend {
         // The typed terminal event: cancel/finish/fail — never a claimed path on
         // cancel or failure (prohibition).
         if interrupted.load(Ordering::SeqCst) {
+            // A cancelled export leaves no partial deliverable behind: the
+            // stacked arm returns before `encoder.finish()`, so the file at the
+            // resolved path can be partial. Removing it keeps the UI's "no file
+            // was written" true and frees the deterministic name for a retry
+            // (WR-02).
+            remove_partial_output(&output);
             events.export_cancelled();
         } else {
             match variant_result {
