@@ -177,7 +177,8 @@ pub enum ReadinessSeverity {
 
 /// Which readiness check produced a finding (CALB-05).
 ///
-/// A superset of the Phase-3 [`CompatibilityCode`]: the same shape checks plus
+/// A superset of the Phase-3 `CompatibilityCode` (removed in the Readiness
+/// migration): the same shape checks plus
 /// the sampled exposure/overlap estimates and lens-profile availability.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
