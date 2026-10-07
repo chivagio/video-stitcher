@@ -2429,6 +2429,11 @@ fn emit_transport<B: EngineBackend>(backend: &mut B, events: &EventSink) {
 
 /// Whether `cmd` is a preview/edit command that the modal export must reject
 /// while an export is in flight (EXPT-04 / CONTEXT modal decision).
+///
+/// Covers every command that mutates preview/edit state — including the lens
+/// override, field-ROI, and lens-refinement edits and the seek/step transport
+/// moves, which were previously omitted and so executed after a blocking export
+/// despite the modal contract (IN-09).
 fn is_modal_forbidden(cmd: &WorkerCommand) -> bool {
     matches!(
         cmd,
@@ -2437,6 +2442,12 @@ fn is_modal_forbidden(cmd: &WorkerCommand) -> bool {
             | WorkerCommand::SetInput { .. }
             | WorkerCommand::ClearInput { .. }
             | WorkerCommand::StartCalibration { .. }
+            | WorkerCommand::SetLensOverride { .. }
+            | WorkerCommand::ClearLensOverride { .. }
+            | WorkerCommand::SetFieldRoi { .. }
+            | WorkerCommand::RefineLens { .. }
+            | WorkerCommand::Seek { .. }
+            | WorkerCommand::StepFrame { .. }
             | WorkerCommand::ManualBegin { .. }
             | WorkerCommand::ManualSetFrame { .. }
             | WorkerCommand::ManualExit
