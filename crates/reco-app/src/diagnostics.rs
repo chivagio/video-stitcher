@@ -82,8 +82,8 @@ impl LogBuffer {
 /// The gathered inputs for one diagnostics bundle (DIAG-03).
 ///
 /// `calibration` is the active profile serialized as JSON, or `None` when no
-/// calibration result exists (the bundle records `calibration: none` rather than
-/// omitting the section). `debug` is the redacted debug inspector payload
+/// calibration result exists (the bundle records `{"calibration":"none"}` rather
+/// than omitting the section). `debug` is the redacted debug inspector payload
 /// ([`redacted_debug_json`]), or `None` when no report was retained.
 #[derive(Debug, Clone)]
 pub struct BundleInputs {
@@ -221,8 +221,9 @@ pub fn redacted_debug_json(report: &DebugReport) -> String {
 /// Write a redacted, local-only diagnostics bundle to `path` (DIAG-03).
 ///
 /// Entries: `logs.jsonl` (one redacted JSON record per line), `system-info.json`,
-/// `calibration.json` (the active profile, or the `calibration: none` marker when
-/// absent), and `debug.json` when a debug report was retained. The write is
+/// `calibration.json` (the active profile, or the valid-JSON
+/// `{"calibration":"none"}` marker when absent), and `debug.json` when a debug
+/// report was retained. The write is
 /// atomic (temp + rename), so a failure leaves no partial bundle (T-05-19).
 ///
 /// # Errors
@@ -281,11 +282,12 @@ fn write_entries(tmp: &Path, inputs: &BundleInputs) -> Result<usize, Diagnostics
     )?;
     files += 1;
 
-    // calibration.json — the active profile, or an explicit "none" marker so the
-    // section is never silently omitted.
+    // calibration.json — the active profile, or an explicit, valid-JSON "none"
+    // marker so the section is never silently omitted and any tooling that
+    // parses the bundle by filename does not choke on a non-JSON entry (IN-05).
     let calibration = match &inputs.calibration {
         Some(json) => redact(json, home),
-        None => "calibration: none\n".to_string(),
+        None => "{\"calibration\":\"none\"}\n".to_string(),
     };
     add_entry(&mut zip, "calibration.json", &calibration, options)?;
     files += 1;
@@ -555,8 +557,11 @@ mod tests {
             .unwrap()
             .read_to_string(&mut calibration)
             .unwrap();
-        assert!(
-            calibration.contains("calibration: none"),
+        let parsed: serde_json::Value =
+            serde_json::from_str(&calibration).expect("the none marker must be valid JSON");
+        assert_eq!(
+            parsed.get("calibration").and_then(|v| v.as_str()),
+            Some("none"),
             "an absent calibration must be recorded, not omitted: {calibration}"
         );
 
