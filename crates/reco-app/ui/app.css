@@ -28,6 +28,12 @@
      "Inputs look compatible", save/load success. */
   --color-success: #3fb950;
 
+  /* Overlay + dialog chrome (Phase 5 UI review): the modal backdrop and the
+     dialog drop shadow were hardcoded rgba(); tokenised here so every modal
+     resolves against one authored value. */
+  --color-scrim: rgba(0, 0, 0, 0.55);
+  --shadow-dialog: 0 8px 32px rgba(0, 0, 0, 0.5);
+
   /* Spacing scale (multiples of 4) */
   --space-xs: 4px;
   --space-sm: 8px;
@@ -75,4 +81,10 @@ body {
   font-size: var(--text-body);
   line-height: var(--line-body);
   font-weight: var(--weight-regular);
+  /* Native form controls (notably WebKitGTK `<select>` menulists) follow the
+   * UA light scheme unless told otherwise, which paints a near-white surface
+   * under the authored light text. Declaring the dark scheme keeps native
+   * widgets on-theme (Phase 5 UI review BLOCKER; pairs with the authored
+   * `appearance: none` surface on the Export selects). */
+  color-scheme: dark;
 }

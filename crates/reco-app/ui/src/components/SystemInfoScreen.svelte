@@ -321,7 +321,7 @@
     display: inline-block;
     padding: 1px var(--space-xs);
     border-radius: var(--space-xs);
-    font-size: 12px;
+    font-size: var(--text-label);
     font-weight: var(--weight-semibold);
   }
 

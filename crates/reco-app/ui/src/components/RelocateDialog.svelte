@@ -121,7 +121,7 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    background: rgba(0, 0, 0, 0.55);
+    background: var(--color-scrim);
     z-index: 40;
   }
 
@@ -131,7 +131,7 @@
     padding: var(--space-lg);
     background: var(--color-secondary);
     border-radius: var(--space-xs);
-    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+    box-shadow: var(--shadow-dialog);
   }
 
   .dialog-heading {

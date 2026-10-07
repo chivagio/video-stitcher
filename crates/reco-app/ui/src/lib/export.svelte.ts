@@ -354,13 +354,17 @@ class ExportStore {
    * A monospace trim summary for the export form (EXPT-03).
    *
    * The worker clamps an invalid window at export time; this is the operator's
-   * requested window, shown so the form and the timeline agree.
+   * requested window, shown so the form and the timeline agree. The Preview
+   * `TrimHandles` renders the transport's exact timecode, so the form borrows
+   * the same formatter rather than emitting raw frame indices — two screens,
+   * one representation. A `null` side means "the clip edge" and stays a word.
    */
-  deriveTrimSummary(): string {
+  deriveTrimSummary(format?: (frame: number) => string): string {
     const { start_frame, end_frame } = this.settings;
     if (start_frame === null && end_frame === null) return "Full clip";
-    const start = start_frame === null ? "start" : `${start_frame}`;
-    const end = end_frame === null ? "end" : `${end_frame}`;
+    const asTimecode = format ?? ((frame: number) => `${frame}`);
+    const start = start_frame === null ? "start" : asTimecode(start_frame);
+    const end = end_frame === null ? "end" : asTimecode(end_frame);
     return `${start} → ${end}`;
   }
 

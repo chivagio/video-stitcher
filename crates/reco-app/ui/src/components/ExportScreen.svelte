@@ -29,6 +29,18 @@
   import ActionButton from "./ActionButton.svelte";
   import InlineNotice from "./InlineNotice.svelte";
 
+  let {
+    formatTimecode,
+  }: {
+    /**
+     * Format a frame index as the transport's exact timecode (EXPT-03). The
+     * Preview timeline and this form must render the same trim window the same
+     * way, so the form borrows the transport formatter rather than showing raw
+     * frame indices.
+     */
+    formatTimecode?: (frame: number) => string;
+  } = $props();
+
   const presets = Object.keys(PRESET_LABELS) as ExportPreset[];
   const variants = Object.keys(VARIANT_LABELS) as ExportVariant[];
 
@@ -44,6 +56,32 @@
   const outputPath = $derived(exportStore.pathPreview?.path ?? "Resolving…");
   const percent = $derived(Math.round(exportStore.progress?.percent ?? 0));
   const encoderOverride = $derived(exportStore.settings.encoder_name ?? "");
+
+  // The worker has no reveal/open-location capability, so the completion
+  // affordance is the least-privilege one: copy the final path to the
+  // clipboard (the path stays selectable as a fallback).
+  let copied = $state(false);
+
+  async function copyPath(): Promise<void> {
+    const path = exportStore.result?.path;
+    if (!path) return;
+    try {
+      await navigator.clipboard.writeText(path);
+    } catch {
+      // Webview clipboard access may be unavailable; fall back to selecting a
+      // hidden textarea so the operator can still copy manually.
+      const area = document.createElement("textarea");
+      area.value = path;
+      area.setAttribute("readonly", "");
+      area.style.position = "fixed";
+      area.style.opacity = "0";
+      document.body.appendChild(area);
+      area.select();
+      document.execCommand("copy");
+      document.body.removeChild(area);
+    }
+    copied = true;
+  }
 
   function handlePreset(e: Event): void {
     exportStore.setPreset((e.currentTarget as HTMLSelectElement).value as ExportPreset);
@@ -98,17 +136,33 @@
       <section class="result" aria-labelledby="export-done-heading">
         <h3 id="export-done-heading" class="progress-heading">Export complete</h3>
         <p class="path-line">
-          Saved to <span class="mono">{exportStore.result.path}</span>
+          Saved to <span class="mono path-value">{exportStore.result.path}</span>
         </p>
         <p class="meta-line">
           Encoder: <span class="mono">{exportStore.result.encoder}</span>
           ({exportStore.result.hardware ? "hardware" : "software"})
         </p>
         <div class="actions">
-          <ActionButton variant="secondary" onClick={() => exportStore.reset()}>
+          <ActionButton
+            variant="secondary"
+            ariaLabel="Copy the exported file path"
+            onClick={() => void copyPath()}
+          >
+            {copied ? "Copied" : "Copy path"}
+          </ActionButton>
+          <ActionButton
+            variant="secondary"
+            onClick={() => {
+              copied = false;
+              exportStore.reset();
+            }}
+          >
             Export again
           </ActionButton>
         </div>
+        <p class="copy-status" role="status" aria-live="polite">
+          {copied ? "Path copied to the clipboard." : ""}
+        </p>
       </section>
     {:else if cancelled}
       <InlineNotice level="warn" message="Export cancelled — no file was written." />
@@ -130,39 +184,87 @@
       <section class="form">
         <label class="field">
           <span class="field-label">Preset</span>
-          <select class="field-input" aria-label="Preset" value={exportStore.preset} onchange={handlePreset}>
-            {#each presets as preset}
-              <option value={preset}>{PRESET_LABELS[preset]}</option>
-            {/each}
-          </select>
+          <span class="select-wrap">
+            <select class="field-input" aria-label="Preset" value={exportStore.preset} onchange={handlePreset}>
+              {#each presets as preset}
+                <option value={preset}>{PRESET_LABELS[preset]}</option>
+              {/each}
+            </select>
+            <span class="select-caret" aria-hidden="true">
+              <svg
+                width="16"
+                height="16"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              >
+                <polyline points="6 9 12 15 18 9" />
+              </svg>
+            </span>
+          </span>
         </label>
 
         <label class="field">
           <span class="field-label">Encoder</span>
-          <select class="field-input" aria-label="Encoder" value={encoderOverride} onchange={handleEncoder}>
-            <option value="">
-              Auto{exportStore.auto ? ` (${exportStore.auto.name})` : ""}
-            </option>
-            {#each exportStore.encoders as enc (enc.name)}
-              <option value={enc.name}>
-                {enc.name} ({enc.is_hardware ? "hardware" : "software"})
+          <span class="select-wrap">
+            <select class="field-input" aria-label="Encoder" value={encoderOverride} onchange={handleEncoder}>
+              <option value="">
+                Auto{exportStore.auto ? ` (${exportStore.auto.name})` : ""}
               </option>
-            {/each}
-          </select>
+              {#each exportStore.encoders as enc (enc.name)}
+                <option value={enc.name}>
+                  {enc.name} ({enc.is_hardware ? "hardware" : "software"})
+                </option>
+              {/each}
+            </select>
+            <span class="select-caret" aria-hidden="true">
+              <svg
+                width="16"
+                height="16"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              >
+                <polyline points="6 9 12 15 18 9" />
+              </svg>
+            </span>
+          </span>
         </label>
 
         <label class="field">
           <span class="field-label">Variant</span>
-          <select class="field-input" aria-label="Variant" value={exportStore.settings.variant} onchange={handleVariant}>
-            {#each variants as variant}
-              <option value={variant}>{VARIANT_LABELS[variant]}</option>
-            {/each}
-          </select>
+          <span class="select-wrap">
+            <select class="field-input" aria-label="Variant" value={exportStore.settings.variant} onchange={handleVariant}>
+              {#each variants as variant}
+                <option value={variant}>{VARIANT_LABELS[variant]}</option>
+              {/each}
+            </select>
+            <span class="select-caret" aria-hidden="true">
+              <svg
+                width="16"
+                height="16"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              >
+                <polyline points="6 9 12 15 18 9" />
+              </svg>
+            </span>
+          </span>
         </label>
       </section>
 
       <p class="trim-line">
-        Trim: <span class="mono">{exportStore.deriveTrimSummary()}</span>
+        Trim: <span class="mono">{exportStore.deriveTrimSummary(formatTimecode)}</span>
       </p>
       <p class="path-line">
         Output: <span class="mono">{outputPath}</span>
@@ -251,14 +353,45 @@
   }
 
   .field-input {
+    flex: 1;
     min-height: 36px;
     padding: var(--space-xs) var(--space-sm);
+    /* Leave room for the 16px caret at the right edge plus a gap, so the
+       selected value never sits under it. */
+    padding-right: calc(var(--space-sm) + 16px + var(--space-xs));
     border: 1px solid var(--color-secondary);
     border-radius: var(--space-xs);
+    /* Drop the native widget appearance: under WebKitGTK an unstyled select is
+       painted by the GTK menulist (near-white), which bypasses the authored
+       background below and leaves light-on-light text (Phase 5 UI review
+       BLOCKER). Mirrors the Phase 2 presenter-select fix. */
+    -webkit-appearance: none;
+    appearance: none;
+    /* background: shorthand first, then explicitly clear any UA gradient/image
+       so nothing paints behind the authored colour. */
     background: var(--color-secondary);
+    background-image: none;
     color: var(--color-body-text);
     font-family: var(--font-ui);
     font-size: var(--text-body);
+  }
+
+  /* Wraps the select + caret so the caret positions against the control row. */
+  .select-wrap {
+    position: relative;
+    display: flex;
+  }
+
+  .select-caret {
+    position: absolute;
+    right: var(--space-sm);
+    top: 50%;
+    transform: translateY(-50%);
+    display: flex;
+    align-items: center;
+    color: var(--color-body-text);
+    /* Never intercept the click that opens the menu. */
+    pointer-events: none;
   }
 
   .field-input:focus-visible {
@@ -280,6 +413,19 @@
     font-family: var(--font-mono);
     font-variant-numeric: tabular-nums;
     color: var(--color-body-text);
+  }
+
+  /* The final path stays selectable so it can be copied by hand even when the
+     clipboard API is unavailable (least-privilege Reveal substitute). */
+  .path-value {
+    user-select: text;
+  }
+
+  .copy-status {
+    min-height: var(--text-body);
+    margin: 0;
+    color: var(--color-success);
+    font-size: var(--text-body);
   }
 
   .modal-progress,
@@ -309,6 +455,10 @@
 
   .fill {
     height: 100%;
+    /* Guarantee a visible sliver from the first frame: at 0-1% a plain width
+       fill is nearly imperceptible at the start of a long run (Phase 5 UI
+       review). The accent fill reads against the dominant track. */
+    min-width: 4px;
     background: var(--color-accent);
     transition: width 250ms ease;
   }

@@ -109,7 +109,7 @@
   .cap-note {
     margin-left: auto;
     color: var(--color-log-info);
-    font-size: 12px;
+    font-size: var(--text-label);
   }
 
   .log-empty {
