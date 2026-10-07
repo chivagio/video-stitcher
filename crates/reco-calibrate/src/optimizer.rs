@@ -70,6 +70,40 @@ pub(crate) const BOUNDS_5: [(f64, f64); 5] = [
 /// Bound for the optional 6th parameter (x_rx, right plane pitch).
 const X_RX_BOUND: (f64, f64) = (-0.3, 0.3); // ~17 deg
 
+/// Snap a solved layout into the optimizer's bounds.
+///
+/// Nelder-Mead is unconstrained, and the bounds penalty is finite, so the
+/// solver can settle marginally outside a bound when that shaves the
+/// reprojection error (the observed `intersect = 1.000038`, `x_rz =
+/// -0.300001`). A saved profile carrying such an overshoot fails the loader's
+/// strict validation, so the solved layout is clamped at the point it becomes
+/// a [`PlaneLayout`].
+///
+/// Fields that were locked during the solve are not free parameters and are
+/// skipped: `cam_d` is derived from `intersect` when `lock_cam_d` is set, and
+/// `z_rx` is fixed at zero when `lock_z_rx` is set.
+pub(crate) fn clamp_layout_to_bounds(
+    layout: &mut PlaneLayout,
+    lock_cam_d: bool,
+    lock_z_rx: bool,
+    enable_x_rx: bool,
+) {
+    layout.intersect = layout.intersect.clamp(BOUNDS_5[1].0, BOUNDS_5[1].1);
+    layout.x_ty = layout.x_ty.clamp(BOUNDS_5[2].0, BOUNDS_5[2].1);
+    layout.x_rz = layout.x_rz.clamp(BOUNDS_5[3].0, BOUNDS_5[3].1);
+    if !lock_cam_d {
+        layout.camera_axis_offset = layout
+            .camera_axis_offset
+            .clamp(BOUNDS_5[0].0, BOUNDS_5[0].1);
+    }
+    if !lock_z_rx {
+        layout.z_rx = layout.z_rx.clamp(BOUNDS_5[4].0, BOUNDS_5[4].1);
+    }
+    if enable_x_rx {
+        layout.x_rx = layout.x_rx.clamp(X_RX_BOUND.0, X_RX_BOUND.1);
+    }
+}
+
 /// Get bounds for the active parameter count.
 fn active_bounds(enable_x_rx: bool, lock_cam_d: bool, lock_z_rx: bool) -> Vec<(f64, f64)> {
     let mut b = if lock_cam_d {
@@ -408,7 +442,7 @@ impl Optimizer for NelderMeadOptimizer {
             (false, true) => params_from_vec_no_zrx(&best_p),
             (false, false) => params_from_vec(&best_p),
         };
-        let layout = PlaneLayout {
+        let mut layout = PlaneLayout {
             camera_axis_offset: params.cam_d,
             intersect: params.intersect,
             x_ty: params.x_ty,
@@ -421,6 +455,9 @@ impl Optimizer for NelderMeadOptimizer {
             },
             z_rz: 0.0,
         };
+        // Snap any marginal bound overshoot from the unconstrained solver so
+        // the resulting calibration always passes the loader's strict checks.
+        clamp_layout_to_bounds(&mut layout, lock, lock_zrx, enable_xrx);
 
         Ok((layout, best_cost))
     }
@@ -565,6 +602,28 @@ mod tests {
         let bounds = active_bounds(false, false, false);
         let inside = vec![0.225, 0.5, 0.0, 0.0, 0.0];
         assert_abs_diff_eq!(bounds_penalty(&inside, &bounds), 0.0, epsilon = 1e-15);
+    }
+
+    #[test]
+    fn clamp_layout_snaps_marginal_bound_overshoot() {
+        // The exact overshoot a real solve produced on the Xiaomi pair: every
+        // free parameter settled a hair outside its bound.
+        let mut layout = PlaneLayout {
+            camera_axis_offset: 0.099_992_891_091_486_65,
+            intersect: 1.000_038_030_259_529_5,
+            x_ty: 0.100_000_1,
+            x_rz: -0.300_000_950_691_069_7,
+            z_rx: 0.300_000_693_289_055_7,
+            x_rx: 0.0,
+            z_rz: 0.0,
+        };
+        clamp_layout_to_bounds(&mut layout, false, false, false);
+
+        assert_eq!(layout.intersect, BOUNDS_5[1].1);
+        assert_eq!(layout.camera_axis_offset, BOUNDS_5[0].0);
+        assert_eq!(layout.x_ty, BOUNDS_5[2].1);
+        assert_eq!(layout.x_rz, BOUNDS_5[3].0);
+        assert_eq!(layout.z_rx, BOUNDS_5[4].1);
     }
 
     #[test]

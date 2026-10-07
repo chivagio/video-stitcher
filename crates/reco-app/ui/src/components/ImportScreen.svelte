@@ -84,7 +84,7 @@
           message="Inputs changed — the loaded calibration no longer matches. Re-run calibration."
         />
       {/if}
-      {#if bothReady && hasIssues && !bannerDismissed}
+      {#if bothReady && hasIssues && !bannerDismissed && !importStore.checksUnavailable}
         <CompatibilityBanner
           report={importStore.readiness}
           onCalibrateAnyway={onCalibrate}

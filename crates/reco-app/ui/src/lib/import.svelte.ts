@@ -242,6 +242,15 @@ class ImportStore {
     if (this.bothReady) {
       this.checksUnavailable = true;
       this.checksError = message;
+      // The compatibility checks did not complete, so the readiness report
+      // they produced is not trustworthy — including its sampled overlap
+      // estimate. Report unknown rather than rendering a stale/partial value
+      // next to the "couldn't run checks" notice (T-04-07).
+      this.readiness = {
+        findings: [],
+        overlap_estimate: null,
+        exposure_delta_stops: null,
+      };
       return;
     }
   }

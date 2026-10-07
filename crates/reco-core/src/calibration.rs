@@ -30,6 +30,17 @@ pub const MAX_DIM: u32 = 8192;
 /// zero-vector normalization in the stitching shaders.
 const EPSILON: f64 = 1e-6;
 
+/// Numerical slack tolerated on `intersect` when loading a profile.
+///
+/// The position optimizer is unconstrained and enforces its bounds with a
+/// finite quadratic penalty, so a solved `intersect` can settle a hair outside
+/// `[0, 1]` (e.g. `1.000038`). Earlier builds saved such values unclamped, so
+/// the loader snaps anything within this slack back onto the bound. Values
+/// further out are genuinely invalid and still rejected (see
+/// [`CalibrationError::IntersectOutOfRange`]). Deliberately far smaller than
+/// the smallest value the range check should reject.
+const INTERSECT_LOAD_EPSILON: f64 = 1e-4;
+
 /// Errors produced by [`MatchCalibration::validate`].
 #[derive(Debug, Error)]
 pub enum CalibrationError {
@@ -360,17 +371,71 @@ impl MatchCalibration {
             });
         }
 
-        let cal: Self = serde_json::from_str(&json).map_err(CalibrationLoadError::Parse)?;
+        let mut cal: Self = serde_json::from_str(&json).map_err(CalibrationLoadError::Parse)?;
+        // Snap the tiny numerical overshoot an older save could carry on
+        // `intersect` before the strict range check, so a profile this project
+        // previously wrote remains loadable. A genuinely invalid value is left
+        // untouched and rejected by `validate`.
+        cal.snap_intersect_overshoot();
         cal.validate()?;
         Ok(cal)
     }
 
     /// Save calibration to a JSON file.
     ///
-    /// Uses pretty-printed JSON for human readability.
+    /// Uses pretty-printed JSON for human readability. The written copy is
+    /// clamped into the validated ranges first, so a profile this project saves
+    /// always passes [`from_file`](Self::from_file)'s validation.
     pub fn to_file(&self, path: &std::path::Path) -> Result<(), std::io::Error> {
-        let json = self.to_json_pretty();
+        let mut clamped = self.clone();
+        clamped.clamp_to_valid_ranges();
+        let json = clamped.to_json_pretty();
         std::fs::write(path, json)
+    }
+
+    /// Clamp every validated parameter into its accepted range.
+    ///
+    /// The position optimizer is unconstrained: its finite quadratic bounds
+    /// penalty permits a solution to settle marginally outside a bound (the
+    /// observed `intersect = 1.000038`). A profile carrying that overshoot
+    /// cannot be read back because [`validate`](Self::validate) rejects it
+    /// strictly. Clamping at save time guarantees the written file validates.
+    ///
+    /// Only finite values are clamped — a NaN/inf is left in place so
+    /// `validate` still rejects it rather than silently replacing it with a
+    /// bound.
+    pub fn clamp_to_valid_ranges(&mut self) {
+        for camera in [&mut self.left, &mut self.right] {
+            if camera.fx.is_finite() {
+                camera.fx = camera.fx.max(EPSILON);
+            }
+            if camera.fy.is_finite() {
+                camera.fy = camera.fy.max(EPSILON);
+            }
+        }
+        if self.layout.camera_axis_offset.is_finite() {
+            self.layout.camera_axis_offset = self.layout.camera_axis_offset.max(EPSILON);
+        }
+        if self.layout.intersect.is_finite() {
+            self.layout.intersect = self.layout.intersect.clamp(0.0, 1.0);
+        }
+    }
+
+    /// Snap an `intersect` that is a hair outside `[0, 1]` back onto the bound.
+    ///
+    /// Used only on load, for profiles written before the save path clamped.
+    /// Values beyond [`INTERSECT_LOAD_EPSILON`] are left untouched so the
+    /// strict range check still rejects genuinely invalid calibrations.
+    fn snap_intersect_overshoot(&mut self) {
+        let intersect = self.layout.intersect;
+        if !intersect.is_finite() {
+            return;
+        }
+        if (-INTERSECT_LOAD_EPSILON..0.0).contains(&intersect) {
+            self.layout.intersect = 0.0;
+        } else if (1.0..=1.0 + INTERSECT_LOAD_EPSILON).contains(&intersect) {
+            self.layout.intersect = 1.0;
+        }
     }
 
     /// Serialize to pretty-printed JSON string.
@@ -797,6 +862,78 @@ mod tests {
         assert!(
             matches!(err, CalibrationError::IntersectOutOfRange { .. }),
             "unexpected error variant: {err}"
+        );
+    }
+
+    #[test]
+    fn clamp_to_valid_ranges_snaps_intersect_overshoot() {
+        let mut cal = valid_cal();
+        cal.layout.intersect = 1.0000380302595295;
+        cal.layout.camera_axis_offset = 0.09999289109148665;
+        cal.clamp_to_valid_ranges();
+        assert_eq!(cal.layout.intersect, 1.0);
+        // cam_d is above EPSILON, so only intersect needs snapping here.
+        assert!(cal.layout.camera_axis_offset > EPSILON);
+        assert!(cal.validate().is_ok());
+    }
+
+    #[test]
+    fn clamp_to_valid_ranges_leaves_nan_for_validation() {
+        let mut cal = valid_cal();
+        cal.layout.intersect = f64::NAN;
+        cal.clamp_to_valid_ranges();
+        assert!(cal.layout.intersect.is_nan());
+        assert!(cal.validate().is_err());
+    }
+
+    #[test]
+    fn saved_overshoot_profile_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("overshoot.json");
+
+        // A solved calibration with the exact overshoot the optimizer produced.
+        let mut cal = valid_cal();
+        cal.layout.intersect = 1.0000380302595295;
+        cal.to_file(&path).expect("save must succeed");
+
+        // The written file must already be in range, so a strict load succeeds.
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let parsed: MatchCalibration = serde_json::from_str(&raw).unwrap();
+        assert_eq!(parsed.layout.intersect, 1.0);
+
+        let loaded = MatchCalibration::from_file(&path).expect("round-trip load must succeed");
+        assert_eq!(loaded.layout.intersect, 1.0);
+    }
+
+    #[test]
+    fn load_tolerates_tiny_intersect_overshoot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy-overshoot.json");
+
+        // Simulate a profile written by an earlier build (no save-time clamp):
+        // serialize an overshoot value directly, bypassing `to_file`.
+        let mut cal = valid_cal();
+        cal.layout.intersect = 1.0000380302595295;
+        std::fs::write(&path, cal.to_json_pretty()).unwrap();
+
+        let loaded = MatchCalibration::from_file(&path)
+            .expect("a tiny overshoot from an older build must remain loadable");
+        assert_eq!(loaded.layout.intersect, 1.0);
+    }
+
+    #[test]
+    fn load_rejects_genuinely_invalid_intersect() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("invalid.json");
+
+        let mut cal = valid_cal();
+        cal.layout.intersect = 1.5;
+        std::fs::write(&path, cal.to_json_pretty()).unwrap();
+
+        let err = MatchCalibration::from_file(&path).unwrap_err();
+        assert!(
+            matches!(err, CalibrationLoadError::Invalid(CalibrationError::IntersectOutOfRange { value }) if (value - 1.5).abs() < 1e-9),
+            "unexpected error: {err}"
         );
     }
 

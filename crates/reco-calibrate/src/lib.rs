@@ -790,7 +790,7 @@ fn calibrate_impl(
         best_layout.z_rz
     );
 
-    let calibration = MatchCalibration {
+    let mut calibration = MatchCalibration {
         left: left_params.clone(),
         right: right_params.clone(),
         layout: best_layout,
@@ -801,6 +801,10 @@ fn calibrate_impl(
         lens_correction_amount: 1.0, // full correction; user-tunable in the GUI
         blend_width: 0.05,           // renderer default; user-tunable in the GUI
     };
+    // Guarantee the in-memory calibration is valid: the layout clamp covers the
+    // solver's physical bounds, this covers the loader's positivity gates
+    // (focal lengths, axis offset) for every solver mode.
+    calibration.clamp_to_valid_ranges();
 
     Ok(CalibrationResult {
         calibration,

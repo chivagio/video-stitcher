@@ -4641,8 +4641,15 @@ impl EngineBackend for GpuEngineBackend {
         }
         let calibration = self
             .current_calibration
-            .as_ref()
+            .as_mut()
             .ok_or_else(|| WorkerError::ProfileSave("no calibration result to save".to_string()))?;
+        // T-04.1-16 parity: never write a profile that fails validation. Clamp
+        // the solver's marginal bound overshoot first, then refuse if anything
+        // (e.g. a non-finite value) is still invalid.
+        calibration.clamp_to_valid_ranges();
+        calibration
+            .validate()
+            .map_err(|e| WorkerError::ProfileSave(e.to_string()))?;
         calibration
             .to_file(std::path::Path::new(&path))
             .map_err(|e| WorkerError::ProfileSave(e.to_string()))?;
