@@ -5851,7 +5851,16 @@ impl EngineBackend for GpuEngineBackend {
         //
         // A trim never exceeds the clip, and an `out <= in` window is clamped so
         // an empty window is never exported — the clamp is announced, not silent.
-        let source_total = self.loaded.as_ref().and_then(|t| t.total_frames());
+        //
+        // The total is probed from the clip the export actually opens (`left`),
+        // never `self.loaded` (the preview/import transport, which can be a
+        // different file than the operator's selected input). Otherwise a valid
+        // `end_frame` beyond the *import* clip's length is silently shortened and
+        // the ETA is computed against the wrong length (WR-01).
+        let source_total =
+            reco_io::ffmpeg::calibration_io::probe_video(std::path::Path::new(&left))
+                .ok()
+                .map(|p| p.total_frames);
         let (start_frame, end_frame, trim_clamped) =
             clamp_trim(settings.start_frame, settings.end_frame, source_total);
         if trim_clamped {
