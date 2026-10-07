@@ -24,10 +24,8 @@
     exportStore,
     PRESET_LABELS,
     VARIANT_LABELS,
-    outputNamePreview,
   } from "../lib/export.svelte";
   import type { ExportPreset, ExportVariant } from "../lib/types";
-  import { importStore } from "../lib/import.svelte";
   import ActionButton from "./ActionButton.svelte";
   import InlineNotice from "./InlineNotice.svelte";
 
@@ -39,9 +37,11 @@
   const cancelled = $derived(exportStore.status === "cancelled");
   const failed = $derived(exportStore.status === "failed");
 
-  const namingPreview = $derived(
-    outputNamePreview(importStore.inputs.left.path, exportStore.settings.variant),
-  );
+  // The webview never constructs an output path (T-05-08): until the worker's
+  // `ExportPathPreview` lands, show a neutral resolving state rather than a
+  // locally-derived name that could differ from the worker's sanitized,
+  // collision-suffixed path (IN-06).
+  const outputPath = $derived(exportStore.pathPreview?.path ?? "Resolving…");
   const percent = $derived(Math.round(exportStore.progress?.percent ?? 0));
   const encoderOverride = $derived(exportStore.settings.encoder_name ?? "");
 
@@ -168,12 +168,12 @@
         Trim: <span class="mono">{exportStore.deriveTrimSummary()}</span>
       </p>
       <p class="path-line">
-        Output: <span class="mono">{exportStore.pathPreview?.path ?? namingPreview}</span>
+        Output: <span class="mono">{outputPath}</span>
       </p>
       {#if exportStore.pathPreviewCollision}
         <InlineNotice
           level="warn"
-          message={`Name in use — saving as ${exportStore.pathPreview?.path ?? namingPreview}`}
+          message={`Name in use — saving as ${outputPath}`}
         />
       {/if}
       <p class="meta-line">
