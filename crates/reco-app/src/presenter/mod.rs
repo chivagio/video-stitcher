@@ -1246,7 +1246,7 @@ mod tests {
         // weaker presenter and the recorded native error is the reason. The
         // locked line must name that weaker kind.
         let err = PresenterError::Unsupported {
-            reason: "parent window handle is Wayland(...), not Xlib — Wayland has no \
+            reason: "parent window handle is Wayland, not Xlib — Wayland has no \
                      X11-style child embedding (D-05)"
                 .to_string(),
         };

@@ -35,7 +35,7 @@
 
 use std::os::raw::{c_long, c_uint};
 
-use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawWindowHandle};
+use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
 use reco_core::render::stitch_renderer::StitchRenderer;
 use reco_core::source::YuvData;
 use x11_dl::xlib;
@@ -284,6 +284,58 @@ pub struct X11Presenter {
 // not called), and this type is never shared across threads.
 unsafe impl Send for X11Presenter {}
 
+/// A stable, non-identifying name for a [`RawWindowHandle`] variant.
+///
+/// The derived `Debug` of `RawWindowHandle` prints platform pointer values
+/// (e.g. a Wayland `wl_surface` address). Those must never reach a user-facing
+/// reason or cross IPC (T-02-09), so the error text names only the platform
+/// kind — never the handle itself.
+fn window_handle_kind(handle: &RawWindowHandle) -> &'static str {
+    match handle {
+        RawWindowHandle::Xlib(_) => "Xlib",
+        RawWindowHandle::Xcb(_) => "Xcb",
+        RawWindowHandle::Wayland(_) => "Wayland",
+        RawWindowHandle::Drm(_) => "DRM",
+        RawWindowHandle::Gbm(_) => "GBM",
+        RawWindowHandle::Win32(_) => "Win32",
+        RawWindowHandle::WinRt(_) => "WinRT",
+        RawWindowHandle::AppKit(_) => "AppKit",
+        RawWindowHandle::UiKit(_) => "UIKit",
+        RawWindowHandle::AndroidNdk(_) => "Android",
+        RawWindowHandle::Haiku(_) => "Haiku",
+        RawWindowHandle::Orbital(_) => "Orbital",
+        RawWindowHandle::OhosNdk(_) => "OpenHarmony",
+        RawWindowHandle::Web(_)
+        | RawWindowHandle::WebCanvas(_)
+        | RawWindowHandle::WebOffscreenCanvas(_) => "Web",
+        _ => "an unsupported platform",
+    }
+}
+
+/// A stable, non-identifying name for a [`RawDisplayHandle`] variant.
+///
+/// The display-handle analogue of [`window_handle_kind`]: the derived `Debug`
+/// of `RawDisplayHandle` prints platform pointer values (e.g. a Wayland
+/// `wl_display` address), which must never cross IPC (T-02-09).
+fn display_handle_kind(handle: &RawDisplayHandle) -> &'static str {
+    match handle {
+        RawDisplayHandle::Xlib(_) => "Xlib",
+        RawDisplayHandle::Xcb(_) => "Xcb",
+        RawDisplayHandle::Wayland(_) => "Wayland",
+        RawDisplayHandle::Drm(_) => "DRM",
+        RawDisplayHandle::Gbm(_) => "GBM",
+        RawDisplayHandle::Windows(_) => "Win32",
+        RawDisplayHandle::AppKit(_) => "AppKit",
+        RawDisplayHandle::UiKit(_) => "UIKit",
+        RawDisplayHandle::Android(_) => "Android",
+        RawDisplayHandle::Haiku(_) => "Haiku",
+        RawDisplayHandle::Orbital(_) => "Orbital",
+        RawDisplayHandle::Ohos(_) => "OpenHarmony",
+        RawDisplayHandle::Web(_) => "Web",
+        _ => "an unsupported platform",
+    }
+}
+
 impl X11Presenter {
     /// Create a presenter by building an X11 child window under `parent`
     /// (obtained from the Tauri window) and a wgpu surface on it.
@@ -331,8 +383,9 @@ impl X11Presenter {
             other => {
                 return Err(PresenterError::Unsupported {
                     reason: format!(
-                        "parent window handle is {other:?}, not Xlib — \
-                         Wayland has no X11-style child embedding (D-05)"
+                        "parent window handle is {}, not Xlib — \
+                         Wayland has no X11-style child embedding (D-05)",
+                        window_handle_kind(&other)
                     ),
                 });
             }
@@ -350,8 +403,9 @@ impl X11Presenter {
             other => {
                 return Err(PresenterError::Unsupported {
                     reason: format!(
-                        "parent display handle is {other:?}, not Xlib — \
-                         Wayland has no X11-style child embedding (D-05)"
+                        "parent display handle is {}, not Xlib — \
+                         Wayland has no X11-style child embedding (D-05)",
+                        display_handle_kind(&other)
                     ),
                 });
             }
@@ -1180,6 +1234,45 @@ mod tests {
             "the second drain must measure from the position the first ended at"
         );
         assert!(state.pressed, "the button is still held across drains");
+    }
+
+    /// WR-04 / T-02-09: the fallback reason names only the platform kind, never
+    /// the raw handle. The derived `Debug` of `RawWindowHandle` prints the
+    /// `wl_surface` address (and `RawDisplayHandle` the `wl_display` address),
+    /// which must not reach the user-facing reason or cross IPC.
+    #[test]
+    fn handle_kinds_are_stable_names_without_pointer_addresses() {
+        let ptr = std::ptr::NonNull::<std::ffi::c_void>::dangling();
+        let window = RawWindowHandle::Wayland(raw_window_handle::WaylandWindowHandle::new(ptr));
+        let display = RawDisplayHandle::Wayland(raw_window_handle::WaylandDisplayHandle::new(ptr));
+
+        assert_eq!(window_handle_kind(&window), "Wayland");
+        assert_eq!(display_handle_kind(&display), "Wayland");
+
+        // The exact reason strings the presenter builds contain no formatted
+        // pointer address and no derived handle debug.
+        let window_reason = format!(
+            "parent window handle is {}, not Xlib",
+            window_handle_kind(&window)
+        );
+        let display_reason = format!(
+            "parent display handle is {}, not Xlib",
+            display_handle_kind(&display)
+        );
+        for reason in [&window_reason, &display_reason] {
+            assert!(!reason.contains("0x"), "reason leaked an address: {reason}");
+            assert!(
+                !reason.contains("Handle"),
+                "reason leaked a handle debug: {reason}"
+            );
+        }
+
+        // The mapping is real, not a constant: a different variant names
+        // differently.
+        let xcb = RawWindowHandle::Xcb(raw_window_handle::XcbWindowHandle::new(
+            std::num::NonZeroU32::new(1).unwrap(),
+        ));
+        assert_eq!(window_handle_kind(&xcb), "Xcb");
     }
 
     /// `set_visible`'s idempotence contract: the stored flag toggles on a
