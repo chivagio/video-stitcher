@@ -172,6 +172,29 @@ pub async fn run_preflight(state: tauri::State<'_, WorkerHandle>) -> Result<(), 
     state.send(WorkerCommand::RunPreflight)
 }
 
+/// Write the one-click, redacted, local-only diagnostics bundle (DIAG-03).
+///
+/// Thin: validate the path, post `ExportDiagnosticsBundle { path }`. The worker
+/// gathers the retained structured logs, the probed system info, the active
+/// calibration profile, and the debug inspector payload, redacts the home path
+/// and account name, and writes a single local zip **atomically** (no partial
+/// bundle on failure). No network is touched and the path is the operator's own
+/// choice; the worker emits a typed `DiagnosticsBundleWritten` or a
+/// `Failed(DiagnosticsBundle)`.
+///
+/// # Errors
+///
+/// Returns [`WorkerError::InvalidInput`] for an empty/non-local path, or
+/// [`WorkerError::ChannelClosed`] if the worker has already exited.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn export_diagnostics_bundle(
+    state: tauri::State<'_, WorkerHandle>,
+    path: String,
+) -> Result<(), WorkerError> {
+    validate_bundle_path(&path)?;
+    state.send(WorkerCommand::ExportDiagnosticsBundle { path })
+}
+
 /// Save the current working state as a `.reco` project (PROJ-01).
 ///
 /// Thin: validate the path, post `SaveProject { path, settings }`. The worker
@@ -642,6 +665,17 @@ fn validate_profile_path(path: &str) -> Result<(), WorkerError> {
 /// opens a non-local path. Reuses [`validate_profile_path`] rather than
 /// duplicating the prefix set.
 fn validate_project_path(path: &str) -> Result<(), WorkerError> {
+    validate_profile_path(path)
+}
+
+/// Validate an operator-supplied diagnostics-bundle path at the command
+/// boundary (DIAG-03).
+///
+/// The bundle is a local zip chosen by the native save dialog; the same
+/// empty/forbidden-prefix guard as a profile path applies, so the worker never
+/// writes to a non-local path. Reuses [`validate_profile_path`] rather than
+/// duplicating the prefix set.
+fn validate_bundle_path(path: &str) -> Result<(), WorkerError> {
     validate_profile_path(path)
 }
 
@@ -1267,6 +1301,18 @@ pub enum WorkerCommand {
     /// A cheap job: the worker probes FFmpeg, ONNX Runtime (when detection is
     /// built), and the webview runtime, then emits a typed `Preflight` report.
     RunPreflight,
+
+    /// Write the one-click, redacted, local-only diagnostics bundle (DIAG-03).
+    ///
+    /// A job: the worker gathers the retained structured logs, the probed
+    /// system info, the active calibration profile, and the debug inspector
+    /// payload, redacts the home path/account name, and writes a single local
+    /// zip at `path` atomically (no partial bundle on failure), then emits
+    /// `DiagnosticsBundleWritten`. Nothing here touches the network.
+    ExportDiagnosticsBundle {
+        /// The local `.zip` path the bundle is written to.
+        path: String,
+    },
 
     /// Save the current working state as a `.reco` project (PROJ-01).
     ///

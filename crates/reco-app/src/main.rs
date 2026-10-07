@@ -25,6 +25,7 @@
 
 mod calibration;
 mod commands;
+mod diagnostics;
 mod events;
 mod export_naming;
 mod hardcoded;
@@ -49,8 +50,12 @@ use tauri::Manager as _;
 /// `log_tx` is the shared worker event sender (DIAG-02): [`system::UiLogLayer`]
 /// forwards each captured engine record as a typed `WorkerEvent::LogRecord`
 /// into the same stream the Tauri bridge drains, so the LogViewer shows the
-/// engine's structured records without a second channel.
-fn init_tracing(log_tx: std::sync::mpsc::Sender<events::WorkerEvent>) {
+/// engine's structured records without a second channel. `log_buffer` is the
+/// same layer's retained copy (DIAG-03), read by the diagnostics bundle.
+fn init_tracing(
+    log_tx: std::sync::mpsc::Sender<events::WorkerEvent>,
+    log_buffer: diagnostics::LogBuffer,
+) {
     use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
     let _ = tracing_log::LogTracer::init();
@@ -59,7 +64,7 @@ fn init_tracing(log_tx: std::sync::mpsc::Sender<events::WorkerEvent>) {
     let _ = tracing_subscriber::registry()
         .with(filter)
         .with(fmt::layer())
-        .with(system::UiLogLayer::new(log_tx))
+        .with(system::UiLogLayer::new(log_tx, log_buffer))
         .try_init();
 }
 
@@ -70,7 +75,12 @@ fn main() -> anyhow::Result<()> {
     // bridge drains. Created before `init_tracing` because the layer needs the
     // sender; the receiver is moved into the app setup.
     let (log_tx, log_rx) = std::sync::mpsc::channel::<events::WorkerEvent>();
-    init_tracing(log_tx.clone());
+    // The retained structured-log buffer (DIAG-03): the tracing layer below
+    // pushes every forwarded record into it, and the worker reads it when it
+    // writes the diagnostics bundle. Created before `init_tracing` because the
+    // layer needs it; a clone is threaded to the worker via `run_skeleton`.
+    let log_buffer = diagnostics::LogBuffer::new();
+    init_tracing(log_tx.clone(), log_buffer.clone());
 
     tauri::Builder::default()
         // Official Tauri 2 dialog plugin (IMPT-01/05/06). Registration alone is
@@ -86,6 +96,7 @@ fn main() -> anyhow::Result<()> {
             commands::preview_export_path,
             commands::system_info,
             commands::run_preflight,
+            commands::export_diagnostics_bundle,
             commands::save_project,
             commands::open_project,
             commands::relocate_project_input,
@@ -130,7 +141,7 @@ fn main() -> anyhow::Result<()> {
             commands::cancel_calibration
         ])
         .setup(move |app| {
-            if let Err(e) = run_skeleton(app, log_tx, log_rx) {
+            if let Err(e) = run_skeleton(app, log_tx, log_rx, log_buffer) {
                 // Surface the exact A1/A3 outcome rather than masking it: this
                 // is the walking-skeleton gate and a failure is a recorded
                 // verdict, not a silent no-op.
@@ -154,6 +165,7 @@ fn run_skeleton(
     app: &mut tauri::App,
     log_tx: std::sync::mpsc::Sender<events::WorkerEvent>,
     log_rx: std::sync::mpsc::Receiver<events::WorkerEvent>,
+    log_buffer: diagnostics::LogBuffer,
 ) -> Result<(), SkeletonError> {
     // Ordering is load-bearing (RESEARCH Pitfall 1): the native child view must
     // be created BEFORE the chrome webview so the webview sits ABOVE it in
@@ -269,6 +281,7 @@ fn run_skeleton(
         startup_fallback,
         std::sync::Arc::clone(&calibration_cancel),
         std::sync::Arc::clone(&export_cancel),
+        log_buffer,
         log_tx,
         log_rx,
     )?;
@@ -455,6 +468,7 @@ fn run_skeleton(
     app: &mut tauri::App,
     _log_tx: std::sync::mpsc::Sender<events::WorkerEvent>,
     _log_rx: std::sync::mpsc::Receiver<events::WorkerEvent>,
+    _log_buffer: diagnostics::LogBuffer,
 ) -> Result<(), SkeletonError> {
     let _window = build_window(app)?;
     let rect = ViewportRect::for_chrome(1280, 800, &ChromeState::default());

@@ -20,6 +20,12 @@
 //! single subscriber `main.rs` installs; the volume is bounded by the
 //! `EnvFilter` (DEBUG below the configured filter never reaches the layer) and
 //! by the LogViewer's carried 2000-line DOM cap (T-05-12).
+//!
+//! # DIAG-03 — bundle log retention
+//!
+//! The same layer also pushes each forwarded record into the shared
+//! [`LogBuffer`](crate::diagnostics::LogBuffer) the diagnostics bundle reads, so
+//! the one-click bundle carries the structured records without a second channel.
 
 use std::sync::mpsc::Sender;
 
@@ -153,20 +159,23 @@ fn probe_devices() -> (Vec<String>, Option<String>) {
 }
 
 /// The tracing layer that forwards engine records to the UI as typed events
-/// (DIAG-02).
+/// (DIAG-02) and retains them for the diagnostics bundle (DIAG-03).
 ///
 /// One instance is composed into the single subscriber `main.rs` installs. It
 /// sends a [`WorkerEvent::LogRecord`] for every record that survives the
-/// configured `EnvFilter`; a closed channel is a silent drop (the UI is gone).
+/// configured `EnvFilter` and pushes the same record into the shared
+/// [`LogBuffer`](crate::diagnostics::LogBuffer) the diagnostics bundle reads; a
+/// closed channel is a silent drop (the UI is gone).
 pub struct UiLogLayer {
     tx: Sender<WorkerEvent>,
+    buffer: crate::diagnostics::LogBuffer,
 }
 
 impl UiLogLayer {
-    /// Build the layer over the worker's event sender.
+    /// Build the layer over the worker's event sender and the shared log buffer.
     #[must_use]
-    pub fn new(tx: Sender<WorkerEvent>) -> Self {
-        Self { tx }
+    pub fn new(tx: Sender<WorkerEvent>, buffer: crate::diagnostics::LogBuffer) -> Self {
+        Self { tx, buffer }
     }
 }
 
@@ -184,6 +193,9 @@ where
             message: visitor.finish(),
             timestamp_ms: now_ms(),
         };
+        // DIAG-03: retain the record for the diagnostics bundle. The clone is
+        // cheap relative to the send and keeps the event and the buffer in sync.
+        self.buffer.push(record.clone());
         // A closed channel means the app is shutting down; dropping the record
         // must never abort the emitting code path.
         let _ = self.tx.send(WorkerEvent::LogRecord { record });
@@ -308,7 +320,8 @@ mod tests {
         use tracing_subscriber::prelude::*;
 
         let (tx, rx) = std::sync::mpsc::channel();
-        let subscriber = tracing_subscriber::registry().with(UiLogLayer::new(tx));
+        let buffer = crate::diagnostics::LogBuffer::new();
+        let subscriber = tracing_subscriber::registry().with(UiLogLayer::new(tx, buffer.clone()));
         tracing::subscriber::with_default(subscriber, || {
             tracing::warn!(target: "reco_test_target", "a structured record");
         });
@@ -326,5 +339,10 @@ mod tests {
             }
             other => panic!("expected LogRecord, got {other:?}"),
         }
+
+        // DIAG-03: the layer also retains the record for the diagnostics bundle.
+        let retained = buffer.snapshot();
+        assert_eq!(retained.len(), 1, "the layer must retain the record");
+        assert_eq!(retained[0].target, "reco_test_target");
     }
 }

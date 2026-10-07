@@ -1382,6 +1382,21 @@ pub enum WorkerEvent {
         /// The referenced inputs that were not found, by role.
         missing: Vec<crate::project::MissingInput>,
     },
+
+    /// A redacted, local-only diagnostics bundle was written (DIAG-03).
+    ///
+    /// Emitted only after the atomic write succeeded, so the path is a real
+    /// on-disk bundle. The webview renders the success line naming the path
+    /// (UI-SPEC Copywriting Contract); a failure is a typed
+    /// [`WorkerError::DiagnosticsBundle`] instead, and no partial bundle exists.
+    DiagnosticsBundleWritten {
+        /// The local path the bundle was written to.
+        path: String,
+        /// How many entries the zip contains.
+        files: usize,
+        /// Whether the home path / user name were redacted (always true today).
+        redacted: bool,
+    },
 }
 
 /// The UI-facing shape of an event-log line (UI-SPEC Event Log Contract).
@@ -1911,6 +1926,24 @@ impl WorkerEvent {
                     None => "project inputs missing".to_string(),
                 },
             },
+            // The locked INFO copy (UI-SPEC Copywriting Contract): names the
+            // path and the entry count so a headless run sees the same line the
+            // webview's success line carries.
+            WorkerEvent::DiagnosticsBundleWritten {
+                path,
+                files,
+                redacted,
+            } => LogLine {
+                level: Level::Info,
+                message: format!(
+                    "Diagnostics bundle written: {path} ({files} files, {})",
+                    if *redacted {
+                        "redacted"
+                    } else {
+                        "not redacted"
+                    }
+                ),
+            },
         }
     }
 }
@@ -2009,6 +2042,15 @@ pub enum WorkerError {
     /// A relocate was requested with no project awaiting one (PROJ-01).
     #[error("cannot relocate project input: {0}")]
     ProjectRelocate(String),
+
+    /// Writing the diagnostics bundle failed (DIAG-03).
+    ///
+    /// The inner message is the typed
+    /// [`DiagnosticsError`](crate::diagnostics::DiagnosticsError)'s `Display`
+    /// text. No partial bundle is left at the target path — the write is atomic
+    /// (temp + rename), so a failure never produces a half-written archive.
+    #[error("cannot write diagnostics bundle: {0}")]
+    DiagnosticsBundle(String),
 }
 
 // Compile-time bound check: both halves of the protocol are `Clone + Send +

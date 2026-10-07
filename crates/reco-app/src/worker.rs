@@ -227,6 +227,10 @@ pub struct EventSink {
     /// one via `manual_attach_preview`. `None` until then; frames are dropped
     /// rather than blocking the worker.
     manual_frames: ManualFrameSlot,
+    /// The last debug inspector report published (DIAG-03). Retained so the
+    /// diagnostics bundle can include the debug payload without the backend
+    /// having to keep its own copy; `None` until a calibration publishes one.
+    last_debug: Arc<std::sync::Mutex<Option<crate::events::DebugReport>>>,
 }
 
 impl EventSink {
@@ -235,6 +239,7 @@ impl EventSink {
         Self {
             tx,
             manual_frames: Arc::new(std::sync::Mutex::new(None)),
+            last_debug: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -441,7 +446,20 @@ impl EventSink {
             report.verified.len(),
             report.rejected.len(),
         );
+        // DIAG-03: retain the latest report so the diagnostics bundle can carry
+        // the debug inspector payload (thumbnails are dropped at serialization).
+        if let Ok(mut slot) = self.last_debug.lock() {
+            *slot = Some(report.clone());
+        }
         let _ = self.tx.send(WorkerEvent::CalibrationDebug { report });
+    }
+
+    /// A snapshot of the last published debug inspector report (DIAG-03).
+    ///
+    /// `None` until a calibration publishes one; the diagnostics bundle then
+    /// omits the `debug.json` entry rather than fabricating an empty report.
+    fn snapshot_debug(&self) -> Option<crate::events::DebugReport> {
+        self.last_debug.lock().ok().and_then(|slot| slot.clone())
     }
 
     /// Emit that a profile was loaded (IMPT-05).
@@ -673,6 +691,21 @@ impl EventSink {
         let event = WorkerEvent::ProjectMissingInputs { missing };
         let line = event.to_log_line();
         log::warn!("{}", line.message);
+        let _ = self.tx.send(event);
+    }
+
+    /// Emit that a redacted, local-only diagnostics bundle was written (DIAG-03).
+    ///
+    /// Only emitted after the atomic write succeeded, so the path names a real
+    /// bundle. Mirrored to the process log at INFO.
+    fn diagnostics_bundle_written(&self, path: impl Into<String>, files: usize, redacted: bool) {
+        let event = WorkerEvent::DiagnosticsBundleWritten {
+            path: path.into(),
+            files,
+            redacted,
+        };
+        let line = event.to_log_line();
+        log::info!("{}", line.message);
         let _ = self.tx.send(event);
     }
 
@@ -1856,6 +1889,19 @@ pub trait EngineBackend: Send {
         events: &EventSink,
     ) -> Result<(), WorkerError>;
 
+    /// Write the one-click, redacted, local-only diagnostics bundle (DIAG-03).
+    ///
+    /// Gathers the retained structured logs, the probed system info, the active
+    /// calibration profile, and the retained debug inspector payload into a
+    /// single zip at `path` (atomic write; no partial bundle on failure), then
+    /// emits `DiagnosticsBundleWritten`. The bundle is local-only: nothing here
+    /// touches the network, and the path is the operator's own choice.
+    fn export_diagnostics_bundle(
+        &self,
+        path: String,
+        events: &EventSink,
+    ) -> Result<(), WorkerError>;
+
     /// Dispatch a transport-agnostic input intent to the worker's pose state.
     fn dispatch_intent(&mut self, intent: reco_control::ControlIntent);
 
@@ -2342,6 +2388,12 @@ fn handle_command<B: EngineBackend>(
         WorkerCommand::RelocateProjectInput { role, path } => {
             // PROJ-01: a job — replace the missing path and re-run the restore.
             if let Err(e) = backend.relocate_project_input(role, path, events) {
+                events.failed(e);
+            }
+        }
+        WorkerCommand::ExportDiagnosticsBundle { path } => {
+            // DIAG-03: a job — gather + redact + write the local bundle atomically.
+            if let Err(e) = backend.export_diagnostics_bundle(path, events) {
                 events.failed(e);
             }
         }
@@ -3412,6 +3464,10 @@ pub struct GpuEngineBackend {
     /// polls it per frame. Distinct from `calibration_cancel` (prohibition: a
     /// stray export cancel must never abort a calibration).
     export_cancel: Arc<AtomicBool>,
+    /// The shared structured-log buffer the diagnostics bundle reads (DIAG-03).
+    /// The tracing layer pushes records into the same buffer, so the bundle
+    /// carries the engine's structured records.
+    log_buffer: crate::diagnostics::LogBuffer,
     /// The single GPU device owner (FOUND-03). Declared **last** so it drops
     /// after the decode source, renderer, and presenter surface — the documented
     /// teardown order (FOUND-06 / RESEARCH Pattern 6). Actually field 1 held the
@@ -3519,6 +3575,7 @@ impl GpuEngineBackend {
         startup_fallback: Option<String>,
         calibration_cancel: Arc<AtomicBool>,
         export_cancel: Arc<AtomicBool>,
+        log_buffer: crate::diagnostics::LogBuffer,
     ) -> Result<Self, WorkerError> {
         // The presenter chain (PREV-05), strongest-first, pre-built on the setup
         // thread. Index each presenter into its fixed chain slot; the first entry
@@ -3633,6 +3690,7 @@ impl GpuEngineBackend {
             recovery_attempts: 0,
             calibration_cancel,
             export_cancel,
+            log_buffer,
             renderer: None,
             renderer_input: None,
         })
@@ -6011,6 +6069,33 @@ impl EngineBackend for GpuEngineBackend {
         Ok(())
     }
 
+    fn export_diagnostics_bundle(
+        &self,
+        path: String,
+        events: &EventSink,
+    ) -> Result<(), WorkerError> {
+        // DIAG-03: gather the retained structured logs (pushed by the tracing
+        // layer), the live system view (the adapter the app is actually using),
+        // the active calibration profile, and the retained debug inspector
+        // payload. `write_bundle` redacts every text entry and writes atomically.
+        let inputs = crate::diagnostics::BundleInputs {
+            logs: self.log_buffer.snapshot(),
+            system: crate::system::probe_system(Some(&self.gpu)),
+            calibration: self
+                .current_calibration
+                .as_ref()
+                .and_then(|cal| serde_json::to_string_pretty(cal).ok()),
+            debug: events
+                .snapshot_debug()
+                .map(|report| crate::diagnostics::redacted_debug_json(&report)),
+            home: crate::diagnostics::home_dir(),
+        };
+        let summary = crate::diagnostics::write_bundle(std::path::Path::new(&path), &inputs)
+            .map_err(|e| WorkerError::DiagnosticsBundle(e.to_string()))?;
+        events.diagnostics_bundle_written(summary.path.display().to_string(), summary.files, true);
+        Ok(())
+    }
+
     fn dispatch_intent(&mut self, intent: reco_control::ControlIntent) {
         dispatch_intent(&mut self.pose, intent);
     }
@@ -6870,6 +6955,10 @@ impl GpuEngineBackend {
 /// # Errors
 ///
 /// [`WorkerError::Engine`] if device creation or surface configuration fails.
+// The constructor takes the whole wiring bundle (presenters, viewport, the two
+// cancel flags, the shared log buffer, and both event-channel halves); splitting
+// it into a struct would only move the argument list, not shorten it.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_gpu_worker(
     instance: reco_core::wgpu::Instance,
     presenters: PresenterChain,
@@ -6877,6 +6966,7 @@ pub fn spawn_gpu_worker(
     startup_fallback: Option<String>,
     calibration_cancel: Arc<AtomicBool>,
     export_cancel: Arc<AtomicBool>,
+    log_buffer: crate::diagnostics::LogBuffer,
     log_tx: Sender<WorkerEvent>,
     log_rx: Receiver<WorkerEvent>,
 ) -> Result<SpawnedWorker, WorkerError> {
@@ -6887,6 +6977,7 @@ pub fn spawn_gpu_worker(
         startup_fallback,
         calibration_cancel,
         export_cancel,
+        log_buffer,
     )?;
     let readback_tx = backend.readback_sender();
     let (worker, events, manual_frame_slot) =
@@ -7217,6 +7308,8 @@ mod tests {
         /// `false` flag; a test can share one via [`MockBackend::with_export_cancel`]
         /// to set it and assert `ExportCancelled`.
         export_cancel: Arc<AtomicBool>,
+        /// The mock's structured-log buffer (DIAG-03), empty by default.
+        log_buffer: crate::diagnostics::LogBuffer,
         /// A per-frame delay the mock's export sleeps, so a test can set the
         /// export-cancel flag mid-run (the worker clears a stale cancel at the
         /// start of every run, so a pre-set flag is intentionally ignored).
@@ -7303,6 +7396,7 @@ mod tests {
                 has_result: false,
                 calibration_cancel: Arc::new(AtomicBool::new(false)),
                 export_cancel: Arc::new(AtomicBool::new(false)),
+                log_buffer: crate::diagnostics::LogBuffer::new(),
                 mock_export_delay: Duration::ZERO,
                 screen_visible: Arc::new(std::sync::Mutex::new(None)),
                 manual_open: false,
@@ -8491,6 +8585,37 @@ mod tests {
                 return Ok(());
             }
             self.apply_mock_project(pending.path, pending.project, events);
+            Ok(())
+        }
+
+        fn export_diagnostics_bundle(
+            &self,
+            path: String,
+            events: &EventSink,
+        ) -> Result<(), WorkerError> {
+            self.record("export_diagnostics_bundle");
+            // Mirror the real backend without a GPU: the GPU fields are honestly
+            // unknown (probe_system(None)), the encoders/devices still probe the
+            // real FFmpeg surface, and the bundle is written atomically.
+            let inputs = crate::diagnostics::BundleInputs {
+                logs: self.log_buffer.snapshot(),
+                system: crate::system::probe_system(None),
+                calibration: self
+                    .current_calibration
+                    .as_ref()
+                    .and_then(|cal| serde_json::to_string_pretty(cal).ok()),
+                debug: events
+                    .snapshot_debug()
+                    .map(|report| crate::diagnostics::redacted_debug_json(&report)),
+                home: crate::diagnostics::home_dir(),
+            };
+            let summary = crate::diagnostics::write_bundle(std::path::Path::new(&path), &inputs)
+                .map_err(|e| WorkerError::DiagnosticsBundle(e.to_string()))?;
+            events.diagnostics_bundle_written(
+                summary.path.display().to_string(),
+                summary.files,
+                true,
+            );
             Ok(())
         }
 
@@ -10255,6 +10380,50 @@ mod tests {
             .expect("relocating the missing input must restore and emit ProjectOpened");
         assert_eq!(opened.0, left.display().to_string());
         assert_eq!(opened.1, right_present.display().to_string());
+    }
+
+    #[test]
+    fn export_diagnostics_bundle_writes_a_redacted_bundle_and_emits_the_event() {
+        // DIAG-03: the one-click bundle writes locally and emits a typed event
+        // naming the path and the file count — never a failure on success.
+        let dir = project_temp_dir("diagnostics");
+        let bundle_path = dir.join("reco-diagnostics.zip");
+
+        let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (worker, events) = EngineWorker::spawn(MockBackend::new(Arc::clone(&ops)));
+        let handle = worker.handle();
+        handle
+            .send(WorkerCommand::ExportDiagnosticsBundle {
+                path: bundle_path.display().to_string(),
+            })
+            .unwrap();
+        handle.send(WorkerCommand::Shutdown).unwrap();
+
+        let seen = drain_until_shutdown(&events);
+        let written = seen
+            .iter()
+            .find_map(|e| match e {
+                WorkerEvent::DiagnosticsBundleWritten {
+                    path,
+                    files,
+                    redacted,
+                } => Some((path.clone(), *files, *redacted)),
+                _ => None,
+            })
+            .expect("a successful bundle must emit DiagnosticsBundleWritten");
+        assert_eq!(written.0, bundle_path.display().to_string());
+        assert!(
+            written.1 >= 3,
+            "the bundle carries at least logs + system + calibration entries"
+        );
+        assert!(written.2, "the bundle is redacted");
+        assert!(bundle_path.exists(), "the bundle must exist on disk");
+        assert!(
+            !seen.iter().any(|e| matches!(e, WorkerEvent::Failed(_))),
+            "a successful bundle must never emit a failure"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
