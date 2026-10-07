@@ -300,7 +300,7 @@
     } else if (e.key === "v" || e.key === "V") {
       e.preventDefault();
       handleViewToggle();
-    } else if (e.shiftKey && e.key === "ArrowLeft") {
+    } else if (poseNudgeActive && e.shiftKey && e.key === "ArrowLeft") {
       // CONTEXT D-03 "arrow-key nudge". Shift is required because bare
       // Left/Right belong to the timeline (frame stepping) whenever it has
       // focus, and a bare arrow reaching here too would seek and pan at once.
@@ -309,13 +309,13 @@
       // which is the authority: +yaw looks LEFT, so Left takes the positive
       // delta. Verified against view_matrix, not assumed from the doc comments.
       void pose.nudgeYawStep(1);
-    } else if (e.shiftKey && e.key === "ArrowRight") {
+    } else if (poseNudgeActive && e.shiftKey && e.key === "ArrowRight") {
       e.preventDefault();
       void pose.nudgeYawStep(-1);
-    } else if (e.shiftKey && e.key === "ArrowUp") {
+    } else if (poseNudgeActive && e.shiftKey && e.key === "ArrowUp") {
       e.preventDefault();
       void pose.nudgePitchStep(1);
-    } else if (e.shiftKey && e.key === "ArrowDown") {
+    } else if (poseNudgeActive && e.shiftKey && e.key === "ArrowDown") {
       e.preventDefault();
       void pose.nudgePitchStep(-1);
     }
@@ -325,6 +325,11 @@
   const isPlaying = $derived(transport.status === "playing");
   const controlsEnabled = $derived(transport.controlsEnabled);
   const isWarning = $derived(presenter.kind !== "native");
+  // Pose nudges act on the panorama only: the source render path ignores the
+  // pose, so a Shift+arrow there would be silently invisible. Mirrors the
+  // FOV/reset gate in ControlsPanel and `webviewPoseActive`'s view-mode half in
+  // PreviewSurface.
+  const poseNudgeActive = $derived(viewMode === "panorama" && pose.enabled);
 
   // Workflow-rail enablement (UI-SPEC Interaction & State Contract).
   const bothReady = $derived(
@@ -465,6 +470,7 @@
     <!-- Controls panel (right edge) -->
     <ControlsPanel
       expanded={panelExpanded}
+      {viewMode}
       onToggle={handlePanelToggle}
       onFovChange={handleFovChange}
       onResetView={handleResetView}

@@ -10,16 +10,19 @@
   import ResetViewButton from "./ResetViewButton.svelte";
   import PresenterSelect from "./PresenterSelect.svelte";
   import { pose } from "../lib/pose.svelte";
-  import type { PresenterKind } from "../lib/types";
+  import { presenter } from "../lib/presenter.svelte";
+  import type { PresenterKind, ViewMode } from "../lib/types";
 
   let {
     expanded,
+    viewMode,
     onToggle,
     onFovChange,
     onResetView,
     onPresenterChange,
   }: {
     expanded: boolean;
+    viewMode: ViewMode;
     onToggle: () => void;
     onFovChange: (value: number) => void;
     onResetView: () => void;
@@ -27,12 +30,22 @@
   } = $props();
 
   const poseEnabled = $derived(pose.enabled);
+  // Pose controls act on the panorama only: the source render path ignores the
+  // pose, so a FOV/reset/arrow change there would be silently invisible. This
+  // mirrors `webviewPoseActive`'s view-mode gate in PreviewSurface.svelte (the
+  // presenter half of that gate does not apply here: these controls send
+  // intents and work in native mode too, where the child owns pointer input).
+  const poseControlsEnabled = $derived(poseEnabled && viewMode === "panorama");
   const fovValue = $derived(pose.fovValue);
   const yaw = $derived(pose.pose?.yaw ?? 0);
   const pitch = $derived(pose.pose?.pitch ?? 0);
   const fov = $derived(pose.pose?.fov ?? 75);
   // The coverage ceiling, so the slider stops advertising range it cannot reach.
   const fovMax = $derived(pose.fovMax);
+  // The live presenter, so the override select reflects the active one instead
+  // of snapping back to "Auto" after a manual override. The badge is the
+  // authoritative readout; the select must agree with it.
+  const presenterValue = $derived(presenter.kind);
 </script>
 
 <div class="controls-panel" class:expanded>
@@ -60,14 +73,14 @@
         <FovSlider
           value={fovValue}
           max={fovMax}
-          disabled={!poseEnabled}
+          disabled={!poseControlsEnabled}
           onChange={onFovChange}
         />
       </div>
 
       <div class="panel-section">
         <ResetViewButton
-          disabled={!poseEnabled}
+          disabled={!poseControlsEnabled}
           onClick={onResetView}
         />
       </div>
@@ -75,7 +88,7 @@
       <div class="panel-section">
         <h3 class="section-heading">Presenter</h3>
         <PresenterSelect
-          value="auto"
+          value={presenterValue}
           disabled={false}
           onChange={onPresenterChange}
         />
