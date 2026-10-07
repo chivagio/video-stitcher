@@ -100,6 +100,11 @@ Push-based is the canonical ingestion path: consumers call `StitchCore::submit_f
 
 Prerequisites: Rust **1.92+** (workspace MSRV), FFmpeg development libraries, pkg-config, clang.
 
+> **Running the desktop app?** Its runtime prerequisites (FFmpeg shared
+> libraries, ONNX Runtime, WebView2 / `webkit2gtk-4.1`), what the installer
+> bundles, and per-prerequisite remediation are documented in
+> [RUNTIME-PREREQUISITES.md](RUNTIME-PREREQUISITES.md).
+
 ```bash
 # Ubuntu / Debian (apt)
 sudo apt install libavcodec-dev libavformat-dev libavutil-dev \
