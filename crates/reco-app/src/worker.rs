@@ -1222,6 +1222,42 @@ pub fn new_session_transport(
     transport
 }
 
+/// The operator clips (and sync offset) a preview decode source was opened from
+/// (IMPT-01 / D3-15).
+///
+/// `import()` opens the hardcoded startup pair; once the operator has chosen
+/// **both** inputs the worker must decode those files instead, or Preview keeps
+/// showing the placeholder clips. The spec is what the worker compares against
+/// so it re-opens exactly once per `(left, right, sync_offset)` change rather
+/// than on every preview.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PreviewSourceSpec {
+    /// The operator-chosen left clip path.
+    left: String,
+    /// The operator-chosen right clip path.
+    right: String,
+    /// The sync offset the pair is opened with (the adopted calibration's, else
+    /// 0).
+    sync_offset: i64,
+}
+
+/// Resolve the decode source the preview must use for the current operator
+/// inputs, or `None` when either role is unset.
+///
+/// Shared by the GPU backend and the GPU-free mock so the two cannot drift:
+/// the mock models exactly the resolution the real `begin_preview` performs.
+fn resolve_preview_source(
+    left: Option<&str>,
+    right: Option<&str>,
+    sync_offset: i64,
+) -> Option<PreviewSourceSpec> {
+    Some(PreviewSourceSpec {
+        left: left?.to_string(),
+        right: right?.to_string(),
+        sync_offset,
+    })
+}
+
 /// Project a probed [`VideoProbe`](reco_io::ffmpeg::calibration_io::VideoProbe)
 /// into the UI-facing [`InputMetadata`](crate::events::InputMetadata) with
 /// per-field provenance (IMPT-02 / D3-04).
@@ -1802,6 +1838,16 @@ pub trait EngineBackend: Send {
     /// through the mutable accessor would falsely signal an active session and
     /// start the tick loop with no session (no renderer, no real timing).
     fn loaded_transport(&self) -> Option<&crate::transport::Transport>;
+
+    /// The `(left, right)` paths the preview decode source was opened from for
+    /// the operator's imported clips, or `None` while preview still decodes the
+    /// startup/hardcoded pair (IMPT-01 / D3-15).
+    ///
+    /// The operator's imported clips must replace the hardcoded startup pair
+    /// once both roles are set; this exposes which pair is live so a GPU-free
+    /// test can prove `begin_preview` uses the imported clips without opening a
+    /// real decoder.
+    fn preview_source_paths(&self) -> Option<(String, String)>;
 
     /// Report the webview chrome's collapsible state; recompute and reconfigure
     /// the native viewport (no transport/pose reset).
@@ -3434,6 +3480,13 @@ pub struct GpuEngineBackend {
     source: Option<reco_io::adapters::FfmpegFileSource>,
     /// Input frame dimensions from the source metadata.
     input_size: Option<(u32, u32)>,
+    /// The `(left, right, sync_offset)` the current [`Self::source`] was opened
+    /// with, or `None` for the hardcoded startup import (IMPT-01 / D3-15).
+    ///
+    /// Lets the worker re-open the source when the operator's imported clips or
+    /// the adopted calibration's sync offset change, so Preview decodes the
+    /// imported files instead of the hardcoded startup pair.
+    source_spec: Option<PreviewSourceSpec>,
     /// The last-built renderer. Rebuilt on device recovery (`Lost`); `None`
     /// until the first `preview`. Drops before the device (it holds bind
     /// groups/textures derived from it).
@@ -3708,6 +3761,7 @@ impl GpuEngineBackend {
             manual_preview_dirty: false,
             source: None,
             input_size: None,
+            source_spec: None,
             presenter,
             presenters: slots,
             active_kind,
@@ -4108,6 +4162,9 @@ impl EngineBackend for GpuEngineBackend {
         self.input_size = Some((info.width, info.height));
         self.calibration = Some(cal);
         self.source = Some(source);
+        // The startup import is the hardcoded pair, not the operator's clips; a
+        // later `set_input` for both roles replaces this source (D3-15).
+        self.source_spec = None;
 
         // Build the transport from the loaded source's timing metadata so a
         // transport command issued before `begin_preview` carries the real
@@ -4145,6 +4202,10 @@ impl EngineBackend for GpuEngineBackend {
         // (D3-08): the scorecard must reflect the clips it actually used.
         self.emit_readiness(events);
         self.invalidate_result(events);
+        // Once both roles are set, decode the operator's clips instead of the
+        // hardcoded startup pair (D3-15). A single set input keeps the startup
+        // source so the Phase 1/2 no-import path is unchanged.
+        self.sync_operator_source()?;
         Ok(())
     }
 
@@ -4161,6 +4222,11 @@ impl EngineBackend for GpuEngineBackend {
         events.info(format!("{} cleared", role.label()));
         self.emit_readiness(events);
         self.invalidate_result(events);
+        // A cleared input must not leave a stale clip behind: drop the operator
+        // source so Preview cannot decode a clip the operator removed. With
+        // both roles still set the source is simply re-resolved (a no-op when
+        // unchanged).
+        self.sync_operator_source()?;
         Ok(())
     }
 
@@ -5354,6 +5420,16 @@ impl EngineBackend for GpuEngineBackend {
     }
 
     fn begin_preview(&mut self, events: &EventSink) -> Result<(), WorkerError> {
+        // Lazily (re)open the operator's imported clips with the adopted
+        // calibration's sync offset. Inputs are usually set before calibration,
+        // so this is where the offset first becomes known (D3-15). A no-op for
+        // the no-import path and when the source already matches.
+        self.sync_operator_source()?;
+        // Make the decoded pair observable: the operator can confirm Preview is
+        // showing the imported clips, not the hardcoded startup pair (D3-15).
+        if let Some((left, right)) = self.preview_source_paths() {
+            events.info(format!("preview source: {left} + {right}"));
+        }
         // Clone (not `take`) the calibration: the renderer takes it by value,
         // but a preview must be repeatable without re-importing, so the loaded
         // calibration stays owned by the backend.
@@ -5721,6 +5797,14 @@ impl EngineBackend for GpuEngineBackend {
 
     fn loaded_transport(&self) -> Option<&crate::transport::Transport> {
         self.loaded.as_ref()
+    }
+
+    fn preview_source_paths(&self) -> Option<(String, String)> {
+        // `None` while the source is the hardcoded startup import; the operator
+        // clips only appear once `sync_operator_source` opened them (D3-15).
+        self.source_spec
+            .as_ref()
+            .map(|spec| (spec.left.clone(), spec.right.clone()))
     }
 
     fn session_transport_mut(&mut self) -> Option<&mut crate::transport::Transport> {
@@ -6540,6 +6624,10 @@ impl GpuEngineBackend {
     /// rebuilds from the adopted profile, but only when no preview session is
     /// live: `tick_session` requires a renderer and would fail mid-session.
     fn adopt_calibration(&mut self, calibration: reco_core::calibration::MatchCalibration) {
+        // Keep the render inputs consistent with the adopted profile: `rig_tilt`
+        // drives the renderer/pose, and before this only the startup `import()`
+        // set it, so Preview rendered the hardcoded tilt (D3-15 / WR-05).
+        self.rig_tilt = calibration.rig_tilt as f32;
         self.current_calibration = Some(calibration.clone());
         self.calibration = Some(calibration);
         self.has_result = true;
@@ -6549,6 +6637,76 @@ impl GpuEngineBackend {
         if self.session.is_none() {
             self.renderer = None;
             self.renderer_input = None;
+        }
+    }
+
+    /// The sync offset the preview source should be opened with: the
+    /// adopted/current calibration's, else 0 when no calibration exists yet.
+    fn preview_sync_offset(&self) -> i64 {
+        self.current_calibration
+            .as_ref()
+            .or(self.calibration.as_ref())
+            .map(|cal| cal.sync_offset)
+            .unwrap_or(0)
+    }
+
+    /// Ensure [`Self::source`] decodes the operator's imported clips when both
+    /// roles are set, replacing the hardcoded startup pair (IMPT-01 / D3-15).
+    ///
+    /// `import()` opens the hardcoded `left.mp4`/`right.mp4`; without this,
+    /// Preview kept decoding those placeholders after the operator imported and
+    /// calibrated real files. Called when both inputs become available (after
+    /// `set_input`) and lazily from `begin_preview` so the adopted calibration's
+    /// sync offset is applied even when the inputs were set before calibration.
+    ///
+    /// The no-import Phase 1/2 path is preserved: while either role is unset and
+    /// no operator source was ever opened, the hardcoded source is left in
+    /// place. A cleared input drops an operator source so Preview cannot decode
+    /// a clip the operator removed.
+    ///
+    /// Returns `true` when the source was (re)opened.
+    fn sync_operator_source(&mut self) -> Result<bool, WorkerError> {
+        use crate::events::InputRole;
+        let spec = resolve_preview_source(
+            self.input_paths.get(&InputRole::Left).map(String::as_str),
+            self.input_paths.get(&InputRole::Right).map(String::as_str),
+            self.preview_sync_offset(),
+        );
+        match spec {
+            None => {
+                // Drop only an operator-opened source; the hardcoded startup
+                // source stays for the no-import path.
+                if self.source_spec.is_some() {
+                    self.source = None;
+                    self.input_size = None;
+                    self.loaded = None;
+                    self.source_spec = None;
+                }
+                Ok(false)
+            }
+            Some(spec) if self.source_spec.as_ref() == Some(&spec) => Ok(false),
+            Some(spec) => {
+                let source = reco_io::adapters::FfmpegFileSource::open_with_offset(
+                    std::path::Path::new(&spec.left),
+                    std::path::Path::new(&spec.right),
+                    spec.sync_offset,
+                )
+                .map_err(|e| WorkerError::Engine(e.to_string()))?;
+                let info = source.info();
+                self.input_size = Some((info.width, info.height));
+                self.source = Some(source);
+                // Rebuild the import-time transport so a transport command
+                // issued before `begin_preview` carries the imported clip's
+                // real fps/frame count instead of the placeholder's.
+                let total_frames = self.source.as_ref().and_then(|s| s.total_frames());
+                self.loaded = Some(crate::transport::Transport::new(
+                    info.fps,
+                    info.fps_rational,
+                    total_frames,
+                ));
+                self.source_spec = Some(spec);
+                Ok(true)
+            }
         }
     }
 
@@ -7338,6 +7496,13 @@ mod tests {
         mock_metadata: [Option<crate::events::InputMetadata>; 2],
         /// The mock's per-role input paths (IMPT-01).
         input_paths: [Option<String>; 2],
+        /// The operator preview source the mock models, or `None` while preview
+        /// is on the hardcoded startup pair (IMPT-01 / D3-15).
+        ///
+        /// Mirrors the real backend's `source_spec` through the shared
+        /// [`resolve_preview_source`], so the protocol tests prove the operator's
+        /// clips replace the startup pair without a GPU.
+        preview_source: Option<PreviewSourceSpec>,
         /// The mock's per-role lens overrides (IMPT-04).
         lens_overrides: [Option<reco_core::calibration::CameraParams>; 2],
         /// The mock's per-role lens-override summaries (PROJ-01).
@@ -7438,6 +7603,7 @@ mod tests {
                 inputs: [None, None],
                 mock_metadata: [None, None],
                 input_paths: [None, None],
+                preview_source: None,
                 lens_overrides: [None, None],
                 lens_override_candidates: [None, None],
                 current_calibration: None,
@@ -7509,6 +7675,28 @@ mod tests {
         /// actually compute from coverage.
         fn fov_ceiling(&self) -> f32 {
             self.pose.lock().unwrap().config().fov_max_degrees
+        }
+
+        /// The mock's preview sync offset: the adopted/current calibration's,
+        /// else 0 (mirrors the real backend's `preview_sync_offset`).
+        fn mock_preview_sync_offset(&self) -> i64 {
+            self.current_calibration
+                .as_ref()
+                .map(|cal| cal.sync_offset)
+                .unwrap_or(0)
+        }
+
+        /// Re-resolve the mock's modelled preview source through the shared
+        /// [`resolve_preview_source`] (IMPT-01 / D3-15).
+        ///
+        /// Mirrors the real backend: both roles set → the operator clips;
+        /// either unset → the hardcoded startup pair (`None`).
+        fn refresh_mock_preview_source(&mut self) {
+            self.preview_source = resolve_preview_source(
+                self.input_paths[0].as_deref(),
+                self.input_paths[1].as_deref(),
+                self.mock_preview_sync_offset(),
+            );
         }
 
         fn record(&self, op: &'static str) {
@@ -7736,6 +7924,9 @@ mod tests {
             // Use the same pure decision the real backend uses.
             self.emit_mock_readiness(events);
             self.invalidate_mock_result(events);
+            // Mirror the real backend: once both roles are set the preview
+            // decodes the operator's clips, not the hardcoded startup pair.
+            self.refresh_mock_preview_source();
             Ok(())
         }
 
@@ -7753,6 +7944,9 @@ mod tests {
             events.info(format!("{} cleared", role.label()));
             self.emit_mock_readiness(events);
             self.invalidate_mock_result(events);
+            // Mirror the real backend: a cleared input drops the operator
+            // preview source so no stale clip is decoded.
+            self.refresh_mock_preview_source();
             Ok(())
         }
 
@@ -8302,6 +8496,9 @@ mod tests {
 
         fn begin_preview(&mut self, events: &EventSink) -> Result<(), WorkerError> {
             self.record("begin_preview");
+            // Mirror the real backend's lazy source resolution: the adopted
+            // calibration's sync offset may only be known now (D3-15).
+            self.refresh_mock_preview_source();
             // Mirror the real backend exactly: the session transport is built
             // through the shared `new_session_transport`, so user-set state
             // survives the session boundary here too and the mock cannot hide
@@ -8456,6 +8653,12 @@ mod tests {
 
         fn loaded_transport(&self) -> Option<&crate::transport::Transport> {
             self.loaded.as_ref()
+        }
+
+        fn preview_source_paths(&self) -> Option<(String, String)> {
+            self.preview_source
+                .as_ref()
+                .map(|spec| (spec.left.clone(), spec.right.clone()))
         }
 
         fn session_transport_mut(&mut self) -> Option<&mut crate::transport::Transport> {
@@ -8869,6 +9072,104 @@ mod tests {
             "SetInput must emit a typed ImportMetadata event: {seen:?}"
         );
         assert!(ops_without_pointer_drain(&ops).contains(&"set_input"));
+    }
+
+    #[test]
+    fn resolve_preview_source_requires_both_roles_and_carries_the_offset() {
+        // The pure decision both backends share (D3-15): only BOTH roles set
+        // switches the preview off the hardcoded startup pair.
+        assert_eq!(resolve_preview_source(None, Some("r"), 3), None);
+        assert_eq!(resolve_preview_source(Some("l"), None, 3), None);
+        assert_eq!(
+            resolve_preview_source(Some("l"), Some("r"), 3),
+            Some(PreviewSourceSpec {
+                left: "l".to_string(),
+                right: "r".to_string(),
+                sync_offset: 3,
+            })
+        );
+    }
+
+    #[test]
+    fn begin_preview_decodes_the_imported_clips_not_the_hardcoded_pair() {
+        // DEFECT: `set_input` only recorded metadata, so `begin_preview` kept
+        // decoding the hardcoded startup source and Preview showed
+        // left.mp4/right.mp4 after the operator imported real clips. The mock
+        // mirrors the real backend's `sync_operator_source` through the shared
+        // `resolve_preview_source`, so this proves the invariant GPU-free.
+        let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let events = EventSink::new(tx);
+        let mut backend = MockBackend::new(ops);
+
+        let left = "test-media/xiaomi/xiaomi-11tpro-left.mp4".to_string();
+        let right = "test-media/xiaomi/xiaomi-14tpro-right.mp4".to_string();
+
+        backend.import(&events).unwrap();
+        assert_eq!(
+            backend.preview_source_paths(),
+            None,
+            "the startup import is the hardcoded pair, not an operator source"
+        );
+
+        backend
+            .set_input(crate::events::InputRole::Left, left.clone(), &events)
+            .unwrap();
+        assert_eq!(
+            backend.preview_source_paths(),
+            None,
+            "one set input must not switch the preview off the startup pair"
+        );
+
+        backend
+            .set_input(crate::events::InputRole::Right, right.clone(), &events)
+            .unwrap();
+        assert_eq!(
+            backend.preview_source_paths(),
+            Some((left.clone(), right.clone())),
+            "both inputs set: preview must decode the imported clips"
+        );
+
+        // `begin_preview` re-resolves lazily (the adopted calibration's sync
+        // offset is often only known now); it must keep the imported clips.
+        backend.begin_preview(&events).unwrap();
+        assert_eq!(
+            backend.preview_source_paths(),
+            Some((left.clone(), right.clone())),
+            "begin_preview must keep decoding the imported clips"
+        );
+
+        // A cleared input drops the operator source so no stale clip is decoded.
+        backend
+            .clear_input(crate::events::InputRole::Right, &events)
+            .unwrap();
+        assert_eq!(
+            backend.preview_source_paths(),
+            None,
+            "a cleared input must drop the operator preview source"
+        );
+    }
+
+    #[test]
+    fn the_named_xiaomi_clips_open_as_a_real_pair() {
+        // The regression above uses the operator's real clips as the paths. Prove
+        // that pair actually opens (so the seam is not exercising a fiction);
+        // skip when this checkout has no `test-media/xiaomi/`.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test-media/xiaomi");
+        let left = dir.join("xiaomi-11tpro-left.mp4");
+        let right = dir.join("xiaomi-14tpro-right.mp4");
+        if !left.is_file() || !right.is_file() {
+            return;
+        }
+        let source = reco_io::adapters::FfmpegFileSource::open_with_offset(&left, &right, 0)
+            .expect("the named xiaomi pair opens");
+        let info = source.info();
+        assert!(
+            info.width > 0 && info.height > 0,
+            "the imported pair reports a real resolution: {}x{}",
+            info.width,
+            info.height
+        );
     }
 
     #[test]
