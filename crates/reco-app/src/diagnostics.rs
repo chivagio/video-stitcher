@@ -139,22 +139,55 @@ pub fn home_dir() -> PathBuf {
 /// Redact a text entry for the bundle (T-05-17).
 ///
 /// Replaces the home directory with `<home>` and the account name (the home's
-/// last path component) with `<user>`. Everything else is left untouched. The
-/// home replacement runs first so a path under it becomes `<home>/…` and the
-/// bare account name is then replaced wherever it still appears.
+/// last path component) with `<user>`. Everything else is left untouched.
+///
+/// Both anchors are matched in a single left-to-right pass over the **original**
+/// text, so the inserted `<home>` placeholder can never be rewritten — even when
+/// the home directory's basename is literally `home` (IN-04). The account name
+/// is only replaced at a token boundary, so a short name (`dev`, `test`) does
+/// not mangle unrelated text such as `device`.
 #[must_use]
 pub fn redact(text: &str, home: &Path) -> String {
     let home_str = home.to_string_lossy();
     if home_str.is_empty() {
         return text.to_string();
     }
-    let mut out = text.replace(home_str.as_ref(), "<home>");
-    if let Some(user) = home.file_name().and_then(|name| name.to_str())
-        && !user.is_empty()
-    {
-        out = out.replace(user, "<user>");
+    let user = home
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty());
+
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < text.len() {
+        if text[i..].starts_with(home_str.as_ref()) {
+            out.push_str("<home>");
+            i += home_str.len();
+            continue;
+        }
+        if let Some(user) = user
+            && text[i..].starts_with(user)
+            && token_boundary(text, i, user.len())
+        {
+            out.push_str("<user>");
+            i += user.len();
+            continue;
+        }
+        let ch_len = text[i..].chars().next().map_or(1, char::len_utf8);
+        out.push_str(&text[i..i + ch_len]);
+        i += ch_len;
     }
     out
+}
+
+/// Whether the `[start, start + len)` span is a standalone token: not preceded
+/// or followed by an identifier character, so a short account name does not
+/// rewrite unrelated text (e.g. `dev` inside `device`) (IN-04).
+fn token_boundary(text: &str, start: usize, len: usize) -> bool {
+    let is_ident = |c: char| c.is_alphanumeric() || c == '_' || c == '-';
+    let before = text[..start].chars().next_back();
+    let after = text[start + len..].chars().next();
+    !before.is_some_and(is_ident) && !after.is_some_and(is_ident)
 }
 
 /// Serialize the debug inspector payload for the bundle, without media bytes.
@@ -382,6 +415,36 @@ mod tests {
     fn redact_with_no_home_is_a_noop() {
         let text = "plain text with no paths";
         assert_eq!(redact(text, Path::new("")), text);
+    }
+
+    #[test]
+    fn redact_does_not_corrupt_the_home_placeholder() {
+        // IN-04: with a home basename of `home`, the inserted `<home>` must not
+        // be rewritten by the account-name pass.
+        let home = PathBuf::from("/home/home");
+        assert_eq!(
+            redact("/home/home/clips/left.mp4", &home),
+            "<home>/clips/left.mp4"
+        );
+    }
+
+    #[test]
+    fn redact_does_not_over_redact_a_short_user_name() {
+        // IN-04: `dev` must not rewrite `device`.
+        let home = PathBuf::from("/home/dev");
+        let redacted = redact("device dev /home/dev/clip.mp4", &home);
+        assert!(
+            redacted.contains("device"),
+            "an unrelated identifier must survive: {redacted}"
+        );
+        assert!(
+            redacted.contains("<user>"),
+            "the standalone account name must be redacted: {redacted}"
+        );
+        assert!(
+            redacted.contains("<home>/clip.mp4"),
+            "the home path must be redacted: {redacted}"
+        );
     }
 
     #[test]
