@@ -24,6 +24,8 @@
     calibrateReason = "Select two clips to calibrate.",
     previewReason = "Calibrate first.",
     exportReason = "Calibrate first.",
+    onOpenProject,
+    onSaveProject,
   }: {
     active: Screen;
     onNavigate: (screen: Screen) => void;
@@ -35,6 +37,8 @@
     calibrateReason?: string;
     previewReason?: string;
     exportReason?: string;
+    onOpenProject: () => void;
+    onSaveProject: () => void;
   } = $props();
 
   const steps: { id: Screen; label: string }[] = [
@@ -76,6 +80,24 @@
     {/each}
   </div>
   <div class="rail-actions">
+    <div class="project-actions" role="group" aria-label="Project">
+      <button
+        type="button"
+        class="project-action"
+        title="Open a .reco project"
+        onclick={onOpenProject}
+      >
+        Open project
+      </button>
+      <button
+        type="button"
+        class="project-action"
+        title="Save the current work as a .reco project"
+        onclick={onSaveProject}
+      >
+        Save project
+      </button>
+    </div>
     <button
       type="button"
       class="system-toggle"
@@ -159,6 +181,28 @@
     gap: var(--space-xs);
   }
 
+  .project-actions {
+    display: flex;
+    align-items: center;
+    gap: var(--space-xs);
+  }
+
+  .project-action {
+    padding: var(--space-xs) var(--space-sm);
+    border: 1px solid transparent;
+    border-radius: var(--space-xs);
+    background: transparent;
+    color: var(--color-body-text);
+    font-family: var(--font-ui);
+    font-size: var(--text-body);
+    cursor: pointer;
+  }
+
+  .project-action:hover {
+    color: var(--color-accent);
+    border-color: var(--color-accent);
+  }
+
   .system-toggle {
     padding: var(--space-xs) var(--space-sm);
     border: 1px solid transparent;
@@ -182,6 +226,7 @@
 
   .step:focus-visible,
   .system-toggle:focus-visible,
+  .project-action:focus-visible,
   .log-toggle:focus-visible {
     outline: none;
     box-shadow: 0 0 0 2px var(--color-accent);
@@ -190,6 +235,7 @@
   @media (prefers-reduced-motion: reduce) {
     .step,
     .system-toggle,
+    .project-action,
     .log-toggle {
       transition: none;
     }

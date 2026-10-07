@@ -29,6 +29,7 @@
   import { fieldRoi } from "./lib/roi.svelte";
   import { exportStore } from "./lib/export.svelte";
   import { systemStore } from "./lib/system.svelte";
+  import { projectStore } from "./lib/project.svelte";
   import PreviewSurface from "./components/PreviewSurface.svelte";
   import Timeline from "./components/Timeline.svelte";
   import TimecodeReadout from "./components/TimecodeReadout.svelte";
@@ -44,6 +45,7 @@
   import SystemInfoScreen from "./components/SystemInfoScreen.svelte";
   import FieldRoiEditor from "./components/FieldRoiEditor.svelte";
   import ConfirmDialog from "./components/ConfirmDialog.svelte";
+  import RelocateDialog from "./components/RelocateDialog.svelte";
   import type { PresenterKind, Screen, ViewMode } from "./lib/types";
 
   // Chrome state (reported to the worker via set_chrome).
@@ -95,6 +97,9 @@
       // worker to probe the system and run the runtime preflight.
       await systemStore.init();
       void systemStore.refresh();
+      // Subscribe the project store (PROJ-01) before the reconcile too, so its
+      // ProjectSaved/ProjectOpened/ProjectMissingInputs listeners are live.
+      await projectStore.init();
       // Subscribe first, *then* ask the worker to re-assert its state. The
       // worker boots and imports before the webview has loaded, and the event
       // bridge only reaches listeners registered at emit time — so its opening
@@ -117,6 +122,7 @@
       fieldRoi.destroy();
       exportStore.destroy();
       systemStore.destroy();
+      projectStore.destroy();
     };
   });
 
@@ -335,6 +341,8 @@
     {calibrateEnabled}
     {previewEnabled}
     {exportEnabled}
+    onOpenProject={() => void projectStore.open()}
+    onSaveProject={() => void projectStore.save()}
   />
 
   {#if screen === "import"}
@@ -478,6 +486,15 @@
     destructive={true}
     onConfirm={handleConfirmCancel}
     onCancel={handleKeepRunning}
+  />
+
+  <!-- Project relocate (PROJ-01). Shown when an opened `.reco` references a
+       missing input; relocating restores the project, skipping leaves the app
+       unchanged (the open never partially restores). -->
+  <RelocateDialog
+    missing={projectStore.missing}
+    onRelocate={(role) => void projectStore.chooseRelocation(role)}
+    onSkip={() => projectStore.dismissMissing()}
   />
 </div>
 

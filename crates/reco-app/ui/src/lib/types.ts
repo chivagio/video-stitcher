@@ -377,6 +377,32 @@ export interface EncoderView {
   is_hardware: boolean;
 }
 
+/** One referenced camera input (mirror `project::ProjectInput`, PROJ-01). */
+export interface ProjectInput {
+  /** The local file path the project references (media is never copied). */
+  path: string;
+  /** The per-input lens override, or `null` for auto-detect. */
+  lens_override: LensCandidate | null;
+}
+
+/** The restored operator pose (mirror `project::PoseView`, PROJ-01). */
+export interface ProjectPoseView {
+  /** Yaw in radians. */
+  yaw: number;
+  /** Pitch in radians. */
+  pitch: number;
+  /** Vertical FOV in degrees. */
+  fov_degrees: number;
+}
+
+/** One missing project input (mirror `project::MissingInput`, PROJ-01). */
+export interface MissingInput {
+  /** Which camera the missing path belongs to. */
+  role: InputRole;
+  /** The missing path (shown verbatim in the relocate dialog). */
+  path: string;
+}
+
 /**
  * The probed system information (mirror `system::SystemInfoView`, DIAG-01).
  *
@@ -553,6 +579,20 @@ export type WorkerEventTyped =
   | { kind: "system_info"; data: { info: SystemInfoView } }
   | { kind: "preflight"; data: { report: PreflightReport } }
   | { kind: "log_record"; data: { record: LogRecord } }
+  | { kind: "project_saved"; data: { path: string } }
+  | {
+      kind: "project_opened";
+      data: {
+        path: string;
+        left: ProjectInput;
+        right: ProjectInput;
+        calibration_path: string | null;
+        has_calibration: boolean;
+        pose: ProjectPoseView;
+        export: ExportSettings;
+      };
+    }
+  | { kind: "project_missing_inputs"; data: { missing: MissingInput[] } }
   | { kind: "log"; data: LogLine }
   | { kind: "failed"; data: unknown };
 
