@@ -60,7 +60,10 @@ pub fn variant_suffix(variant: ExportVariant) -> &'static str {
 ///
 /// The stem already comes from `Path::file_stem`, so it normally has no
 /// separator; this is defense-in-depth against a crafted name (`..`, a
-/// separator, or control characters) escaping the chosen directory. An empty
+/// separator, or control characters) escaping the chosen directory. It also
+/// maps the Windows-reserved characters (`< > : " | ? *`) to `_` so a stem
+/// carrying one cannot create an invalid filename or an NTFS alternate data
+/// stream (the `:` case) on a platform the app targets (IN-02). An empty
 /// result falls back to `"export"` so the output name is never degenerate.
 #[must_use]
 pub fn sanitize_stem(stem: &str) -> String {
@@ -68,6 +71,8 @@ pub fn sanitize_stem(stem: &str) -> String {
         .chars()
         .map(|c| match c {
             '/' | '\\' => '_',
+            // Windows-reserved: `< > : " | ? *` (and the path separators above).
+            '<' | '>' | ':' | '"' | '|' | '?' | '*' => '_',
             c if c.is_control() => '_',
             c => c,
         })
@@ -171,6 +176,16 @@ mod tests {
         assert_eq!(sanitize_stem("a/b"), "a_b");
         assert_eq!(sanitize_stem(".."), "export");
         assert_eq!(sanitize_stem(""), "export");
+        assert_eq!(sanitize_stem("clip"), "clip");
+    }
+
+    #[test]
+    fn sanitize_stem_maps_windows_reserved_characters() {
+        // IN-02: a `:` can create an NTFS alternate data stream; the rest are
+        // invalid in a Windows filename.
+        assert_eq!(sanitize_stem("a:b"), "a_b");
+        assert_eq!(sanitize_stem("a<b>c"), "a_b_c");
+        assert_eq!(sanitize_stem("a\"b|c?d*e"), "a_b_c_d_e");
         assert_eq!(sanitize_stem("clip"), "clip");
     }
 
