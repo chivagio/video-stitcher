@@ -600,6 +600,34 @@ impl EventSink {
         let _ = self.tx.send(event);
     }
 
+    /// Emit the probed system information (DIAG-01).
+    ///
+    /// The structured view rides the typed channel; the log line is a bounded
+    /// summary. Never fabricates a value — an unknown is `None` (the panel
+    /// renders `Not reported`).
+    fn system_info(&self, info: crate::system::SystemInfoView) {
+        let event = WorkerEvent::SystemInfo { info };
+        let line = event.to_log_line();
+        log::info!("{}", line.message);
+        let _ = self.tx.send(event);
+    }
+
+    /// Emit the runtime preflight verdict (DIAG-05).
+    ///
+    /// A passing report is INFO; an incomplete one is a WARN naming the first
+    /// failed prerequisite and its remediation, so the log is never silent
+    /// about a missing prerequisite.
+    fn preflight(&self, report: crate::preflight::PreflightReport) {
+        let event = WorkerEvent::Preflight { report };
+        let line = event.to_log_line();
+        match line.level {
+            Level::Warn => log::warn!("{}", line.message),
+            Level::Error => log::error!("{}", line.message),
+            Level::Info => log::info!("{}", line.message),
+        }
+        let _ = self.tx.send(event);
+    }
+
     /// Emit that a manual calibration session opened (MANU-01 / MANU-03).
     ///
     /// Mirrored to the process log at INFO; the structured payload rides the
@@ -1710,6 +1738,20 @@ pub trait EngineBackend: Send {
     /// before exporting.
     fn preview_export_path(&self, settings: &crate::events::ExportSettings, events: &EventSink);
 
+    /// Probe the system and emit a typed `SystemInfo` (DIAG-01).
+    ///
+    /// The worker owns the probe; the webview never enumerates a GPU or an
+    /// encoder itself. The real backend reads its own live
+    /// [`reco_core::gpu::GpuContext`]; a GPU-free path reports the GPU fields as
+    /// unknown (never a fabricated value).
+    fn system_info(&self, events: &EventSink);
+
+    /// Run the runtime preflight and emit a typed `Preflight` (DIAG-05).
+    ///
+    /// A cheap job: it probes FFmpeg, ONNX Runtime (when built), and the webview
+    /// runtime and reports each with an actionable remediation on failure.
+    fn run_preflight(&self, events: &EventSink);
+
     /// Dispatch a transport-agnostic input intent to the worker's pose state.
     fn dispatch_intent(&mut self, intent: reco_control::ControlIntent);
 
@@ -2171,6 +2213,15 @@ fn handle_command<B: EngineBackend>(
             // EXPT-06: pure path resolution — the worker owns the path the
             // webview shows; no job, no encoder, no calibration required.
             backend.preview_export_path(&settings, events);
+        }
+        WorkerCommand::SystemInfo => {
+            // DIAG-01: probe the system on demand; the webview renders the typed
+            // view and never enumerates a GPU or encoder itself.
+            backend.system_info(events);
+        }
+        WorkerCommand::RunPreflight => {
+            // DIAG-05: probe the runtime prerequisites on demand.
+            backend.run_preflight(events);
         }
         WorkerCommand::Intent(intent) => backend.dispatch_intent(intent),
         WorkerCommand::RepublishProjection => backend.republish_projection(events),
@@ -2781,8 +2832,24 @@ impl EngineWorker {
     pub fn spawn_with_manual_slot<B: EngineBackend + 'static>(
         backend: B,
     ) -> (Self, Receiver<WorkerEvent>, ManualFrameSlot) {
-        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
         let (evt_tx, evt_rx) = std::sync::mpsc::channel();
+        Self::spawn_with_events(backend, evt_tx, evt_rx)
+    }
+
+    /// Spawn the worker over an **externally-created** event channel (DIAG-02).
+    ///
+    /// The app path uses this so the structured-log tracing layer (`main.rs`'s
+    /// `UiLogLayer`) and the worker's [`EventSink`] share one event sender: the
+    /// layer forwards engine records into the same stream the Tauri bridge
+    /// drains, so a record reaches the LogViewer with no second channel. Tests
+    /// keep the two-tuple [`Self::spawn`] / [`Self::spawn_with_manual_slot`]
+    /// forms, which create a private channel.
+    pub fn spawn_with_events<B: EngineBackend + 'static>(
+        backend: B,
+        evt_tx: Sender<WorkerEvent>,
+        evt_rx: Receiver<WorkerEvent>,
+    ) -> (Self, Receiver<WorkerEvent>, ManualFrameSlot) {
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
         let events = EventSink::new(evt_tx);
         let slot = events.manual_frame_slot();
         let handle = thread::Builder::new()
@@ -5717,6 +5784,17 @@ impl EngineBackend for GpuEngineBackend {
         }
     }
 
+    fn system_info(&self, events: &EventSink) {
+        // DIAG-01: report the adapter the app is actually using — the worker's
+        // own `GpuContext`, never a second one that could resolve differently.
+        events.system_info(crate::system::probe_system(Some(&self.gpu)));
+    }
+
+    fn run_preflight(&self, events: &EventSink) {
+        // DIAG-05: probe the shipped runtime prerequisites directly.
+        events.preflight(crate::preflight::run_preflight());
+    }
+
     fn dispatch_intent(&mut self, intent: reco_control::ControlIntent) {
         dispatch_intent(&mut self.pose, intent);
     }
@@ -6418,6 +6496,10 @@ impl GpuEngineBackend {
 /// created outside the worker. The caller supplies the `Instance` and the
 /// pre-built presenter chain (which owns the render targets).
 ///
+/// `log_tx` / `log_rx` are the shared event channel (DIAG-02): the structured-log
+/// tracing layer holds a clone of `log_tx`, so engine records and the worker's
+/// own events cross one stream that the bridge drains from `log_rx`.
+///
 /// Returns the worker, the event receiver, the **readback channel sender**
 /// (PREV-05), and the **manual-frame channel slot** (MANU-03): the Tauri command
 /// layer hands webview `Channel<Response>`s to the worker through them, which
@@ -6434,6 +6516,8 @@ pub fn spawn_gpu_worker(
     startup_fallback: Option<String>,
     calibration_cancel: Arc<AtomicBool>,
     export_cancel: Arc<AtomicBool>,
+    log_tx: Sender<WorkerEvent>,
+    log_rx: Receiver<WorkerEvent>,
 ) -> Result<SpawnedWorker, WorkerError> {
     let backend = GpuEngineBackend::new(
         instance,
@@ -6444,7 +6528,8 @@ pub fn spawn_gpu_worker(
         export_cancel,
     )?;
     let readback_tx = backend.readback_sender();
-    let (worker, events, manual_frame_slot) = EngineWorker::spawn_with_manual_slot(backend);
+    let (worker, events, manual_frame_slot) =
+        EngineWorker::spawn_with_events(backend, log_tx, log_rx);
     Ok((worker, events, readback_tx, manual_frame_slot))
 }
 
@@ -7845,6 +7930,19 @@ mod tests {
                 Ok(path) => events.export_path_preview(path.display().to_string()),
                 Err(e) => events.log(Level::Warn, e.to_string()),
             }
+        }
+
+        fn system_info(&self, events: &EventSink) {
+            self.record("system_info");
+            // The mock owns no GPU: the GPU fields are honestly unknown (the
+            // DIAG-01 "no GPU" edge probe), while the encoders/devices still
+            // probe through the real FFmpeg surface.
+            events.system_info(crate::system::probe_system(None));
+        }
+
+        fn run_preflight(&self, events: &EventSink) {
+            self.record("run_preflight");
+            events.preflight(crate::preflight::run_preflight());
         }
 
         fn dispatch_intent(&mut self, intent: reco_control::ControlIntent) {

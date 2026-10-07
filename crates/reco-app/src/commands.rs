@@ -145,6 +145,33 @@ pub async fn preview_export_path(
     state.send(WorkerCommand::PreviewExportPath { settings })
 }
 
+/// Probe the system information for the System Info panel (DIAG-01).
+///
+/// Thin, same contract as [`import`]: post `SystemInfo` and return; the worker
+/// emits the typed `SystemInfo` event. The webview never enumerates a GPU or an
+/// encoder itself.
+///
+/// # Errors
+///
+/// Returns [`WorkerError::ChannelClosed`] if the worker has already exited.
+#[tauri::command]
+pub async fn system_info(state: tauri::State<'_, WorkerHandle>) -> Result<(), WorkerError> {
+    state.send(WorkerCommand::SystemInfo)
+}
+
+/// Run the runtime prerequisite preflight (DIAG-05).
+///
+/// Thin, same contract as [`import`]: post `RunPreflight` and return; the worker
+/// emits the typed `Preflight` report with a remediation per failed item.
+///
+/// # Errors
+///
+/// Returns [`WorkerError::ChannelClosed`] if the worker has already exited.
+#[tauri::command]
+pub async fn run_preflight(state: tauri::State<'_, WorkerHandle>) -> Result<(), WorkerError> {
+    state.send(WorkerCommand::RunPreflight)
+}
+
 /// Begin/continue playing the preview session (PREV-02).
 ///
 /// Thin, same contract as [`import`]: post `Play` and return. The worker owns
@@ -1155,6 +1182,19 @@ pub enum WorkerCommand {
         /// The typed export request the path is resolved for.
         settings: crate::events::ExportSettings,
     },
+
+    /// Probe the system for the System Info panel (DIAG-01).
+    ///
+    /// A cheap job: the worker reads its own GPU context, enumerates encoders,
+    /// and scans for camera devices, then emits a typed `SystemInfo`. The
+    /// webview never enumerates a GPU or an encoder itself.
+    SystemInfo,
+
+    /// Run the runtime prerequisite preflight (DIAG-05).
+    ///
+    /// A cheap job: the worker probes FFmpeg, ONNX Runtime (when detection is
+    /// built), and the webview runtime, then emits a typed `Preflight` report.
+    RunPreflight,
 
     /// Forward a transport-agnostic input intent (pan / zoom / quality) to the
     /// worker's pose state on the same message-passing path as the other

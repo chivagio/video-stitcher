@@ -28,7 +28,9 @@ mod commands;
 mod events;
 mod export_naming;
 mod hardcoded;
+mod preflight;
 mod presenter;
+mod system;
 mod transport;
 mod worker;
 
@@ -42,7 +44,12 @@ use tauri::Manager as _;
 ///
 /// The binary installs the subscriber once; libraries must not
 /// (CONVENTIONS.md). Mirrors `crates/reco-gui/src/main.rs:1223`.
-fn init_tracing() {
+///
+/// `log_tx` is the shared worker event sender (DIAG-02): [`system::UiLogLayer`]
+/// forwards each captured engine record as a typed `WorkerEvent::LogRecord`
+/// into the same stream the Tauri bridge drains, so the LogViewer shows the
+/// engine's structured records without a second channel.
+fn init_tracing(log_tx: std::sync::mpsc::Sender<events::WorkerEvent>) {
     use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
     let _ = tracing_log::LogTracer::init();
@@ -51,11 +58,18 @@ fn init_tracing() {
     let _ = tracing_subscriber::registry()
         .with(filter)
         .with(fmt::layer())
+        .with(system::UiLogLayer::new(log_tx))
         .try_init();
 }
 
 fn main() -> anyhow::Result<()> {
-    init_tracing();
+    // The shared structured-log channel (DIAG-02): the tracing layer installed
+    // below holds a clone of the sender, and the worker's `EventSink` uses the
+    // same sender, so engine records and worker events cross one stream the
+    // bridge drains. Created before `init_tracing` because the layer needs the
+    // sender; the receiver is moved into the app setup.
+    let (log_tx, log_rx) = std::sync::mpsc::channel::<events::WorkerEvent>();
+    init_tracing(log_tx.clone());
 
     tauri::Builder::default()
         // Official Tauri 2 dialog plugin (IMPT-01/05/06). Registration alone is
@@ -69,6 +83,8 @@ fn main() -> anyhow::Result<()> {
             commands::cancel_export,
             commands::probe_encoders,
             commands::preview_export_path,
+            commands::system_info,
+            commands::run_preflight,
             commands::play,
             commands::pause,
             commands::seek,
@@ -109,8 +125,8 @@ fn main() -> anyhow::Result<()> {
             commands::manual_save,
             commands::cancel_calibration
         ])
-        .setup(|app| {
-            if let Err(e) = run_skeleton(app) {
+        .setup(move |app| {
+            if let Err(e) = run_skeleton(app, log_tx, log_rx) {
                 // Surface the exact A1/A3 outcome rather than masking it: this
                 // is the walking-skeleton gate and a failure is a recorded
                 // verdict, not a silent no-op.
@@ -130,7 +146,11 @@ fn main() -> anyhow::Result<()> {
 /// Returns a typed error so the exact A1/A3 failure is visible (the caller logs
 /// it; the gate report (Plan 05) folds it in).
 #[cfg(all(unix, not(target_os = "macos")))]
-fn run_skeleton(app: &mut tauri::App) -> Result<(), SkeletonError> {
+fn run_skeleton(
+    app: &mut tauri::App,
+    log_tx: std::sync::mpsc::Sender<events::WorkerEvent>,
+    log_rx: std::sync::mpsc::Receiver<events::WorkerEvent>,
+) -> Result<(), SkeletonError> {
     // Ordering is load-bearing (RESEARCH Pitfall 1): the native child view must
     // be created BEFORE the chrome webview so the webview sits ABOVE it in
     // z-order. An above-webview native child would swallow pointer events over
@@ -245,6 +265,8 @@ fn run_skeleton(app: &mut tauri::App) -> Result<(), SkeletonError> {
         startup_fallback,
         std::sync::Arc::clone(&calibration_cancel),
         std::sync::Arc::clone(&export_cancel),
+        log_tx,
+        log_rx,
     )?;
     // The webview bridge: drain typed worker events on an async Tauri task and
     // forward each one to the frontend. The JS `listen("worker-event")` side
@@ -397,9 +419,16 @@ fn install_event_bridge(
         // `recv` blocks until an event arrives or the worker drops the sender
         // (at shutdown); both cases end the loop cleanly.
         while let Ok(event) = events.recv() {
-            let line = event.to_log_line();
-            if let Err(e) = tauri::Emitter::emit(&app, "worker-event", &line) {
-                log::warn!("failed to emit worker event: {e}");
+            // Structured log records (DIAG-02) are rendered by the LogViewer
+            // from the typed channel. They are NOT also mirrored as narrative
+            // lines: the worker's own `EventSink::log` already emits a `Log`
+            // event for each of its lines, so projecting a `LogRecord` here
+            // would duplicate every worker message in the drawer.
+            if !matches!(event, worker::WorkerEvent::LogRecord { .. }) {
+                let line = event.to_log_line();
+                if let Err(e) = tauri::Emitter::emit(&app, "worker-event", &line) {
+                    log::warn!("failed to emit worker event: {e}");
+                }
             }
             // The typed path (E5): forward the full serialized `WorkerEvent`
             // under its own event name so structured consumers (the import
@@ -418,7 +447,11 @@ fn install_event_bridge(
 /// Builds the window + a fallback presenter that reports `Unsupported` (D-05)
 /// so a Wayland-only / unported build still links and reports cleanly.
 #[cfg(not(all(unix, not(target_os = "macos"))))]
-fn run_skeleton(app: &mut tauri::App) -> Result<(), SkeletonError> {
+fn run_skeleton(
+    app: &mut tauri::App,
+    _log_tx: std::sync::mpsc::Sender<events::WorkerEvent>,
+    _log_rx: std::sync::mpsc::Receiver<events::WorkerEvent>,
+) -> Result<(), SkeletonError> {
     let _window = build_window(app)?;
     let rect = ViewportRect::for_chrome(1280, 800, &ChromeState::default());
     let presenter = presenter::fallback::FallbackPresenter::new(

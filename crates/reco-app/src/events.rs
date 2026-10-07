@@ -1302,6 +1302,36 @@ pub enum WorkerEvent {
         /// The collision-free absolute output path the worker resolved.
         path: String,
     },
+
+    /// The probed system information for the System Info panel (DIAG-01).
+    ///
+    /// Carries the typed [`SystemInfoView`](crate::system::SystemInfoView) so
+    /// the webview renders GPU/backend/driver, encoders, and devices verbatim;
+    /// an unknown value is `None` and renders `Not reported` (never a
+    /// fabricated `0`).
+    SystemInfo {
+        /// The probed system view.
+        info: crate::system::SystemInfoView,
+    },
+
+    /// The runtime preflight verdict (DIAG-05).
+    ///
+    /// Carries the typed [`PreflightReport`](crate::preflight::PreflightReport)
+    /// so the panel renders each prerequisite's pass/fail and remediation.
+    Preflight {
+        /// The per-prerequisite report.
+        report: crate::preflight::PreflightReport,
+    },
+
+    /// One structured engine log record captured by the tracing layer (DIAG-02).
+    ///
+    /// The webview renders the typed record (`level · target · message`) and
+    /// never regex-parses log text. Bounded in volume by the subscriber's
+    /// `EnvFilter` and the LogViewer's 2000-line cap (T-05-12).
+    LogRecord {
+        /// The structured record.
+        record: crate::system::LogRecord,
+    },
 }
 
 /// The UI-facing shape of an event-log line (UI-SPEC Event Log Contract).
@@ -1768,6 +1798,46 @@ impl WorkerEvent {
                 level: Level::Info,
                 message: format!("export output path: {path}"),
             },
+            // The System Info panel's structured view rides the typed channel;
+            // the log line is a bounded summary.
+            WorkerEvent::SystemInfo { info } => LogLine {
+                level: Level::Info,
+                message: format!(
+                    "system info: {} / {} / {}, {} encoder(s), {} device(s)",
+                    info.gpu_name.as_deref().unwrap_or("Not reported"),
+                    info.backend.as_deref().unwrap_or("Not reported"),
+                    info.driver.as_deref().unwrap_or("Not reported"),
+                    info.encoders.len(),
+                    info.devices.len(),
+                ),
+            },
+            // A passing preflight is INFO; an incomplete one is a WARN naming the
+            // first failed prerequisite so the log is not silent about it.
+            WorkerEvent::Preflight { report } => LogLine {
+                level: if report.all_ok {
+                    Level::Info
+                } else {
+                    Level::Warn
+                },
+                message: match report.items.iter().find(|item| !item.ok) {
+                    Some(first) => format!(
+                        "runtime prerequisites incomplete: {} — {}",
+                        first.label, first.remediation
+                    ),
+                    None => "runtime prerequisites OK".to_string(),
+                },
+            },
+            // Engine records arrive as typed `LogRecord` events and are rendered
+            // by the LogViewer; the narrative projection carries the level word
+            // and target so a log-only consumer still sees them (DIAG-02).
+            WorkerEvent::LogRecord { record } => LogLine {
+                level: match record.level.as_str() {
+                    "error" => Level::Error,
+                    "warn" => Level::Warn,
+                    _ => Level::Info,
+                },
+                message: format!("[{}] {}", record.target, record.message),
+            },
         }
     }
 }
@@ -1865,6 +1935,12 @@ const _: fn() = || {
     assert_clone_send::<ExportPreset>();
     assert_clone_send::<ExportVariant>();
     assert_clone_send::<EncoderView>();
+    // DIAG-01 / DIAG-02 / DIAG-05: the system, log, and preflight DTOs cross
+    // the same worker→UI boundary.
+    assert_clone_send::<crate::system::SystemInfoView>();
+    assert_clone_send::<crate::system::LogRecord>();
+    assert_clone_send::<crate::preflight::PreflightReport>();
+    assert_clone_send::<crate::preflight::PreflightItem>();
 };
 
 #[cfg(test)]
