@@ -80,11 +80,14 @@ impl Default for StackedEncoderConfig {
                 audio_source: None,
                 audio_start_time: 0.0,
                 // Short GOP so replay readers see recent
-                // frames within ~1 second. For Matroska the
-                // GOP controls cluster cadence; for fMP4 it
-                // would control fragment cadence. 30 frames
-                // at 30fps costs ~5-10% bitrate vs the libx264
-                // default of 250.
+                // frames within ~1 second. For fMP4 this
+                // controls fragment cadence; for Matroska it
+                // only controls keyframe cadence - the muxer
+                // buffers whole clusters until its own time/
+                // size limit, so replay freshness comes from
+                // the explicit muxer flush in `flush_to_disk`,
+                // not from the GOP. 30 frames at 30fps costs
+                // ~5-10% bitrate vs the libx264 default of 250.
                 gop_size: Some(30),
                 stream_url: None,
             },

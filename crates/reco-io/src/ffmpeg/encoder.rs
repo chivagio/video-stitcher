@@ -494,6 +494,10 @@ pub struct VideoEncoder {
     width: u32,
     height: u32,
     finished: bool,
+    /// Output container. Recorded so [`Self::flush_to_disk`] can choose the
+    /// muxer-level flush that is safe for this container (fMP4 and Matroska
+    /// disagree about what a NULL packet means).
+    container: Container,
     encoder_name: String,
     /// Reusable frame buffers to avoid per-frame allocation.
     rgba_frame: VideoFrame,
@@ -747,6 +751,7 @@ impl VideoEncoder {
                         width,
                         height,
                         finished: false,
+                        container: config.container,
                         encoder_name: name.to_string(),
                         rgba_frame: VideoFrame::new(Pixel::RGBA, width, height),
                         yuv_frame: VideoFrame::new(staging_pixel_format(*pixel_fmt), width, height),
@@ -1409,22 +1414,41 @@ impl VideoEncoder {
     /// they've actually hit disk. Call periodically (e.g. every
     /// keyframe) from the stacked-video replay path.
     ///
-    /// `av_write_frame(ctx, NULL)` prompts the muxer to emit any
-    /// queued packets; `avio_flush` then forces the AVIO layer to
-    /// write its buffer to the OS. Both are safe to call multiple
-    /// times and at any point after `write_header`.
+    /// Two layers can hold bytes back:
+    ///
+    /// 1. The muxer. The Matroska muxer accumulates packets into a
+    ///    `Cluster` and only emits it when the cluster time/size
+    ///    limit is reached, so without a muxer flush a reader sees
+    ///    nothing but the header for the first several seconds of a
+    ///    recording. `av_write_frame(ctx, NULL)` is ffmpeg's
+    ///    documented "flush the muxer" call and forces that pending
+    ///    cluster out.
+    /// 2. The AVIO layer, whose 32 KiB buffer is pushed to the file
+    ///    descriptor by `avio_flush`.
+    ///
+    /// The NULL flush is container-sensitive: fMP4's `frag_keyframe`
+    /// mode treats a NULL packet as "close the current fragment",
+    /// which then clashes with the subsequent `write_trailer` on
+    /// [`Self::finish`] (observed as `AVERROR -105`). fMP4 already
+    /// emits a self-contained fragment per keyframe, so `avio_flush`
+    /// alone is enough there; we only issue the muxer flush for
+    /// Matroska, where it is both necessary and safe.
     pub fn flush_to_disk(&mut self) -> Result<(), EncodeError> {
         // SAFETY: `octx` is a live output context (created in
-        // `new`, never dropped until `Drop` runs). `avio_flush` is
-        // safe on any live AVIO and doesn't alter muxer state -
-        // just forces the output-layer buffer to the file
-        // descriptor. We intentionally avoid
-        // `av_write_frame(ctx, NULL)` because fMP4's
-        // `frag_keyframe` mode treats that as "close current
-        // fragment" which clashes with the subsequent
-        // `write_trailer` on finish (observed as AVERROR -105).
+        // `new`, never dropped until `Drop` runs). `av_write_frame`
+        // with a NULL packet only asks the muxer to flush buffered
+        // data - it does not unref or own any packet - and
+        // `avio_flush` is safe on any live AVIO. Both are safe to
+        // call repeatedly and at any point after `write_header`.
         unsafe {
-            let pb = (*self.octx.as_mut_ptr()).pb;
+            let ctx = self.octx.as_mut_ptr();
+            if self.container == Container::Matroska {
+                let rc = ffmpeg::sys::av_write_frame(ctx, std::ptr::null_mut());
+                if rc < 0 {
+                    return Err(ffmpeg::Error::from(rc).into());
+                }
+            }
+            let pb = (*ctx).pb;
             if !pb.is_null() {
                 ffmpeg::sys::avio_flush(pb);
             }

@@ -162,11 +162,13 @@ fn roundtrip_matroska_recovers_tiles() {
 /// frames.
 /// Matroska write-while-read: the load-bearing M6.5-item-3 guarantee.
 /// A reader opened on the same file while the writer is still pushing
-/// frames must see already-flushed clusters. Matroska flushes clusters
-/// periodically (roughly every keyframe with a short GOP), and the
-/// container has no central index that needs the trailer to be
-/// readable - so a concurrent reader sees content as soon as it
-/// hits disk.
+/// frames must see already-flushed clusters. The container has no
+/// central index that needs the trailer to be readable, but ffmpeg's
+/// Matroska muxer accumulates packets into a `Cluster` and only emits
+/// it once its time/size limit is hit (seconds of video, not one GOP),
+/// so the writer must call [`StackedEncoder::flush`] to force the
+/// pending cluster out before a concurrent reader can see anything
+/// beyond the header. That flush is what this test exercises.
 #[test]
 fn matroska_reader_sees_partial_writes() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -176,9 +178,11 @@ fn matroska_reader_sees_partial_writes() {
     let mut enc =
         StackedEncoder::new(layout, &path, encoder_config(Container::Matroska)).expect("open");
 
-    // Push half the frames and flush so the AVIO layer writes to
-    // disk. Without flush(), ffmpeg buffers several clusters-worth
-    // of packets in memory before a single write.
+    // Push half the frames and flush so the muxer emits its pending
+    // cluster and the AVIO layer writes it to disk. Without flush(),
+    // the Matroska muxer buffers several clusters-worth of packets
+    // (seconds of video) before a single write, and a concurrent
+    // reader sees only the header.
     for i in 0..(N_FRAMES / 2) {
         let l = synthetic_tile(i, 0);
         let r = synthetic_tile(i, 1);
