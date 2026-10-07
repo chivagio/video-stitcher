@@ -342,9 +342,32 @@ pub struct ChromeState {
     /// Defaults to [`Screen::Import`] so the app lands on Import and the native
     /// view starts suspended until the operator reaches Preview.
     pub active_screen: Screen,
+    /// Whether a webview modal dialog is currently open over the app.
+    ///
+    /// A modal (the `.reco` relocate dialog, the cancel-calibration confirm)
+    /// paints a full-window backdrop, but on X11 the native child view is a
+    /// separate window that composites **above** the webview. A modal opened
+    /// while Preview is active would therefore be hidden behind the live native
+    /// view and be unreachable by pointer. The frontend reports this flag so
+    /// Rust can suspend the native child whenever a modal is up, regardless of
+    /// the active screen — reusing the same [`SurfacePresenter::set_visible`]
+    /// path the Screen Router uses (no second mechanism). Defaults to `false`
+    /// (no modal).
+    pub modal_open: bool,
 }
 
 impl ChromeState {
+    /// Whether the native child view must be visible for this state.
+    ///
+    /// The single predicate the real backend and the test mock both call, so a
+    /// change to the suspend policy cannot drift between them. The native view
+    /// is live only on the Preview screen **and** only while no modal dialog is
+    /// open: an open modal must suspend it even on Preview, or the modal's
+    /// backdrop and controls are occluded by the native child window on X11.
+    pub fn native_view_visible(&self) -> bool {
+        self.active_screen == Screen::Preview && !self.modal_open
+    }
+
     /// The right controls panel's width in physical pixels for this state.
     pub fn panel_width(&self) -> u32 {
         if self.panel_expanded {
@@ -969,7 +992,40 @@ mod tests {
 
     #[test]
     fn chrome_state_defaults_to_the_import_screen() {
-        assert_eq!(ChromeState::default().active_screen, Screen::Import);
+        let chrome = ChromeState::default();
+        assert_eq!(chrome.active_screen, Screen::Import);
+        assert!(!chrome.modal_open, "no modal is open by default");
+        // The landing screen with no modal still suspends the native view.
+        assert!(!chrome.native_view_visible());
+    }
+
+    #[test]
+    fn native_view_visible_requires_preview_and_no_modal() {
+        // The single suspend predicate: live only on Preview AND with no modal
+        // open. An open modal must suspend the native child even on Preview,
+        // because it composites above the webview on X11 and would occlude the
+        // dialog.
+        let on_preview = ChromeState {
+            active_screen: Screen::Preview,
+            ..ChromeState::default()
+        };
+        assert!(on_preview.native_view_visible());
+
+        let preview_with_modal = ChromeState {
+            modal_open: true,
+            ..on_preview
+        };
+        assert!(
+            !preview_with_modal.native_view_visible(),
+            "an open modal suspends the native view even on Preview"
+        );
+
+        let import_with_modal = ChromeState {
+            active_screen: Screen::Import,
+            modal_open: true,
+            ..ChromeState::default()
+        };
+        assert!(!import_with_modal.native_view_visible());
     }
 
     #[test]

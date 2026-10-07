@@ -2228,12 +2228,14 @@ fn handle_command<B: EngineBackend>(
             panel_expanded,
             drawer_expanded,
             active_screen,
+            modal_open,
         } => {
             backend.set_chrome(
                 crate::presenter::ChromeState {
                     panel_expanded,
                     drawer_expanded,
                     active_screen,
+                    modal_open,
                 },
                 events,
             );
@@ -5527,10 +5529,13 @@ impl EngineBackend for GpuEngineBackend {
         }
 
         // UI-SPEC Screen Router (E6): the native view is suspended on
-        // Import/Calibrate, so never render a frame into a hidden surface. The
-        // session/transport/pose are left untouched — a tick that resumes on
-        // Preview continues from here (the transport is not advanced).
-        if self.chrome.active_screen != crate::presenter::Screen::Preview {
+        // Import/Calibrate and while a webview modal is open, so never render a
+        // frame into a hidden surface. The same `native_view_visible` predicate
+        // that drives `set_visible` gates the tick, so the two can never
+        // disagree. The session/transport/pose are left untouched — a tick that
+        // resumes on Preview (modal closed) continues from here (the transport
+        // is not advanced while suspended).
+        if !self.chrome.native_view_visible() {
             return Ok(());
         }
 
@@ -5855,10 +5860,15 @@ impl EngineBackend for GpuEngineBackend {
         // UI-SPEC Screen Router (E6): the native child view is live only on the
         // Preview screen. Import/Calibrate are opaque webview screens, so the
         // native view is suspended (X11 unmap) while either is active — no black
-        // or idle native surface may show through. Called here (a screen change
-        // boundary), never per tick; `set_visible` is idempotent (T-03-12).
-        self.presenter
-            .set_visible(chrome.active_screen == crate::presenter::Screen::Preview);
+        // or idle native surface may show through. It must ALSO be suspended
+        // while a webview modal is open, even on Preview: on X11 the native
+        // child composites above the webview, so an open modal would otherwise
+        // be hidden behind the live panorama and unreachable by pointer. Both
+        // conditions are folded into the shared `native_view_visible` predicate
+        // (the mock uses the same one, so they cannot drift). Called here (a
+        // screen/modal change boundary), never per tick; `set_visible` is
+        // idempotent (T-03-12).
+        self.presenter.set_visible(chrome.native_view_visible());
         self.reconfigure_viewport(events);
     }
 
@@ -7533,9 +7543,11 @@ mod tests {
         mock_export_delay: Duration,
         /// The mock's modelled native-view visibility (UI-SPEC Screen Router).
         ///
-        /// Mirrors the real backend's `presenter.set_visible(screen == Preview)`
-        /// so a worker test can observe the screen-driven visibility without a
-        /// GPU. Shared because the backend is moved onto the worker thread.
+        /// Mirrors the real backend's `presenter.set_visible(chrome.native_view_visible())`
+        /// — the same shared predicate, covering both the active screen and
+        /// whether a modal is open — so a worker test can observe the visibility
+        /// policy without a GPU. Shared because the backend is moved onto the
+        /// worker thread.
         screen_visible: Arc<std::sync::Mutex<Option<bool>>>,
         /// Whether a manual session is open in the mock (MANU-03).
         manual_open: bool,
@@ -8688,9 +8700,9 @@ mod tests {
 
         fn set_chrome(&mut self, chrome: crate::presenter::ChromeState, _events: &EventSink) {
             self.record("set_chrome");
-            // Mirror the real backend: the native view is live only on Preview.
-            *self.screen_visible.lock().unwrap() =
-                Some(chrome.active_screen == crate::presenter::Screen::Preview);
+            // Mirror the real backend through the SAME shared predicate, so the
+            // mock cannot drift from the suspend policy under test.
+            *self.screen_visible.lock().unwrap() = Some(chrome.native_view_visible());
         }
 
         fn resize_viewport(&mut self, _width: u32, _height: u32, _events: &EventSink) {
@@ -12222,6 +12234,7 @@ mod tests {
                 panel_expanded: true,
                 drawer_expanded: true,
                 active_screen: crate::presenter::Screen::Preview,
+                modal_open: false,
             })
             .unwrap();
         handle
@@ -12278,6 +12291,7 @@ mod tests {
                 panel_expanded: false,
                 drawer_expanded: false,
                 active_screen: crate::presenter::Screen::Import,
+                modal_open: false,
             })
             .unwrap();
         wait_for(Some(false));
@@ -12288,6 +12302,78 @@ mod tests {
                 panel_expanded: false,
                 drawer_expanded: false,
                 active_screen: crate::presenter::Screen::Preview,
+                modal_open: false,
+            })
+            .unwrap();
+        wait_for(Some(true));
+
+        handle.send(WorkerCommand::Shutdown).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            if ops.lock().unwrap().contains(&"shutdown") {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        let _ = worker.join(Duration::from_secs(2));
+    }
+
+    #[test]
+    fn set_chrome_modal_open_suspends_native_view_on_preview() {
+        // Regression: a webview modal (the `.reco` relocate dialog) can open
+        // while Preview is active. On X11 the native child view composites ABOVE
+        // the webview, so the live panorama would occlude the modal unless the
+        // modal-open signal suspends it — and it must be restored when the modal
+        // closes. The signal rides the same `SetChrome` path as the screen and
+        // the mock observes the shared `native_view_visible` predicate, so this
+        // proves the worker's protocol-level contract without a GPU.
+        let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let visible = Arc::new(std::sync::Mutex::new(None));
+        let (worker, _events) = EngineWorker::spawn(
+            MockBackend::new(Arc::clone(&ops)).with_screen_visible(Arc::clone(&visible)),
+        );
+        let handle = worker.handle();
+
+        let wait_for = |target: Option<bool>| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while std::time::Instant::now() < deadline {
+                if *visible.lock().unwrap() == target {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            panic!("timed out waiting for native visibility == {target:?}");
+        };
+
+        // Preview with no modal: the native view is live.
+        handle
+            .send(WorkerCommand::SetChrome {
+                panel_expanded: false,
+                drawer_expanded: false,
+                active_screen: crate::presenter::Screen::Preview,
+                modal_open: false,
+            })
+            .unwrap();
+        wait_for(Some(true));
+
+        // A modal opens while Preview stays active: the native view is suspended.
+        handle
+            .send(WorkerCommand::SetChrome {
+                panel_expanded: false,
+                drawer_expanded: false,
+                active_screen: crate::presenter::Screen::Preview,
+                modal_open: true,
+            })
+            .unwrap();
+        wait_for(Some(false));
+
+        // The modal closes: the native view is restored on the same screen.
+        handle
+            .send(WorkerCommand::SetChrome {
+                panel_expanded: false,
+                drawer_expanded: false,
+                active_screen: crate::presenter::Screen::Preview,
+                modal_open: false,
             })
             .unwrap();
         wait_for(Some(true));

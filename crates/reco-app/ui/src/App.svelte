@@ -62,6 +62,14 @@
   // the whole app; the Calibrate screen requests it via `onRequestCancel`.
   let cancelDialogOpen = $state(false);
 
+  // Whether any webview modal dialog is currently open. Both modals (the
+  // cancel-calibration confirm and the project relocate dialog) paint a
+  // full-window backdrop over the preview region, but on X11 the native child
+  // view is a separate window composited ABOVE the webview. Reporting this to
+  // Rust (through `set_chrome`) lets it suspend the native view while a modal is
+  // up, so the dialog is visible and pointer-reachable instead of occluded.
+  const modalOpen = $derived(cancelDialogOpen || projectStore.missing.length > 0);
+
   // Field ROI editor panel on Preview (CALB-09). It renders its own
   // webview-owned canvas in the controls region (never over the Rust-owned
   // native child view), so opening it expands the controls panel and the worker
@@ -126,14 +134,16 @@
     };
   });
 
-  // Report chrome state changes to the worker. The active screen is part of
-  // chrome state so Rust (the geometry/visibility authority) can suspend the
-  // native child view on Import/Calibrate and show it on Preview (D3-01/E6).
+  // Report chrome state changes to the worker. The active screen and whether a
+  // modal is open are both part of chrome state so Rust (the geometry/visibility
+  // authority) can suspend the native child view on Import/Calibrate, or while a
+  // modal is up, and show it on Preview otherwise (D3-01/E6).
   $effect(() => {
     void invoke("set_chrome", {
       panel_expanded: panelExpanded,
       drawer_expanded: drawerExpanded,
       active_screen: screen,
+      modal_open: modalOpen,
     });
   });
 

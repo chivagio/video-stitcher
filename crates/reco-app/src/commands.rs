@@ -348,8 +348,9 @@ pub async fn set_loop(
 /// Report the webview chrome's collapsible state (UI-SPEC Geometry authority).
 ///
 /// Thin: posts `SetChrome`; the worker recomputes the native viewport and the
-/// native view's visibility from the active screen (Import/Calibrate suspend
-/// it; Preview shows it). Names no engine type.
+/// native view's visibility from the active screen and whether a modal is open
+/// (Import/Calibrate suspend it; Preview shows it only while no modal is up).
+/// Names no engine type.
 ///
 /// # Why `rename_all = "snake_case"`
 ///
@@ -375,11 +376,13 @@ pub async fn set_chrome(
     panel_expanded: bool,
     drawer_expanded: bool,
     active_screen: crate::presenter::Screen,
+    modal_open: bool,
 ) -> Result<(), WorkerError> {
     state.send(WorkerCommand::SetChrome {
         panel_expanded,
         drawer_expanded,
         active_screen,
+        modal_open,
     })
 }
 
@@ -1389,6 +1392,13 @@ pub enum WorkerCommand {
         /// — never a string; an unknown value is rejected at the IPC boundary
         /// (T-03-11).
         active_screen: crate::presenter::Screen,
+        /// Whether a webview modal dialog is currently open over the app.
+        ///
+        /// The native child view composites above the webview on X11, so an open
+        /// modal must suspend it even on Preview (otherwise the modal is
+        /// occluded and unreachable by pointer). Carried on the same chrome
+        /// signal as the screen so the worker reuses one visibility path.
+        modal_open: bool,
     },
 
     /// Reconfigure the native viewport for a new window size (PREV-01/04).
@@ -1790,6 +1800,7 @@ mod tests {
                 panel_expanded: true,
                 drawer_expanded: false,
                 active_screen: crate::presenter::Screen::Calibrate,
+                modal_open: false,
             })
             .unwrap();
         handle
@@ -1817,7 +1828,8 @@ mod tests {
             WorkerCommand::SetChrome {
                 panel_expanded: true,
                 drawer_expanded: false,
-                active_screen: crate::presenter::Screen::Calibrate
+                active_screen: crate::presenter::Screen::Calibrate,
+                modal_open: false,
             }
         );
         assert_eq!(
