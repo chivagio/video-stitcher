@@ -46,12 +46,26 @@
 //! let calibration: MatchCalibration = serde_json::from_str(&json).unwrap();
 //! ```
 
+/// Hidden re-export of [`tracing`] so [`profile_scope!`] can name it through
+/// `$crate` at the call site.
+///
+/// `profile_scope!` is `#[macro_export]`ed, so its expansion is resolved in the
+/// *consumer's* crate. A bare `tracing::info_span!` therefore forced every
+/// consumer to depend on `tracing` directly whenever `reco-core/profiling` was
+/// enabled — including consumers that never enabled their own `profiling`
+/// feature (feature unification turns the macro on for them, producing
+/// `E0433: unresolved tracing`). Routing through `$crate::tracing` keeps the
+/// dependency owned by `reco-core`, which is the crate that gates it.
+#[cfg(feature = "profiling")]
+#[doc(hidden)]
+pub use tracing;
+
 /// Create a tracing span guard (no-op when `profiling` feature is disabled).
 #[cfg(feature = "profiling")]
 #[macro_export]
 macro_rules! profile_scope {
     ($name:expr) => {
-        let _span = tracing::info_span!($name).entered();
+        let _span = $crate::tracing::info_span!($name).entered();
     };
 }
 
