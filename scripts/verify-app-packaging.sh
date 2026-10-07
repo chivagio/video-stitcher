@@ -7,8 +7,10 @@
 # CI when the secrets exist); this script produces NO signature and never claims
 # one. See `.planning/phases/05-export-projects-diagnostics-distribution/05-02-PACKAGING-VERIFICATION.md`.
 #
-# Exit status: 0 when the config validates and the UI builds. The Linux bundle
-# build is best-effort — a missing bundler toolchain is recorded, not fatal.
+# Exit status: 0 when the config validates, the UI builds, and every bundle
+# build that was attempted succeeded. A bundle build that runs and FAILS is a
+# non-zero exit; a missing bundler toolchain (the build is skipped) is recorded,
+# not fatal.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -54,7 +56,7 @@ if command -v dpkg-deb >/dev/null 2>&1; then
     fi
   else
     DEB_STATUS="failed"
-    echo "    WARNING: deb bundle build failed (recorded, non-fatal)" >&2
+    echo "    ERROR: deb bundle build failed" >&2
   fi
 else
   DEB_STATUS="skipped-no-dpkg-deb"
@@ -83,4 +85,22 @@ echo "---- packaging summary ----"
 echo "deb:      $DEB_STATUS ${DEB_PATH}"
 echo "appimage: $APPIMAGE_STATUS"
 echo "signing:  credential-gated (not executed in this environment)"
+
+# The success signal must reflect the bundle outcomes, not merely that the
+# script reached the end: a build that ran and failed (or exited 0 without
+# producing its artifact) is a packaging regression, not a pass (WR-04).
+# `skipped-*` remains non-fatal — the toolchain was absent, so nothing failed.
+FAILED_REASON=""
+if [ "$DEB_STATUS" = "failed" ]; then
+  FAILED_REASON="deb build failed"
+elif [ "$DEB_STATUS" = "build-ok-no-deb" ]; then
+  FAILED_REASON="deb build reported success but produced no .deb"
+elif [ "$APPIMAGE_STATUS" = "failed" ]; then
+  FAILED_REASON="appimage build failed"
+fi
+
+if [ -n "$FAILED_REASON" ]; then
+  echo "PACKAGING VERIFY: FAIL ($FAILED_REASON)"
+  exit 1
+fi
 echo "PACKAGING VERIFY: PASS"
