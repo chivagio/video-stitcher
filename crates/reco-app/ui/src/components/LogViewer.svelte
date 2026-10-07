@@ -31,7 +31,9 @@
 
   const records = $derived(systemStore.filteredRecords);
   const total = $derived(systemStore.records.length);
-  const capped = $derived(total >= MAX_LOG_RECORDS);
+  // The store evicts only when the count exceeds the cap, so at exactly
+  // MAX_LOG_RECORDS nothing has been dropped yet (IN-07).
+  const capped = $derived(total > MAX_LOG_RECORDS);
 </script>
 
 <div class="log-viewer">
