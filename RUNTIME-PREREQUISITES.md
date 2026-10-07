@@ -15,19 +15,21 @@ prerequisite — this file documents what that panel reports.
 
 | Prerequisite | Platform | Why it is needed | Bundled with the installer? | Remediation |
 |---|---|---|---|---|
-| **FFmpeg shared libraries** (`libavcodec`, `libavformat`, `libavutil`, `libswscale`, `libavfilter`, `libavdevice`, `libswresample`) | Linux | Decode the camera clips and encode the stitched panorama. `reco-io` links these dynamically. | **Yes** — the Linux `deb` declares `Depends: libwebkit2gtk-4.1-0, libgtk-3-0`; FFmpeg libraries come from the distribution's FFmpeg runtime package. | `sudo apt install ffmpeg` (Debian/Ubuntu) or `sudo dnf install ffmpeg` (Fedora). |
-| **FFmpeg DLLs** | Windows | Same decode/encode path as above. | **Yes** — the release workflow downloads the BtbN `n7.1 win64-gpl-shared` build and the installer ships the `bin\*.dll` set alongside the app. | If a custom build omits them: download [BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds/releases) (`n7.1 win64-gpl-shared`), extract, and place the DLLs next to `reco-app.exe`. |
-| **FFmpeg libraries** | macOS | Same decode/encode path. | **Yes** — `brew install ffmpeg` provides the dylibs the release build links; the app bundle embeds what it links. | `brew install ffmpeg`. |
-| **ONNX Runtime** (`libonnxruntime`) | Linux / macOS / Windows | AI detection backends (camera control / subject tracking) when the `ort` feature is built. Loaded via `dlopen` (`load-dynamic`) so a missing runtime degrades to "detection unavailable" rather than failing to launch. | **Yes** — the release workflow bundles ONNX Runtime **1.24.4** (DirectML on Windows, CPU elsewhere) next to the binary; the app resolves it from its own directory (`$ORIGIN` / `@loader_path`). | Download the matching [ONNX Runtime release](https://github.com/microsoft/onnxruntime/releases/tag/v1.24.4) (`onnxruntime-linux-x64-1.24.4.tgz`, `onnxruntime-osx-arm64-1.24.4.tgz`, or the Windows NuGet package) and place `libonnxruntime.so` / `libonnxruntime.dylib` / `onnxruntime.dll` next to the app binary. |
+| **FFmpeg shared libraries** (`libavcodec`, `libavformat`, `libavutil`, `libswscale`, `libavfilter`, `libavdevice`, `libswresample`) | Linux | Decode the camera clips and encode the stitched panorama. `reco-io` links these dynamically. | **No** — the app installer does not ship FFmpeg libraries (the `deb` declares only `libwebkit2gtk-4.1-0, libgtk-3-0`). | `sudo apt install ffmpeg` (Debian/Ubuntu) or `sudo dnf install ffmpeg` (Fedora). |
+| **FFmpeg DLLs** | Windows | Same decode/encode path as above. | **No** — the app installer does not ship FFmpeg DLLs. (The `release.yml` *CLI* artifacts copy them; `release-app.yml` does not bundle them.) | Download [BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds/releases) (`n7.1 win64-gpl-shared`), extract, and place the DLLs next to `reco-app.exe`. |
+| **FFmpeg libraries** | macOS | Same decode/encode path. | **No** — the app bundle does not embed FFmpeg dylibs. | `brew install ffmpeg`. |
+| **ONNX Runtime** (`libonnxruntime`) | Linux / macOS / Windows | AI detection backends (camera control / subject tracking) when the `ort` feature is built. Loaded via `dlopen` (`load-dynamic`) so a missing runtime degrades to "detection unavailable" rather than failing to launch. | **No** — the app installer does not bundle ONNX Runtime. (`release.yml`'s CLI artifacts bundle 1.24.4; `release-app.yml` does not.) | Download the matching [ONNX Runtime release](https://github.com/microsoft/onnxruntime/releases/tag/v1.24.4) (`onnxruntime-linux-x64-1.24.4.tgz`, `onnxruntime-osx-arm64-1.24.4.tgz`, or the Windows NuGet package) and place `libonnxruntime.so` / `libonnxruntime.dylib` / `onnxruntime.dll` next to the app binary. |
 | **WebView2 runtime** | Windows | The app UI is a webview; Windows ships no built-in webview. | **Bootstrapped** — `bundle.windows.webviewInstallMode = downloadBootstrapper`: the NSIS/MSI installer downloads Microsoft's WebView2 bootstrapper from the official endpoint and installs it if absent. | Already handled by the installer. Manual: [WebView2 Evergreen Bootstrapper](https://developer.microsoft.com/microsoft-edge/webview2/) (Microsoft download page). |
 | **`webkit2gtk-4.1`** | Linux | The Tauri webview backend on Linux. | **Not bundled** — declared as a package dependency: `bundle.linux.deb.depends = ["libwebkit2gtk-4.1-0", "libgtk-3-0"]`, so the `deb` pulls it in. AppImage users install it manually. | `sudo apt install libwebkit2gtk-4.1-0 libgtk-3-0` (Debian/Ubuntu) or `sudo dnf install webkit2gtk4.1 gtk3` (Fedora). |
 | **WKWebView** | macOS | The Tauri webview backend on macOS. | **Yes** — part of the OS (WebKit). | None required. |
 
 ## Notes
 
-- **"Bundled" means shipped by the installer**, not statically linked. FFmpeg
-  and ONNX Runtime are distributed as shared libraries next to the app so the
-  same binary works across distributions without a system install.
+- **The app installer does not bundle FFmpeg or ONNX Runtime.** Both must be
+  installed at runtime per the table above. (`release.yml`'s *CLI* artifacts do
+  copy these shared libraries next to the CLI binary; `release-app.yml` does
+  not, and `crates/reco-app/tauri.conf.json` declares no `bundle.resources`.)
+  "Bundled" here means shipped by an installer, never statically linked.
 - **Linux package dependencies** are declared in
   `crates/reco-app/tauri.conf.json` under `bundle.linux.deb.depends`. The
   AppImage target cannot express package dependencies, so AppImage users must
@@ -45,6 +47,10 @@ prerequisite — this file documents what that panel reports.
 
 Signed/notarized installers (macOS Developer ID + notarization, Windows
 Authenticode) are produced by `.github/workflows/release-app.yml` **only when the
-signing secrets exist**; with no secrets the workflow produces unsigned Linux
-artifacts. The seven secret names and their acquisition lead time are recorded in
-`01-CREDENTIALS.md` §4. No signature is faked.
+signing secrets exist**. With no secrets, the workflow produces Linux artifacts
+with no signature and a macOS `.app`/`.dmg` that is **ad-hoc signed**
+(`bundle.macOS.signingIdentity: "-"`) but **not** notarized — ad-hoc signing is
+still a signature and is incompatible with notarization, so "no signature is
+faked" means no *Developer ID* signature is fabricated, not that the macOS
+artifact is entirely unsigned. The seven secret names and their acquisition lead
+time are recorded in `01-CREDENTIALS.md` §4.

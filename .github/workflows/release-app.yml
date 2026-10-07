@@ -4,10 +4,16 @@ name: Release App (Tauri)
 # and Linux (AppImage/deb), and signs/notarizes them ONLY when the signing
 # credentials are present as repository secrets (DIAG-04).
 #
-# With no signing secrets the workflow still builds and uploads UNSIGNED
-# artifacts; the signing steps are skipped, never failed (the DIAG-04 "no
-# secrets" edge probe). The seven secret names are recorded in
+# With no signing secrets the signing steps are skipped, never failed (the
+# DIAG-04 "no secrets" edge probe): Linux artifacts carry no signature and the
+# macOS `.app`/`.dmg` is ad-hoc signed (`bundle.macOS.signingIdentity: "-"`) but
+# not notarized. The seven secret names are recorded in
 # `.planning/phases/01-walking-skeleton-native-surface-gate/01-CREDENTIALS.md` §4.
+#
+# This workflow does NOT bundle FFmpeg or ONNX Runtime into the installer: the
+# downloads below support the build and are not copied into the bundle, and
+# `tauri.conf.json` declares no `bundle.resources`. The app requires those
+# runtimes to be installed at runtime — see RUNTIME-PREREQUISITES.md (WR-03).
 #
 # NOTE on the signing gates: GitHub Actions does NOT allow the `secrets`
 # context inside a step-level `if:` ("Secrets cannot be directly referenced in
@@ -82,6 +88,8 @@ jobs:
 
       # FFmpeg shared libraries for Windows — same BtbN n7.1 source the
       # existing `release.yml` uses so the app and CLI stay ABI-matched.
+      # These provide the build-time import libraries; this workflow does NOT
+      # copy the DLLs into the installer (see the header note / WR-03).
       - name: Install FFmpeg (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -104,8 +112,9 @@ jobs:
           echo "Bundled FFmpeg: $($asset.name)"
 
       # ONNX Runtime for AI detection — the same 1.24.4 artifacts `release.yml`
-      # bundles (DirectML on Windows, CPU elsewhere). Runtime prerequisites are
-      # documented in RUNTIME-PREREQUISITES.md.
+      # bundles for the CLI (DirectML on Windows, CPU elsewhere). This workflow
+      # does NOT copy them into the app installer; the app requires ONNX Runtime
+      # at runtime, per RUNTIME-PREREQUISITES.md (WR-03).
       - name: Download ONNX Runtime (Windows - DirectML)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -151,7 +160,8 @@ jobs:
       # macOS signing + notarization (credential-gated)
       # ------------------------------------------------------------------
       # Skipped entirely when APPLE_CERTIFICATE is absent; the build step then
-      # produces an unsigned `.app`/`.dmg`. No signature is ever faked.
+      # produces an ad-hoc-signed (not notarized) `.app`/`.dmg`. No Developer ID
+      # signature is ever faked (IN-08).
       - name: Import Apple Developer ID certificate
         if: runner.os == 'macOS' && env.APPLE_CERTIFICATE != ''
         env:
