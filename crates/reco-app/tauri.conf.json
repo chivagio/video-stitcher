@@ -25,6 +25,9 @@
     "icon": [
       "icons/icon.png"
     ],
+    "resources": {
+      "../../RUNTIME-PREREQUISITES.md": "RUNTIME-PREREQUISITES.md"
+    },
     "macOS": {
       "minimumSystemVersion": "11.0",
       "signingIdentity": "-",
@@ -45,7 +48,12 @@
       "deb": {
         "depends": [
           "libwebkit2gtk-4.1-0",
-          "libgtk-3-0"
+          "libgtk-3-0",
+          "libavcodec61",
+          "libavformat61",
+          "libavutil59",
+          "libswscale8",
+          "libswresample5"
         ]
       }
     }

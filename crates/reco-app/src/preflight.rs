@@ -18,6 +18,86 @@ use crate::events::EncoderView;
 /// Where a remediation sends the operator for the full install instructions.
 pub const PREREQUISITES_DOC: &str = "See RUNTIME-PREREQUISITES.md for install instructions.";
 
+/// The host platform, used to select a platform-specific install step.
+///
+/// Kept as a plain value (not a `cfg` inside the remediation strings) so the
+/// per-platform instructions are unit-testable on any host. Only the host
+/// variant is constructed outside tests; the others exist for the remediation
+/// table and the cross-platform tests (hence the scoped allow, matching
+/// [`OrtProbe::NotBuilt`]).
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Platform {
+    /// Linux (Debian/Ubuntu/Fedora and other distributions).
+    Linux,
+    /// macOS.
+    MacOs,
+    /// Windows.
+    Windows,
+}
+
+/// The platform this binary was compiled for.
+fn host_platform() -> Platform {
+    #[cfg(target_os = "windows")]
+    let platform = Platform::Windows;
+    #[cfg(target_os = "macos")]
+    let platform = Platform::MacOs;
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let platform = Platform::Linux;
+    platform
+}
+
+/// The actionable FFmpeg install step for `platform` (DIAG-05).
+///
+/// The app does not bundle FFmpeg: the Linux `deb` declares the runtime
+/// libraries as package dependencies, and macOS/Windows users install them per
+/// `RUNTIME-PREREQUISITES.md`. The step is platform-specific so the System Info
+/// panel never tells a Windows user to run `apt`.
+fn ffmpeg_remediation(platform: Platform) -> String {
+    let hint = match platform {
+        Platform::Linux => {
+            "Install the FFmpeg shared libraries the app links: `sudo apt install \
+             libavcodec61 libavformat61 libavutil59 libswscale8 libswresample5` \
+             (Debian/Ubuntu; the .deb already declares these) or \
+             `sudo dnf install ffmpeg-libs` (Fedora)."
+        }
+        Platform::MacOs => {
+            "Install FFmpeg with Homebrew: `brew install ffmpeg` (the .app bundle does \
+             not embed the FFmpeg dylibs)."
+        }
+        Platform::Windows => {
+            "Download the FFmpeg `n7.1 win64-gpl-shared` build from \
+             https://github.com/BtbN/FFmpeg-Builds/releases, extract it, and place its \
+             DLLs next to `reco-app.exe` (the installer does not bundle them)."
+        }
+    };
+    format!("{hint} {PREREQUISITES_DOC}")
+}
+
+/// The actionable ONNX Runtime install step for `platform` (DIAG-05).
+///
+/// ONNX Runtime is not a package dependency: the default build statically links
+/// `ort`'s prebuilt CPU runtime into the binary, and a `load-dynamic` build
+/// loads it at runtime. When the runtime is built but cannot initialise, the app
+/// degrades detection to "unavailable" rather than failing to launch — so this
+/// step names where the platform library must be placed.
+fn onnxruntime_remediation(platform: Platform) -> String {
+    let hint = match platform {
+        Platform::Linux => {
+            "Install ONNX Runtime and place `libonnxruntime.so` next to the app \
+             binary (or rebuild with the bundled `ort` backend)."
+        }
+        Platform::MacOs => {
+            "Install ONNX Runtime and place `libonnxruntime.dylib` next to the app \
+             binary."
+        }
+        Platform::Windows => {
+            "Install ONNX Runtime and place `onnxruntime.dll` next to `reco-app.exe`."
+        }
+    };
+    format!("{hint} {PREREQUISITES_DOC}")
+}
+
 /// One checked runtime prerequisite (DIAG-05).
 ///
 /// `ok` is the pass/fail verdict; `detail` is the observed evidence; and
@@ -83,10 +163,7 @@ fn ffmpeg_item(encoders: &[EncoderView]) -> PreflightItem {
         remediation: if ok {
             String::new()
         } else {
-            format!(
-                "Install the FFmpeg shared libraries (e.g. `sudo apt install ffmpeg` on \
-                 Debian/Ubuntu). {PREREQUISITES_DOC}"
-            )
+            ffmpeg_remediation(host_platform())
         },
     }
 }
@@ -146,14 +223,9 @@ fn onnxruntime_item(probe: OrtProbe) -> PreflightItem {
             format!("ONNX Runtime available (best provider: {best})"),
             String::new(),
         ),
-        OrtProbe::Unavailable { reason } => (
-            false,
-            reason,
-            format!(
-                "Install ONNX Runtime and place its library next to the app binary. \
-                 {PREREQUISITES_DOC}"
-            ),
-        ),
+        OrtProbe::Unavailable { reason } => {
+            (false, reason, onnxruntime_remediation(host_platform()))
+        }
     };
     PreflightItem {
         id: "onnxruntime".to_string(),
@@ -222,6 +294,50 @@ mod tests {
             "detail: {}",
             item.detail
         );
+    }
+
+    #[test]
+    fn ffmpeg_remediation_is_platform_specific_and_points_at_the_doc() {
+        // DIAG-05: a failing prerequisite must name the right install step for
+        // the platform, never a Linux-only `apt` line on Windows/macOS.
+        let linux = ffmpeg_remediation(Platform::Linux);
+        assert!(linux.contains("apt"), "linux: {linux}");
+        assert!(linux.contains("libavcodec61"), "linux: {linux}");
+        assert!(linux.contains("RUNTIME-PREREQUISITES"), "linux: {linux}");
+
+        let macos = ffmpeg_remediation(Platform::MacOs);
+        assert!(macos.contains("brew"), "macos: {macos}");
+        assert!(macos.contains("RUNTIME-PREREQUISITES"), "macos: {macos}");
+
+        let windows = ffmpeg_remediation(Platform::Windows);
+        assert!(windows.contains("BtbN"), "windows: {windows}");
+        assert!(windows.contains("DLL"), "windows: {windows}");
+        assert!(
+            windows.contains("RUNTIME-PREREQUISITES"),
+            "windows: {windows}"
+        );
+    }
+
+    #[test]
+    fn onnxruntime_remediation_names_the_platform_library() {
+        assert!(
+            onnxruntime_remediation(Platform::Linux).contains("libonnxruntime.so"),
+            "linux ORT remediation must name the .so"
+        );
+        assert!(
+            onnxruntime_remediation(Platform::MacOs).contains("libonnxruntime.dylib"),
+            "macOS ORT remediation must name the .dylib"
+        );
+        assert!(
+            onnxruntime_remediation(Platform::Windows).contains("onnxruntime.dll"),
+            "Windows ORT remediation must name the .dll"
+        );
+        for platform in [Platform::Linux, Platform::MacOs, Platform::Windows] {
+            assert!(
+                onnxruntime_remediation(platform).contains("RUNTIME-PREREQUISITES"),
+                "ORT remediation must point at the doc for {platform:?}"
+            );
+        }
     }
 
     #[test]
