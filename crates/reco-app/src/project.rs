@@ -219,12 +219,18 @@ impl RecoProject {
                 "version must be at least 1".to_string(),
             ));
         }
-        for (name, input) in [("left", &self.left), ("right", &self.right)] {
-            if input.path.trim().is_empty() {
-                return Err(ProjectError::Invalid(format!(
-                    "{name} input path must not be empty"
-                )));
-            }
+        // Every path the manifest supplies is untrusted input (T-05-14) and must
+        // satisfy the same local-file policy the command boundary applies, or a
+        // crafted manifest could smuggle an FFmpeg protocol/URL past the guard
+        // into `probe_video`, `MatchCalibration::from_file`, and the export
+        // output directory (CR-01 / T-03-01).
+        ensure_local_path(&self.left.path, "left input path")?;
+        ensure_local_path(&self.right.path, "right input path")?;
+        if let Some(calibration_path) = &self.calibration_path {
+            ensure_local_path(calibration_path, "calibration path")?;
+        }
+        if let Some(output_dir) = &self.export.output_dir {
+            ensure_local_path(output_dir, "export output directory")?;
         }
         validate_export(&self.export)?;
         Ok(())
@@ -258,6 +264,21 @@ impl RecoProject {
             InputRole::Left => self.left.path = path,
             InputRole::Right => self.right.path = path,
         }
+    }
+}
+
+/// Reject a manifest-supplied path that is not a local file (CR-01).
+///
+/// Reuses the shared [`crate::path_guard`] policy the command boundary applies,
+/// so the two cannot drift. `field` names the offending manifest field so the
+/// error is actionable.
+fn ensure_local_path(path: &str, field: &str) -> Result<(), ProjectError> {
+    match crate::path_guard::classify(path) {
+        None => Ok(()),
+        Some(violation) => Err(ProjectError::Invalid(format!(
+            "{field} {}",
+            violation.reason()
+        ))),
     }
 }
 
@@ -396,6 +417,38 @@ mod tests {
         let mut project = sample();
         project.export.width = 0;
         assert!(matches!(project.validate(), Err(ProjectError::Invalid(_))));
+    }
+
+    #[test]
+    fn from_json_rejects_non_local_manifest_paths() {
+        // CR-01 / T-05-14: a crafted `.reco` must not smuggle an FFmpeg
+        // protocol or URL past the command-boundary guard into `probe_video`,
+        // `MatchCalibration::from_file`, or the export output directory.
+        for malicious in ["http://attacker/left.mp4", "concat:/a|/b", "pipe:0"] {
+            let mut project = sample();
+            project.left.path = malicious.to_string();
+            assert!(
+                matches!(
+                    RecoProject::from_json(&project.to_json()),
+                    Err(ProjectError::Invalid(_))
+                ),
+                "left input {malicious:?} must be rejected"
+            );
+        }
+
+        let mut project = sample();
+        project.calibration_path = Some("https://attacker/match.json".to_string());
+        assert!(matches!(
+            RecoProject::from_json(&project.to_json()),
+            Err(ProjectError::Invalid(_))
+        ));
+
+        let mut project = sample();
+        project.export.output_dir = Some("data:application/octet-stream;base64,AAAA".to_string());
+        assert!(matches!(
+            RecoProject::from_json(&project.to_json()),
+            Err(ProjectError::Invalid(_))
+        ));
     }
 
     #[test]

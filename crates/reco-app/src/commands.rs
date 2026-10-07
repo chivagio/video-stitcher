@@ -638,21 +638,14 @@ pub async fn start_calibration(
 /// means the worker never opens a non-local path. Extracted as a pure function
 /// so the boundary check is unit-testable without a Tauri `State`.
 fn validate_profile_path(path: &str) -> Result<(), WorkerError> {
-    let trimmed = path.trim();
-    if trimmed.is_empty() {
+    // The same policy `reco_io::ffmpeg::calibration_io` applies before an FFmpeg
+    // open (the path-safety precedent for any FFmpeg invocation), shared with
+    // `crate::project::RecoProject::validate` so a `.reco` manifest cannot
+    // bypass the command boundary (T-03-01 / CR-01).
+    if let Some(violation) = crate::path_guard::classify(path) {
         return Err(WorkerError::InvalidInput {
             field: "path".to_string(),
-            reason: "path must not be empty".to_string(),
-        });
-    }
-    // The same prefix set `reco_io::ffmpeg::calibration_io` rejects before an
-    // FFmpeg open (the path-safety precedent for any FFmpeg invocation).
-    const FORBIDDEN_PREFIXES: &[&str] = &["http://", "https://", "concat:", "pipe:", "data:"];
-    let lower = trimmed.to_ascii_lowercase();
-    if FORBIDDEN_PREFIXES.iter().any(|p| lower.starts_with(p)) {
-        return Err(WorkerError::InvalidInput {
-            field: "path".to_string(),
-            reason: "path must be a local file, not a URL or ffmpeg protocol".to_string(),
+            reason: violation.reason().to_string(),
         });
     }
     Ok(())

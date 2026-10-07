@@ -29,6 +29,7 @@ mod diagnostics;
 mod events;
 mod export_naming;
 mod hardcoded;
+mod path_guard;
 mod preflight;
 mod presenter;
 mod project;
