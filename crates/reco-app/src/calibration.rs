@@ -357,6 +357,9 @@ pub fn project_scorecard(result: &CalibrationResult) -> Scorecard {
         per_frame_matches,
         frames_used: result.frames_used as u64,
         lens_profile,
+        // The left camera's solved k1 is the profile value the opt-in refine
+        // action will refine (INTR-03); carried so its aria-label can name it.
+        k1: result.calibration.left.d[0],
         sync: {
             // The provenance chain mark mirrors the method that produced the
             // offset; manual is the only path with no computed confidence.
@@ -1094,6 +1097,20 @@ mod tests {
         assert_eq!(confidence_band(0.5), ConfidenceBand::Medium);
         assert_eq!(confidence_band(0.49), ConfidenceBand::Low);
         assert_eq!(confidence_band(0.8), ConfidenceBand::High);
+    }
+
+    #[test]
+    fn project_scorecard_carries_the_left_camera_k1() {
+        // INTR-03 / UI-SPEC Accessibility: the scorecard carries the profile's
+        // solved k1 so the opt-in refine action can name the current value.
+        let mut result = sample_result();
+        result.calibration.left.d[0] = 0.1234;
+        let card = project_scorecard(&result);
+        assert!(
+            (card.k1 - 0.1234).abs() < 1e-12,
+            "the scorecard must carry the left camera's solved k1: {}",
+            card.k1
+        );
     }
 
     #[test]

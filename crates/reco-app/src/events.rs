@@ -421,7 +421,8 @@ pub struct SyncView {
     pub offset_semantics: String,
 }
 
-/// The CALB-03 scorecard — exactly the locked field set, no invented metrics.
+/// The CALB-03 scorecard — the locked field set plus the profile's solved
+/// `k1` (INTR-03), no invented metrics.
 ///
 /// Projected from a `CalibrationResult` by `calibration::project_scorecard`;
 /// every field maps to a real engine value. A missing value is `None`, never a
@@ -442,6 +443,12 @@ pub struct Scorecard {
     pub frames_used: u64,
     /// Resolved lens profile and source, if any.
     pub lens_profile: Option<LensProfileView>,
+    /// The profile's solved first radial distortion coefficient (`k1`).
+    ///
+    /// The value the opt-in `Refine lens (k1)` action will refine (INTR-03),
+    /// carried so the action's `aria-label` can name the current `k1` (UI-SPEC
+    /// Accessibility). Equal to the left camera's `d[0]` at calibration time.
+    pub k1: f64,
     /// Sync method and confidence.
     pub sync: SyncView,
 }
@@ -1946,6 +1953,7 @@ mod tests {
                 name: "GoPro HERO10 Wide".to_string(),
                 source: "database".to_string(),
             }),
+            k1: 0.0387,
             sync: SyncView {
                 method: SyncMethod::Imu,
                 confidence: None,

@@ -253,6 +253,8 @@ export interface Scorecard {
   per_frame_matches: number;
   frames_used: number;
   lens_profile: LensProfileView | null;
+  /** The profile's solved `k1`, the value the opt-in refine action will refine. */
+  k1: number;
   sync: SyncView;
 }
 

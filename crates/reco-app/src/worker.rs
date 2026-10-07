@@ -1909,6 +1909,9 @@ fn handle_command<B: EngineBackend>(
             }
         }
         WorkerCommand::RefineLens { heldout_fraction } => {
+            // UI-SPEC Event Log Contract: an INFO line when the request is
+            // received, distinct from the completion INFO/WARN the result emits.
+            events.info("Lens k1 refinement requested");
             if let Err(e) = backend.refine_lens(heldout_fraction, events) {
                 events.failed(e);
             }
@@ -5758,6 +5761,7 @@ mod tests {
             per_frame_matches: 300.0,
             frames_used: 3,
             lens_profile: None,
+            k1: 0.072,
             sync: crate::events::SyncView {
                 method: crate::events::SyncMethod::None,
                 confidence: None,
@@ -8332,6 +8336,46 @@ mod tests {
     }
 
     #[test]
+    fn refine_lens_request_emits_an_info_log_line() {
+        // UI-SPEC Event Log Contract: an INFO line is emitted when the refine
+        // request is received, distinct from the completion INFO/WARN.
+        let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (evt_tx, evt_rx) = std::sync::mpsc::channel();
+        let events = EventSink::new(evt_tx);
+        let interrupted = AtomicBool::new(false);
+        let mut mock = MockBackend::new(Arc::clone(&ops));
+
+        assert!(handle_command(
+            WorkerCommand::LoadProfile {
+                path: "/media/match.json".to_string(),
+            },
+            &mut mock,
+            &events,
+            &interrupted,
+        ));
+        // Drop the load's own log lines so only the refine request is examined.
+        let _ = evt_rx.try_iter().count();
+
+        assert!(handle_command(
+            WorkerCommand::RefineLens {
+                heldout_fraction: 0.2,
+            },
+            &mut mock,
+            &events,
+            &interrupted,
+        ));
+
+        assert!(
+            evt_rx.try_iter().any(|e| matches!(
+                e,
+                WorkerEvent::Log { level: Level::Info, message }
+                    if message == "Lens k1 refinement requested"
+            )),
+            "the refine request must emit the UI-SPEC INFO line"
+        );
+    }
+
+    #[test]
     fn refine_verified_lens_refuses_with_no_retained_matches() {
         // CR-01: after a profile load there are no retained verified matches, so
         // the shared refinement path must refuse with a clear, actionable typed
@@ -9990,9 +10034,11 @@ mod tests {
             thread::sleep(Duration::from_millis(5));
         }
         let _ = worker.join(Duration::from_secs(2));
+        // The loop's per-iteration pointer drain interleaves with the command
+        // batch, so filter it before asserting the command ordering.
         assert_eq!(
-            &*ops.lock().unwrap(),
-            &["set_chrome", "resize_viewport", "shutdown"]
+            ops_without_pointer_drain(&ops),
+            ["set_chrome", "resize_viewport", "shutdown"]
         );
     }
 

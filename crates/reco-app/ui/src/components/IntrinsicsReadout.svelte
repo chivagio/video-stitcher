@@ -78,7 +78,12 @@
       <InlineNotice level="warn" message={refinement.reason} />
     </div>
   {:else}
-    <p id="intrinsics-readout-reason" class="reason">{refinement.reason}</p>
+    <!-- Symmetric with the rejected branch's `InlineNotice` (`role="status"`):
+         an accepted verdict is announced politely rather than arriving silently.
+         The two branches are mutually exclusive, so the reason is announced once. -->
+    <p id="intrinsics-readout-reason" class="reason" role="status" aria-live="polite">
+      {refinement.reason}
+    </p>
   {/if}
 
   <p class="fixed-note">

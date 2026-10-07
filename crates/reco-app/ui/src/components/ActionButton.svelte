@@ -10,12 +10,15 @@
     variant = "secondary",
     disabled = false,
     title,
+    ariaLabel,
     onClick,
     children,
   }: {
     variant?: "primary" | "secondary" | "destructive";
     disabled?: boolean;
     title?: string;
+    /** Accessible name; overrides the visible label when the action needs more context. */
+    ariaLabel?: string | undefined;
     onClick: () => void;
     children: Snippet;
   } = $props();
@@ -26,6 +29,7 @@
   class="action-btn {variant}"
   {disabled}
   title={title ?? ""}
+  aria-label={ariaLabel}
   onclick={onClick}
 >
   {@render children()}

@@ -46,6 +46,19 @@
   // fully operable on this screen regardless of the presenter.
   let fieldRoiOpen = $state(false);
 
+  // The current profile `k1` the opt-in refine action will refine (UI-SPEC
+  // Accessibility: the action's `aria-label` names the action and the current
+  // `k1`). Once a refinement has run, the readout holds the profile's current
+  // value; before that, the calibration result carries the solved `k1`.
+  const currentK1 = $derived(
+    calibration.intrinsicsRefinement?.k1 ?? calibration.result?.k1 ?? null,
+  );
+  const refineAriaLabel = $derived(
+    currentK1 === null
+      ? undefined
+      : `Refine lens (k1); current k1 ${currentK1.toFixed(4)}`,
+  );
+
   function handleStart(): void {
     if (!advancedValid) return;
     void calibration.start(options);
@@ -86,6 +99,7 @@
           variant="secondary"
           disabled={calibration.refining}
           title="Refine the lens k1 against the verified matches (opt-in)"
+          ariaLabel={refineAriaLabel}
           onClick={() => void calibration.refineLens()}
         >
           <Icon name="wrench" />
