@@ -21,6 +21,7 @@
     calibrateEnabled = false,
     previewEnabled = false,
     exportEnabled = false,
+    exportRunning = false,
     calibrateReason = "Select two clips to calibrate.",
     previewReason = "Calibrate first.",
     exportReason = "Calibrate first.",
@@ -34,6 +35,12 @@
     calibrateEnabled?: boolean;
     previewEnabled?: boolean;
     exportEnabled?: boolean;
+    /**
+     * Whether an export is in flight. The UI-SPEC modal-export contract disables
+     * the rail (steps, project actions, System, Log) so the progress state owns
+     * the screen and the operator cannot navigate away mid-run.
+     */
+    exportRunning?: boolean;
     calibrateReason?: string;
     previewReason?: string;
     exportReason?: string;
@@ -49,6 +56,7 @@
   ];
 
   function isEnabled(id: Screen): boolean {
+    if (exportRunning) return false;
     if (id === "import") return true;
     if (id === "calibrate") return calibrateEnabled;
     if (id === "preview") return previewEnabled;
@@ -56,6 +64,7 @@
   }
 
   function reasonFor(id: Screen): string {
+    if (exportRunning) return "Export in progress.";
     if (id === "calibrate" && !calibrateEnabled) return calibrateReason;
     if (id === "preview" && !previewEnabled) return previewReason;
     if (id === "export" && !exportEnabled) return exportReason;
@@ -84,7 +93,8 @@
       <button
         type="button"
         class="project-action"
-        title="Open a .reco project"
+        title={exportRunning ? "Export in progress." : "Open a .reco project"}
+        disabled={exportRunning}
         onclick={onOpenProject}
       >
         Open project
@@ -92,7 +102,8 @@
       <button
         type="button"
         class="project-action"
-        title="Save the current work as a .reco project"
+        title={exportRunning ? "Export in progress." : "Save the current work as a .reco project"}
+        disabled={exportRunning}
         onclick={onSaveProject}
       >
         Save project
@@ -103,7 +114,8 @@
       class="system-toggle"
       class:active={active === "system"}
       aria-current={active === "system" ? "page" : undefined}
-      title="System info and logs"
+      title={exportRunning ? "Export in progress." : "System info and logs"}
+      disabled={exportRunning}
       onclick={() => onNavigate("system")}
     >
       System
@@ -112,6 +124,8 @@
       type="button"
       class="log-toggle"
       aria-pressed={logExpanded}
+      title={exportRunning ? "Export in progress." : "Toggle the event log"}
+      disabled={exportRunning}
       onclick={onToggleLog}
     >
       Log
@@ -164,6 +178,14 @@
     cursor: default;
   }
 
+  /* While an export runs the whole rail is disabled (modal-export contract). */
+  .project-action:disabled,
+  .system-toggle:disabled,
+  .log-toggle:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+
   .log-toggle {
     padding: var(--space-xs) var(--space-sm);
     border: 1px solid transparent;
@@ -198,7 +220,7 @@
     cursor: pointer;
   }
 
-  .project-action:hover {
+  .project-action:hover:not(:disabled) {
     color: var(--color-accent);
     border-color: var(--color-accent);
   }

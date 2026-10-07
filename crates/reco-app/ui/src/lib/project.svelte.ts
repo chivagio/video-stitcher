@@ -74,9 +74,22 @@ class ProjectStore {
   error = $state<string | null>(null);
   /** The path of the last successful save (shown in the success line). */
   lastSavedPath = $state<string | null>(null);
+  /**
+   * A transient success confirmation for the operator, or null. Set to
+   * `Input relocated — project restored.` after a relocate completes (the
+   * UI-SPEC "Relocate resolved" copy); dismissed explicitly or on the next
+   * open.
+   */
+  notice = $state<string | null>(null);
 
   /** Unlisten function for the typed worker-event listener. */
   #unlisten: (() => void) | null = null;
+  /**
+   * Whether the current open is a relocate flow. Distinguishes a restore after
+   * relocating a missing input (which announces the contract confirmation) from
+   * a plain open (which is silent).
+   */
+  #relocating = false;
 
   /** Start listening for typed worker events. */
   async init(): Promise<void> {
@@ -135,6 +148,13 @@ class ProjectStore {
     this.missing = [];
     this.status = "opened";
     this.error = null;
+
+    // A restore that followed a relocate announces the declared confirmation;
+    // a plain open is silent (UI-SPEC "Relocate resolved").
+    if (this.#relocating) {
+      this.notice = "Input relocated — project restored.";
+      this.#relocating = false;
+    }
 
     // Inputs: set the referenced paths; the worker's ImportMetadata /
     // LensOverrideApplied events (emitted during the restore) fill in the
@@ -208,6 +228,9 @@ class ProjectStore {
       this.status = "opening";
       this.error = null;
       this.missing = [];
+      // A plain open is silent; clear any pending relocate confirmation.
+      this.#relocating = false;
+      this.notice = null;
       await invoke("open_project", { path: selected });
     } catch (e) {
       this.status = "error";
@@ -226,6 +249,9 @@ class ProjectStore {
     try {
       this.status = "opening";
       this.error = null;
+      // Mark this restore as a relocate so its completion announces the
+      // contract confirmation.
+      this.#relocating = true;
       await invoke("relocate_project_input", { role, path });
     } catch (e) {
       this.status = "error";
@@ -257,6 +283,12 @@ class ProjectStore {
   dismissMissing(): void {
     this.missing = [];
     this.status = "idle";
+    this.#relocating = false;
+  }
+
+  /** Dismiss the transient relocate-success confirmation. */
+  dismissNotice(): void {
+    this.notice = null;
   }
 
   /** Derive `<left-stem>_<right-stem>.reco` from the input names (PROJ-01). */

@@ -271,6 +271,10 @@
 
   // Keyboard routing (focus-scoped).
   function handleGlobalKeyDown(e: KeyboardEvent): void {
+    // Modal export owns the screen: the Preview transport/pose shortcuts are
+    // disabled while a run is in flight, and the export's own controls (Cancel,
+    // Copy path) keep native keyboard behavior (UI-SPEC modal-export contract).
+    if (exportRunning) return;
     // Never hijack a text field: the lens search and the advanced number
     // inputs need Space, `l`, `v`, etc. to type, not to drive playback (WR-04).
     const target = e.target as HTMLElement | null;
@@ -337,6 +341,10 @@
   // Export needs the same valid calibration result (EXPT-01 edge probe: the
   // Export step is disabled with a reason until a result exists).
   const exportEnabled = $derived(previewEnabled);
+  // Modal export (UI-SPEC Interaction & State Contract): while a run is in
+  // flight the rail and Preview controls are disabled and the progress state
+  // owns the screen. The store is the authority for the in-flight state.
+  const exportRunning = $derived(exportStore.status === "running");
 </script>
 
 <svelte:window onkeydown={handleGlobalKeyDown} />
@@ -351,6 +359,7 @@
     {calibrateEnabled}
     {previewEnabled}
     {exportEnabled}
+    {exportRunning}
     onOpenProject={() => void projectStore.open()}
     onSaveProject={() => void projectStore.save()}
   />
@@ -367,7 +376,7 @@
   {:else if screen === "export"}
     <!-- Modal Export screen (EXPT-01/02/04). The native view is suspended by
          Rust on this screen; the webview owns the whole surface. -->
-    <ExportScreen />
+    <ExportScreen {formatTimecode} />
   {:else if screen === "system"}
     <!-- System Info + structured logs (DIAG-01/02/05). Opaque; Rust suspends
          the native view on this screen. -->
@@ -506,6 +515,22 @@
     onRelocate={(role) => void projectStore.chooseRelocation(role)}
     onSkip={() => projectStore.dismissMissing()}
   />
+
+  <!-- Relocate resolved (UI-SPEC "Relocate resolved"): a transient, dismissible
+       confirmation that the project was restored after relocating an input. -->
+  {#if projectStore.notice !== null}
+    <div class="project-notice" role="status" aria-live="polite">
+      <span class="project-notice-text">{projectStore.notice}</span>
+      <button
+        type="button"
+        class="project-notice-dismiss"
+        aria-label="Dismiss notice"
+        onclick={() => projectStore.dismissNotice()}
+      >
+        Dismiss
+      </button>
+    </div>
+  {/if}
 </div>
 
 <style>
@@ -575,6 +600,45 @@
   }
 
   .field-roi-close:focus-visible {
+    outline: none;
+    box-shadow: 0 0 0 2px var(--color-accent);
+  }
+
+  /* Relocate-resolved confirmation (UI-SPEC "Relocate resolved"). A transient
+     strip below the rail; success word + colour, dismissible, polite live
+     region. */
+  .project-notice {
+    position: fixed;
+    top: calc(var(--workflow-rail-height) + var(--space-md));
+    left: 50%;
+    transform: translateX(-50%);
+    display: flex;
+    align-items: center;
+    gap: var(--space-md);
+    max-width: min(640px, calc(100% - var(--space-xl)));
+    padding: var(--space-sm) var(--space-md);
+    border-left: 3px solid var(--color-success);
+    border-radius: var(--space-xs);
+    background: var(--color-secondary);
+    color: var(--color-success);
+    font-size: var(--text-body);
+    overflow-wrap: anywhere;
+    z-index: 35;
+  }
+
+  .project-notice-dismiss {
+    flex: 0 0 auto;
+    padding: var(--space-xs) var(--space-sm);
+    border: 1px solid transparent;
+    border-radius: var(--space-xs);
+    background: transparent;
+    color: inherit;
+    font-family: var(--font-ui);
+    font-size: var(--text-body);
+    cursor: pointer;
+  }
+
+  .project-notice-dismiss:focus-visible {
     outline: none;
     box-shadow: 0 0 0 2px var(--color-accent);
   }
