@@ -6,10 +6,12 @@
 //! remediation string. The System Info panel renders the report; a failing item
 //! always carries a remediation (DIAG-05 prohibition: never a bare failure).
 //!
-//! Each item is probed **directly** (encoder enumeration, ORT provider
-//! registration, the platform webview backend), never hardcoded to pass
-//! (T-05-13). The documented prerequisite matrix lives in
-//! `RUNTIME-PREREQUISITES.md`, which every remediation points at.
+//! The FFmpeg and ONNX Runtime items are probed **directly** (encoder
+//! enumeration, ORT provider registration), never hardcoded to pass (T-05-13).
+//! The webview item is established by the fact the app is already running inside
+//! that webview — a direct observation of the running process, not a probe
+//! (IN-03) — and its `detail` says so. The documented prerequisite matrix lives
+//! in `RUNTIME-PREREQUISITES.md`, which every remediation points at.
 
 use crate::events::EncoderView;
 
@@ -166,7 +168,9 @@ fn onnxruntime_item(probe: OrtProbe) -> PreflightItem {
 ///
 /// The app is running inside the webview, so its presence is directly observed
 /// rather than assumed; the row names the platform backend and points AppImage
-/// users at the manual install (`RUNTIME-PREREQUISITES.md`).
+/// users at the manual install (`RUNTIME-PREREQUISITES.md`). This is an
+/// observation of the running process, not a probed check (IN-03): the `detail`
+/// states the app is running inside the named backend.
 fn webview_item() -> PreflightItem {
     #[cfg(target_os = "windows")]
     let backend = "WebView2";
