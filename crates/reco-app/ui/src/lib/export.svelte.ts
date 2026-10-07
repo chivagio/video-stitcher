@@ -189,8 +189,12 @@ class ExportStore {
   auto = $state<EncoderView | null>(null);
   /** Whether the auto encoder is hardware-accelerated, or null before a probe. */
   autoHardware = $state<boolean | null>(null);
-  /** The typed fallback pair when hardware was unavailable (EXPT-02). */
-  fallback = $state<{ requested: string; used: string } | null>(null);
+  /** The typed fallback pair when an override was unavailable (EXPT-02). */
+  fallback = $state<{
+    requested: string;
+    used: string;
+    used_hardware: boolean;
+  } | null>(null);
   /** The live per-frame progress, or null outside a run. */
   progress = $state<ExportProgressView | null>(null);
   /** The screen state machine. */
@@ -246,8 +250,8 @@ class ExportStore {
         break;
       }
       case "export_fallback": {
-        // EXPT-02: the explicit hardware→software fallback. The banner renders
-        // the locked copy; the store only mirrors the typed pair.
+        // EXPT-02: the explicit, never-silent fallback. The banner renders the
+        // locked copy from the typed pair (including the actual encoder class).
         this.fallback = event.data;
         break;
       }
@@ -458,6 +462,24 @@ class ExportStore {
     if (this.fallback !== null) return this.fallback.used;
     if (this.result !== null) return this.result.encoder;
     return this.auto?.name ?? "software";
+  }
+
+  /**
+   * The fallback banner copy (EXPT-02).
+   *
+   * Keeps the locked `<reason> — exporting with <class> encoding (<encoder>).`
+   * structure, but reports the class of the encoder that will ACTUALLY run: an
+   * unavailable override falls back to the auto pick, which may itself be
+   * hardware, so the class is never hardcoded to software.
+   */
+  get fallbackMessage(): string {
+    const classWord =
+      this.fallback?.used_hardware === true ? "hardware" : "software";
+    const reason =
+      this.fallback !== null && this.fallback.used_hardware
+        ? `${this.fallback.requested} unavailable`
+        : "Hardware encoding unavailable";
+    return `${reason} — exporting with ${classWord} encoding (${this.fallbackEncoderName}).`;
   }
 
   /**

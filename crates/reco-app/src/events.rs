@@ -1283,16 +1283,22 @@ pub enum WorkerEvent {
         auto_hardware: bool,
     },
 
-    /// Hardware was unavailable (or an override was rejected) and software was
-    /// used (EXPT-02).
+    /// An encoder override was unavailable (or Auto resolved to software) and
+    /// the fallback ran (EXPT-02).
     ///
     /// The typed half of the explicit, never-silent fallback; the matching WARN
-    /// log line names both encoders (UI-SPEC Copywriting Contract).
+    /// log line names both encoders and the class actually used (UI-SPEC
+    /// Copywriting Contract).
     ExportFallback {
         /// The requested encoder (an operator override or the hardware auto pick).
         requested: String,
-        /// The software encoder that will actually run.
+        /// The encoder that will actually run.
         used: String,
+        /// Whether [`Self::ExportFallback::used`] is hardware-accelerated. The
+        /// fallback is not always to software: an unavailable override falls back
+        /// to the auto pick, which may itself be hardware. The copy must report
+        /// the class of the encoder actually used, never a hardcoded "software".
+        used_hardware: bool,
     },
 
     /// The deterministic output path the worker resolved for the current
@@ -1851,12 +1857,22 @@ impl WorkerEvent {
                     }
                 ),
             },
-            WorkerEvent::ExportFallback { requested, used } => LogLine {
+            WorkerEvent::ExportFallback {
+                requested,
+                used,
+                used_hardware,
+            } => LogLine {
                 level: Level::Warn,
                 // The locked WARN copy (UI-SPEC Copywriting Contract): names both
-                // encoders so the fallback is never silent.
+                // encoders and the class actually used so the fallback is never
+                // silent and never misreports the encoder's class.
                 message: format!(
-                    "Export encoder fallback: {requested} unavailable, using {used} (software)"
+                    "Export encoder fallback: {requested} unavailable, using {used} ({})",
+                    if *used_hardware {
+                        "hardware"
+                    } else {
+                        "software"
+                    }
                 ),
             },
             WorkerEvent::ExportPathPreview { path } => LogLine {
@@ -3199,11 +3215,16 @@ mod tests {
         let fallback = WorkerEvent::ExportFallback {
             requested: "h264_nvenc".to_string(),
             used: "libx264".to_string(),
+            used_hardware: false,
         };
         let json = serde_json::to_string(&fallback).unwrap();
         assert!(
             json.contains("\"kind\":\"export_fallback\""),
             "json: {json}"
+        );
+        assert!(
+            json.contains("\"used_hardware\":false"),
+            "the class actually used must travel with the event: {json}"
         );
         assert_eq!(
             serde_json::from_str::<WorkerEvent>(&json).unwrap(),
@@ -3214,6 +3235,30 @@ mod tests {
         assert_eq!(
             line.message,
             "Export encoder fallback: h264_nvenc unavailable, using libx264 (software)"
+        );
+    }
+
+    #[test]
+    fn fallback_copy_reports_the_class_of_the_encoder_actually_used() {
+        // DEFECT: an unavailable override falls back to the auto pick, which can
+        // itself be HARDWARE. The WARN must report the class actually used, not a
+        // hardcoded "software" (observed next to `Export encoder: h264_nvenc
+        // (hardware)`).
+        let fallback = WorkerEvent::ExportFallback {
+            requested: "h264_amf".to_string(),
+            used: "h264_nvenc".to_string(),
+            used_hardware: true,
+        };
+        let line = fallback.to_log_line();
+        assert_eq!(line.level, Level::Warn);
+        assert_eq!(
+            line.message,
+            "Export encoder fallback: h264_amf unavailable, using h264_nvenc (hardware)"
+        );
+        assert!(
+            !line.message.contains("(software)"),
+            "a hardware fallback must not be labelled software: {}",
+            line.message
         );
     }
 

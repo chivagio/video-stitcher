@@ -124,10 +124,7 @@
       {/if}
 
       {#if exportStore.softwareFallback}
-        <InlineNotice
-          level="warn"
-          message={`Hardware encoding unavailable — exporting with software encoding (${exportStore.fallbackEncoderName}).`}
-        />
+        <InlineNotice level="warn" message={exportStore.fallbackMessage} />
       {/if}
 
       <section class="form">

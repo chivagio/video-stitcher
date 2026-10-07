@@ -592,14 +592,22 @@ impl EventSink {
         });
     }
 
-    /// Emit the explicit hardware→software fallback (EXPT-02).
+    /// Emit the explicit encoder fallback (EXPT-02).
     ///
     /// Mirrored to the process log at WARN so the fallback is never silent. The
-    /// typed half lets the webview render the locked banner copy.
-    fn export_fallback(&self, requested: impl Into<String>, used: impl Into<String>) {
+    /// typed half lets the webview render the locked banner copy. `used_hardware`
+    /// is the class of the encoder that will actually run, so the copy never
+    /// claims "software" for a hardware fallback.
+    fn export_fallback(
+        &self,
+        requested: impl Into<String>,
+        used: impl Into<String>,
+        used_hardware: bool,
+    ) {
         let event = WorkerEvent::ExportFallback {
             requested: requested.into(),
             used: used.into(),
+            used_hardware,
         };
         let line = event.to_log_line();
         log::warn!("{}", line.message);
@@ -1809,7 +1817,8 @@ pub trait EngineBackend: Send {
     /// Builds a `reco_io::StitchJob` from the typed settings — the worker never
     /// calls FFmpeg or the encoder directly. Emits `ExportProgress` per frame,
     /// `ExportFinished`/`ExportCancelled`/`ExportFailed` on completion, and a
-    /// typed `ExportFallback` + WARN when hardware is unavailable.
+    /// typed `ExportFallback` + WARN when an override is unavailable (or Auto
+    /// resolves to software).
     fn export(
         &mut self,
         settings: &crate::events::ExportSettings,
@@ -5834,8 +5843,10 @@ impl EngineBackend for GpuEngineBackend {
         }
         let (chosen, fallback) = choose_encoder(&available, settings.encoder_name.as_deref());
         if let Some((requested, used)) = fallback {
-            // Explicit, never-silent hardware→software fallback (EXPT-02).
-            events.export_fallback(requested, used);
+            // Explicit, never-silent fallback (EXPT-02). The class is the
+            // encoder that will actually run: an unavailable override can fall
+            // back to a hardware auto pick, so the copy must not assume software.
+            events.export_fallback(requested, used, chosen.is_hardware);
         }
         events.info(format!(
             "Export encoder: {} ({})",

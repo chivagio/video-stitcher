@@ -575,7 +575,10 @@ export type WorkerEventTyped =
         auto_hardware: boolean;
       };
     }
-  | { kind: "export_fallback"; data: { requested: string; used: string } }
+  | {
+      kind: "export_fallback";
+      data: { requested: string; used: string; used_hardware: boolean };
+    }
   | { kind: "system_info"; data: { info: SystemInfoView } }
   | { kind: "preflight"; data: { report: PreflightReport } }
   | { kind: "log_record"; data: { record: LogRecord } }
