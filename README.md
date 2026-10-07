@@ -116,9 +116,26 @@ brew install ffmpeg pkg-config
 
 # Windows: FFmpeg 7.x binaries + LLVM/Clang, set FFMPEG_DIR env var
 
-# Build everything
-cargo build --release
+# Build everything except the OBS plugin (reco-obs needs libobs headers; see note)
+cargo build --release --exclude reco-obs
 ```
+
+> **`reco-obs` needs libobs headers at build time.** It is a workspace member
+> that links against OBS Studio, so a whole-workspace build, test, or clippy
+> fails at its build script unless `/usr/include/obs/obs.h` exists (Ubuntu /
+> Debian: `sudo apt install libobs-dev`; or set `OBS_INCLUDE_DIR` to the
+> directory containing `obs.h`). CI installs `libobs-dev`, so the workspace
+> commands run unmodified there. In an environment without the headers, exclude
+> the crate:
+>
+> ```bash
+> cargo build  --workspace --exclude reco-obs
+> cargo test   --workspace --exclude reco-obs
+> cargo clippy --workspace --exclude reco-obs --all-targets -- -D warnings
+> ```
+>
+> This is a missing environment prerequisite, not a code defect; the OBS plugin
+> is built and shipped by the dedicated OBS build job.
 
 ### Feature flags
 

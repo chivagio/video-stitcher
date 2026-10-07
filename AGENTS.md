@@ -28,9 +28,9 @@ consumer-side workaround.
 ## Key commands
 
 ```bash
-cargo build                   # Build all crates
-cargo test --all              # Run all tests
-cargo clippy --all-targets -- -D warnings   # Lint
+cargo build --workspace --exclude reco-obs   # Build all crates (reco-obs needs libobs; see note)
+cargo test --workspace --exclude reco-obs    # Run all tests
+cargo clippy --workspace --exclude reco-obs --all-targets -- -D warnings   # Lint
 cargo fmt --all -- --check    # Format check
 cargo fmt --all               # Auto-format
 cargo doc --no-deps --open    # Generate and open docs
@@ -39,6 +39,14 @@ cargo run -p reco-cli -- stitch left.mp4 right.mp4 -c match.json -o out.mp4
 cargo run -p reco-cli -- preview left.mp4 right.mp4 -c match.json
 cargo run --release -p reco-cli --features profiling -- stitch left.mp4 right.mp4 -c match.json -o out.mp4 --max-frames 300  # Profile 300 frames → reco-trace.json (open in ui.perfetto.dev)
 ```
+
+> **`reco-obs` needs libobs headers to build.** It is a workspace member that
+> links against OBS Studio, so whole-workspace `build` / `test` / `clippy`
+> fails at its build script unless `/usr/include/obs/obs.h` exists (Ubuntu:
+> `libobs-dev`, or set `OBS_INCLUDE_DIR`). CI installs `libobs-dev` and runs the
+> workspace commands unmodified; in an environment without the headers, pass
+> `--exclude reco-obs` (as above). That is a missing environment prerequisite,
+> not a code defect.
 
 ## Headless GUI verification (reco-app)
 
@@ -94,6 +102,8 @@ import -display :99 -window root /tmp/opencode/shot.png
 - Module-level docs (`//!`) explaining purpose
 - Tests in each module (`#[cfg(test)] mod tests`)
 - All PRs must pass: `cargo fmt --check && cargo clippy && cargo test`
+  (CI installs `libobs-dev`; add `--workspace --exclude reco-obs` locally when
+  the libobs headers are absent)
 - Clippy must also pass with `--features profiling`
 - Keep commit messages and PR descriptions concise and technical (what
   changed + why), especially when written by an AI agent - no filler, no
