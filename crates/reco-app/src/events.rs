@@ -2021,7 +2021,12 @@ pub enum WorkerError {
 
     /// An export is in flight and the app is modal: preview/edit commands are
     /// rejected rather than silently dropped (EXPT-04 / CONTEXT modal decision).
-    #[error("export in progress — wait for it to finish or cancel it")]
+    ///
+    /// The export blocks the worker loop, so a rejected command is drained only
+    /// after the export already returned; the wording reflects that the command
+    /// was dropped because an export was in flight, not that one is still
+    /// running (IN-09).
+    #[error("an export was in progress — this command was dropped; try again")]
     ExportInProgress,
 
     /// Saving a `.reco` project failed (PROJ-01).
@@ -3216,7 +3221,7 @@ mod tests {
     fn export_in_progress_error_renders_plain_language() {
         assert_eq!(
             WorkerError::ExportInProgress.to_string(),
-            "export in progress — wait for it to finish or cancel it"
+            "an export was in progress — this command was dropped; try again"
         );
         let event = WorkerEvent::Failed(WorkerError::ExportInProgress);
         assert_eq!(event.to_log_line().level, Level::Error);

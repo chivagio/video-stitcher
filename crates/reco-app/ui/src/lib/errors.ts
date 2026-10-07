@@ -15,16 +15,18 @@
  * Display text for `WorkerError` unit variants.
  *
  * `WorkerError` is externally tagged, so a unit variant serializes to a bare
- * JSON string (`"NotImported"`, `"ShuttingDown"`, `"ChannelClosed"`). Without
- * this map the stores would render that code verbatim, contradicting the
- * "never a bare code" contract (CONVENTIONS.md:113). The text mirrors each
- * variant's Rust `Display` impl (events.rs `#[error(...)]`).
+ * JSON string (`"NotImported"`, `"ShuttingDown"`, `"ChannelClosed"`,
+ * `"ExportInProgress"`). Without this map the stores would render that code
+ * verbatim, contradicting the "never a bare code" contract (CONVENTIONS.md:113).
+ * The text mirrors each variant's Rust `Display` impl (events.rs `#[error(...)]`).
  */
 const UNIT_ERROR_TEXT: Record<string, string> = {
   NotImported:
     "no clips are loaded yet — the startup import did not complete (see the log)",
   ShuttingDown: "the engine worker is shutting down",
   ChannelClosed: "the engine worker is no longer running",
+  ExportInProgress:
+    "an export was in progress — this command was dropped; try again",
 };
 
 /** Render a typed worker error (or a rejected command) as display text. */
