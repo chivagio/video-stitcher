@@ -238,11 +238,29 @@ fn normalize_exposure(
     apply_exposure_gain(right, rw, rh, gain_right);
 }
 
+/// Why a frame pair was skipped instead of contributing matches.
+///
+/// Kept distinct from a plain "no matches" so the run can report the specific
+/// [`CalibrateError::NoKeypoints`] cause when *every* frame had no detectable
+/// features (CALB-04).
+enum FrameSkip {
+    /// One or both frames had zero detected keypoints; `camera` names the empty
+    /// one (`"left"` or `"right"`).
+    NoKeypoints(&'static str),
+    /// The pair had keypoints but did not survive ratio-test / spatial / RANSAC
+    /// filtering.
+    Rejected,
+}
+
 /// Process an undistorted RGBA frame pair through the feature matching pipeline.
 ///
 /// Takes pre-undistorted RGBA data (from GPU phase) and runs feature
 /// detection, matching, and filtering using the provided trait objects.
 /// This function is thread-safe and called in parallel via rayon.
+///
+/// `Err(FrameSkip::NoKeypoints)` is returned when detection yields no features
+/// in either image; `Err(FrameSkip::Rejected)` when features exist but the pair
+/// fails matching. Either way the caller skips the frame and keeps going.
 #[allow(clippy::too_many_arguments)]
 fn process_undistorted_pair(
     left_rgba: &[u8],
@@ -257,7 +275,7 @@ fn process_undistorted_pair(
     detector: &dyn traits::FeatureDetector,
     matcher: &dyn traits::FeatureMatcher,
     point_filter: &dyn traits::PointFilter,
-) -> Option<FrameMatches> {
+) -> Result<FrameMatches, FrameSkip> {
     profile_scope!("process_frame");
     let inner = config.matching.spatial_x_inner as f32;
     let y_min = config.akaze.detect_y_min as f32;
@@ -306,8 +324,11 @@ fn process_undistorted_pair(
     );
 
     if kp_left.is_empty() || kp_right.is_empty() {
-        log::warn!("frame {frame_idx}: no keypoints in one or both images");
-        return None;
+        // Name the empty camera; when both are empty "left" is reported (the
+        // error variant carries a single camera and the fix applies to both).
+        let camera = if kp_left.is_empty() { "left" } else { "right" };
+        log::warn!("frame {frame_idx}: no keypoints in the {camera} image");
+        return Err(FrameSkip::NoKeypoints(camera));
     }
 
     // Match descriptors using the provided matcher, config-aware when the
@@ -321,7 +342,7 @@ fn process_undistorted_pair(
             raw_matches.len(),
             config.matching.min_matches
         );
-        return None;
+        return Err(FrameSkip::Rejected);
     }
 
     // Spatial overlap filter
@@ -344,7 +365,7 @@ fn process_undistorted_pair(
         Ok(indices) => indices,
         Err(e) => {
             log::debug!("frame {frame_idx}: RANSAC failed: {e}");
-            return None;
+            return Err(FrameSkip::Rejected);
         }
     };
     let post_ransac = inlier_indices.len();
@@ -355,7 +376,7 @@ fn process_undistorted_pair(
             post_ransac,
             config.matching.min_matches
         );
-        return None;
+        return Err(FrameSkip::Rejected);
     }
 
     // Normalize surviving matches to plane coordinates.
@@ -412,7 +433,7 @@ fn process_undistorted_pair(
     // Apply the user-provided point filter (e.g. y-disparity rejection)
     let points = point_filter.filter(&points);
 
-    Some(FrameMatches {
+    Ok(FrameMatches {
         points,
         rejected,
         keypoints_left: kp_left.len(),
@@ -423,6 +444,29 @@ fn process_undistorted_pair(
         post_ransac,
         debug_frame: None,
     })
+}
+
+/// The run-level error for a calibration that produced no usable frame pair.
+///
+/// The engine deliberately continues past a frame that fails; only once every
+/// attempted frame has failed does it report a run-level error. When *every*
+/// failure was "no keypoints in one/both cameras", the specific
+/// [`CalibrateError::NoKeypoints`] is reported (carrying the first empty
+/// camera/frame, so the operator learns *why* matching never started). A mixed
+/// run — some frames had keypoints but failed matching — stays the general
+/// [`CalibrateError::NoUsableFrames`].
+fn empty_run_error(
+    frames_len: usize,
+    no_keypoints_frames: usize,
+    first_empty: Option<(&'static str, usize)>,
+) -> CalibrateError {
+    if frames_len > 0
+        && no_keypoints_frames == frames_len
+        && let Some((camera, frame_idx)) = first_empty
+    {
+        return CalibrateError::NoKeypoints { camera, frame_idx };
+    }
+    CalibrateError::NoUsableFrames
 }
 
 /// Run the full calibration pipeline with default implementations.
@@ -437,8 +481,9 @@ fn process_undistorted_pair(
 ///
 /// # Errors
 ///
-/// Returns [`CalibrateError::NoUsableFrames`] if no frame pairs produce
-/// enough matches, or [`CalibrateError::OptimizerFailed`] if all
+/// Returns [`CalibrateError::NoKeypoints`] if no frame had any detectable
+/// features, [`CalibrateError::NoUsableFrames`] if frames had features but no
+/// pair produced enough matches, or [`CalibrateError::OptimizerFailed`] if all
 /// optimization iterations fail.
 pub fn calibrate(
     gpu: &GpuContext,
@@ -533,8 +578,9 @@ pub fn calibrate_with_progress_diagnostic(
 ///
 /// # Errors
 ///
-/// Returns [`CalibrateError::NoUsableFrames`] if no frame pairs produce
-/// enough matches, or [`CalibrateError::OptimizerFailed`] if all
+/// Returns [`CalibrateError::NoKeypoints`] if no frame had any detectable
+/// features, [`CalibrateError::NoUsableFrames`] if frames had features but no
+/// pair produced enough matches, or [`CalibrateError::OptimizerFailed`] if all
 /// optimization iterations fail.
 #[allow(clippy::too_many_arguments)]
 pub fn calibrate_with(
@@ -631,6 +677,10 @@ fn calibrate_impl(
     // memory proportional to one frame pair (~100 MB) instead of all
     // pairs (~1 GB for 8 pairs at 4K).
     let mut successful_frames: Vec<FrameMatches> = Vec::new();
+    // Track why frames were skipped so the empty-run error can name the specific
+    // "no keypoints" cause when that is the sole reason (CALB-04).
+    let mut no_keypoints_frames = 0usize;
+    let mut first_empty: Option<(&'static str, usize)> = None;
     for (i, (left, right)) in frames.iter().enumerate() {
         on_progress(&CalibrationProgress {
             step: CalibrationStep::Undistorting,
@@ -654,7 +704,7 @@ fn calibrate_impl(
                 &config.matching,
             );
         }
-        let mut result = {
+        let attempt = {
             profile_scope!("akaze_detect_match");
             process_undistorted_pair(
                 &left_rgba,
@@ -671,34 +721,41 @@ fn calibrate_impl(
                 point_filter,
             )
         };
-        // Retain the undistorted RGBA pair of the FIRST frame that produced
-        // matches, for the debug inspector (CALB-08). Only one pair is kept so
-        // peak memory stays bounded (T-04-10). The borrow of `left_rgba`/
-        // `right_rgba` by `process_undistorted_pair` has ended, so they can be
-        // moved into the retained frame.
-        if let Some(fm) = result.as_mut()
-            && successful_frames.is_empty()
-        {
-            fm.debug_frame = Some(types::DebugFrame {
-                left: std::mem::take(&mut left_rgba),
-                left_width: lw,
-                left_height: lh,
-                right: std::mem::take(&mut right_rgba),
-                right_width: rw,
-                right_height: rh,
-            });
-        }
-        if let Some(fm) = result {
-            successful_frames.push(fm);
+        match attempt {
+            Ok(mut fm) => {
+                // Retain the undistorted RGBA pair of the FIRST frame that
+                // produced matches, for the debug inspector (CALB-08). Only one
+                // pair is kept so peak memory stays bounded (T-04-10). The
+                // borrow of `left_rgba`/`right_rgba` by
+                // `process_undistorted_pair` has ended, so they can be moved
+                // into the retained frame.
+                if successful_frames.is_empty() {
+                    fm.debug_frame = Some(types::DebugFrame {
+                        left: std::mem::take(&mut left_rgba),
+                        left_width: lw,
+                        left_height: lh,
+                        right: std::mem::take(&mut right_rgba),
+                        right_width: rw,
+                        right_height: rh,
+                    });
+                }
+                successful_frames.push(fm);
+            }
+            Err(FrameSkip::NoKeypoints(camera)) => {
+                no_keypoints_frames += 1;
+                first_empty.get_or_insert((camera, i));
+            }
+            Err(FrameSkip::Rejected) => {}
         }
     }
 
     if successful_frames.is_empty() {
         // Every frame was undistorted and matched before this point; the last
         // active stage is FeatureMatching, so attribute the empty result there
-        // rather than to Undistorting (WR-03).
+        // rather than to Undistorting (WR-03). The specific `NoKeypoints` cause
+        // is reported only when no frame had any detectable features.
         return Err(CalibrationFailure::new(
-            CalibrateError::NoUsableFrames,
+            empty_run_error(frames.len(), no_keypoints_frames, first_empty),
             CalibrationStep::FeatureMatching,
             successful_frames,
         ));
@@ -920,5 +977,48 @@ mod exposure_tests {
 
         assert_eq!(left, left_before);
         assert_eq!(right, right_before);
+    }
+}
+
+#[cfg(test)]
+mod empty_run_error_tests {
+    use super::*;
+
+    #[test]
+    fn all_frames_missing_keypoints_reports_no_keypoints() {
+        // 3 frames, every one skipped for missing keypoints: the first empty
+        // camera/frame is reported so the diagnosis names the cause (CALB-04).
+        let error = empty_run_error(3, 3, Some(("right", 1)));
+        assert!(matches!(
+            error,
+            CalibrateError::NoKeypoints {
+                camera: "right",
+                frame_idx: 1
+            }
+        ));
+    }
+
+    #[test]
+    fn mixed_failures_stay_no_usable_frames() {
+        // 3 frames but only 2 had no keypoints (the third had features that did
+        // not match): the run is a mixed failure, not a keypoint failure.
+        let error = empty_run_error(3, 2, Some(("left", 0)));
+        assert!(matches!(error, CalibrateError::NoUsableFrames));
+    }
+
+    #[test]
+    fn no_frames_stays_no_usable_frames() {
+        // The zero-frame guard is handled before the loop; keep this helper
+        // honest even if called with an empty slice.
+        let error = empty_run_error(0, 0, None);
+        assert!(matches!(error, CalibrateError::NoUsableFrames));
+    }
+
+    #[test]
+    fn missing_first_empty_marker_stays_no_usable_frames() {
+        // Defensive: a full count without a recorded camera cannot name a frame,
+        // so it falls back rather than fabricating one.
+        let error = empty_run_error(2, 2, None);
+        assert!(matches!(error, CalibrateError::NoUsableFrames));
     }
 }
