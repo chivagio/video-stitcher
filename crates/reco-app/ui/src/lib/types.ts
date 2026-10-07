@@ -343,6 +343,40 @@ export interface CalibrationOptions {
   use_imu_rotation_seeds: boolean | null;
 }
 
+/** Built-in export presets plus Custom (mirror `events::ExportPreset`, EXPT-01). */
+export type ExportPreset = "source_match" | "p1080" | "p4k" | "web" | "custom";
+
+/** The output composition variant (mirror `events::ExportVariant`, EXPT-05). */
+export type ExportVariant = "panorama" | "side_by_side" | "stacked";
+
+/**
+ * The typed export request (mirror `events::ExportSettings`, EXPT-01).
+ *
+ * `codec`/`quality` are parsed with a default-on-unknown inside the worker;
+ * `start_frame`/`end_frame` are source frame indices the worker converts to
+ * seconds against the source fps.
+ */
+export interface ExportSettings {
+  preset: ExportPreset;
+  width: number;
+  height: number;
+  codec: string;
+  quality: string;
+  bitrate_kbps: number | null;
+  encoder_name: string | null;
+  start_frame: number | null;
+  end_frame: number | null;
+  variant: ExportVariant;
+  output_dir: string | null;
+}
+
+/** One probed encoder (mirror `events::EncoderView`, EXPT-02). */
+export interface EncoderView {
+  name: string;
+  description: string;
+  is_hardware: boolean;
+}
+
 /**
  * The subset of the typed `WorkerEvent` union this phase consumes.
  *
@@ -441,8 +475,38 @@ export type WorkerEventTyped =
   | { kind: "manual_saved"; data: { path: string } }
   | { kind: "intrinsics_refined"; data: { refinement: IntrinsicsRefinementView } }
   | { kind: "result_invalidated"; data: null }
+  | {
+      kind: "export_progress";
+      data: {
+        frames_completed: number;
+        total: number | null;
+        elapsed_ms: number;
+        eta_ms: number | null;
+        percent: number;
+      };
+    }
+  | {
+      kind: "export_finished";
+      data: {
+        path: string;
+        encoder: string;
+        hardware: boolean;
+        variant: ExportVariant;
+      };
+    }
+  | { kind: "export_cancelled"; data: null }
+  | { kind: "export_failed"; data: { message: string } }
+  | {
+      kind: "encoder_list";
+      data: {
+        encoders: EncoderView[];
+        auto: EncoderView;
+        auto_hardware: boolean;
+      };
+    }
+  | { kind: "export_fallback"; data: { requested: string; used: string } }
   | { kind: "log"; data: LogLine }
   | { kind: "failed"; data: unknown };
 
 /** The workflow-rail screens (D3-01). Import is the landing screen. */
-export type Screen = "import" | "calibrate" | "preview";
+export type Screen = "import" | "calibrate" | "preview" | "export";

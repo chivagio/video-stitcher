@@ -20,8 +20,10 @@
     onToggleLog,
     calibrateEnabled = false,
     previewEnabled = false,
+    exportEnabled = false,
     calibrateReason = "Select two clips to calibrate.",
     previewReason = "Calibrate first.",
+    exportReason = "Calibrate first.",
   }: {
     active: Screen;
     onNavigate: (screen: Screen) => void;
@@ -29,25 +31,30 @@
     onToggleLog: () => void;
     calibrateEnabled?: boolean;
     previewEnabled?: boolean;
+    exportEnabled?: boolean;
     calibrateReason?: string;
     previewReason?: string;
+    exportReason?: string;
   } = $props();
 
   const steps: { id: Screen; label: string }[] = [
     { id: "import", label: "Import" },
     { id: "calibrate", label: "Calibrate" },
     { id: "preview", label: "Preview" },
+    { id: "export", label: "Export" },
   ];
 
   function isEnabled(id: Screen): boolean {
     if (id === "import") return true;
     if (id === "calibrate") return calibrateEnabled;
-    return previewEnabled;
+    if (id === "preview") return previewEnabled;
+    return exportEnabled;
   }
 
   function reasonFor(id: Screen): string {
     if (id === "calibrate" && !calibrateEnabled) return calibrateReason;
     if (id === "preview" && !previewEnabled) return previewReason;
+    if (id === "export" && !exportEnabled) return exportReason;
     return "";
   }
 </script>

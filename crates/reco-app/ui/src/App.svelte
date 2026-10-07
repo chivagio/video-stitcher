@@ -27,6 +27,7 @@
   import { importStore } from "./lib/import.svelte";
   import { calibration } from "./lib/calibration.svelte";
   import { fieldRoi } from "./lib/roi.svelte";
+  import { exportStore } from "./lib/export.svelte";
   import PreviewSurface from "./components/PreviewSurface.svelte";
   import Timeline from "./components/Timeline.svelte";
   import TimecodeReadout from "./components/TimecodeReadout.svelte";
@@ -38,6 +39,7 @@
   import WorkflowRail from "./components/WorkflowRail.svelte";
   import ImportScreen from "./components/ImportScreen.svelte";
   import CalibrateScreen from "./components/CalibrateScreen.svelte";
+  import ExportScreen from "./components/ExportScreen.svelte";
   import FieldRoiEditor from "./components/FieldRoiEditor.svelte";
   import ConfirmDialog from "./components/ConfirmDialog.svelte";
   import type { PresenterKind, Screen, ViewMode } from "./lib/types";
@@ -75,6 +77,10 @@
       await importStore.init();
       await calibration.init();
       await fieldRoi.init();
+      // Subscribe the export store to the typed bridge before the reconcile too
+      // (A10 ordering), so its EncoderList/ExportProgress listeners are live.
+      await exportStore.init();
+      void exportStore.probeEncoders();
       // Subscribe first, *then* ask the worker to re-assert its state. The
       // worker boots and imports before the webview has loaded, and the event
       // bridge only reaches listeners registered at emit time — so its opening
@@ -95,6 +101,7 @@
       importStore.destroy();
       calibration.destroy();
       fieldRoi.destroy();
+      exportStore.destroy();
     };
   });
 
@@ -107,6 +114,13 @@
       drawer_expanded: drawerExpanded,
       active_screen: screen,
     });
+  });
+
+  // Seed the export store's "Source match" derivation from the left input's
+  // probed metadata. The worker is authoritative for the resolution; the store
+  // re-derives the preset parameters when it lands.
+  $effect(() => {
+    exportStore.setInputMetadata(importStore.inputs.left.metadata);
   });
 
   // Transport controls.
@@ -275,6 +289,9 @@
   const previewEnabled = $derived(
     importStore.hasResult || calibration.result !== null,
   );
+  // Export needs the same valid calibration result (EXPT-01 edge probe: the
+  // Export step is disabled with a reason until a result exists).
+  const exportEnabled = $derived(previewEnabled);
 </script>
 
 <svelte:window onkeydown={handleGlobalKeyDown} />
@@ -288,6 +305,7 @@
     onToggleLog={handleDrawerToggle}
     {calibrateEnabled}
     {previewEnabled}
+    {exportEnabled}
   />
 
   {#if screen === "import"}
@@ -299,6 +317,10 @@
       onRequestCancel={handleRequestCancel}
       onBackToImport={() => (screen = "import")}
     />
+  {:else if screen === "export"}
+    <!-- Modal Export screen (EXPT-01/02/04). The native view is suspended by
+         Rust on this screen; the webview owns the whole surface. -->
+    <ExportScreen />
   {:else}
     <!-- Preview surface (transparent in native mode) -->
     <PreviewSurface
