@@ -309,6 +309,8 @@ pub enum Screen {
     Calibrate,
     /// The Phase 2 preview experience (native view live).
     Preview,
+    /// The Phase 5 export screen (opaque; native view suspended).
+    Export,
 }
 
 /// The webview chrome's collapsible state (UI-SPEC Surface Layout Contract).
@@ -944,9 +946,15 @@ mod tests {
             serde_json::to_string(&Screen::Preview).unwrap(),
             "\"preview\""
         );
+        assert_eq!(
+            serde_json::to_string(&Screen::Export).unwrap(),
+            "\"export\""
+        );
         // Round-trips back from the wire form the frontend sends.
         let parsed: Screen = serde_json::from_str("\"preview\"").unwrap();
         assert_eq!(parsed, Screen::Preview);
+        let parsed_export: Screen = serde_json::from_str("\"export\"").unwrap();
+        assert_eq!(parsed_export, Screen::Export);
     }
 
     #[test]

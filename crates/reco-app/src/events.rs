@@ -683,6 +683,131 @@ pub enum ValidationVerdict {
     CheckSeam,
 }
 
+/// A built-in export preset plus the Custom escape hatch (EXPT-01).
+///
+/// The preset is a *label* the webview derives concrete
+/// resolution/codec/quality/bitrate parameters from
+/// (`ui/src/lib/export.svelte.ts::deriveSettings`); the worker only carries it
+/// for naming/diagnostics. Serializes snake_case and mirrors into
+/// `ui/src/lib/types.ts`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExportPreset {
+    /// Match the source resolution with H.264 / High quality.
+    #[default]
+    SourceMatch,
+    /// 1920×1080 H.264 / Balanced.
+    P1080,
+    /// 3840×2160 H.264 / Balanced.
+    #[serde(rename = "p4k")]
+    P4K,
+    /// 1920×1080 H.264 / Fast (small, web-friendly).
+    Web,
+    /// Operator-supplied parameters (no derivation).
+    Custom,
+}
+
+/// The output composition variant (EXPT-05).
+///
+/// Panorama is the default stitched output; side-by-side and stacked reuse the
+/// engine's existing N-up pack path. Serializes snake_case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExportVariant {
+    /// The stitched panorama (default).
+    #[default]
+    Panorama,
+    /// The two source tiles packed horizontally.
+    SideBySide,
+    /// The two source tiles packed vertically.
+    Stacked,
+}
+
+impl ExportVariant {
+    /// The deterministic filename suffix for this variant (`_panorama`, `_sbs`,
+    /// `_stacked`) — the single source of the naming convention (CONTEXT).
+    #[must_use]
+    pub fn suffix(self) -> &'static str {
+        match self {
+            ExportVariant::Panorama => "_panorama",
+            ExportVariant::SideBySide => "_sbs",
+            ExportVariant::Stacked => "_stacked",
+        }
+    }
+}
+
+/// The typed export request (EXPT-01).
+///
+/// Crosses the webview→worker boundary as typed values; `codec`/`quality` are
+/// parsed with `FromStr` and default on an unknown string (T-05-01), never
+/// injected as a raw encoder argument. `start_frame`/`end_frame` are source
+/// frame indices the worker converts to `StitchJob::start_time`/`end_time`
+/// against the source fps. Mirrors into `ui/src/lib/types.ts`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ExportSettings {
+    /// The chosen preset (label; parameters are carried explicitly below).
+    pub preset: ExportPreset,
+    /// Output width in pixels.
+    pub width: u32,
+    /// Output height in pixels.
+    pub height: u32,
+    /// Output codec name (`"h264"` / `"hevc"` / `"av1"`); parsed with a default.
+    pub codec: String,
+    /// Quality tier name (`"fast"` / `"balanced"` / `"high"`); parsed with a default.
+    pub quality: String,
+    /// Explicit bitrate target in kbps, when the operator set one.
+    ///
+    /// The engine exposes quality tiers (`Quality`), not a kbps target; this is
+    /// carried for the preset/UI and currently advisory only (a WARN is logged
+    /// when set). Never silently applied as a fabricated value.
+    pub bitrate_kbps: Option<u64>,
+    /// An operator-selected encoder name, or `None` for Auto.
+    pub encoder_name: Option<String>,
+    /// Trim start frame index (source frames), or `None` for the clip start.
+    pub start_frame: Option<u64>,
+    /// Trim end frame index (source frames), or `None` for the clip end.
+    pub end_frame: Option<u64>,
+    /// The output composition variant.
+    pub variant: ExportVariant,
+    /// The directory the output is written to, or `None` for the default.
+    pub output_dir: Option<String>,
+}
+
+impl Default for ExportSettings {
+    /// The engine-default export: Source-match preset, 1920×1080, H.264,
+    /// Balanced, Auto encoder, full clip, panorama.
+    fn default() -> Self {
+        Self {
+            preset: ExportPreset::SourceMatch,
+            width: 1920,
+            height: 1080,
+            codec: "h264".to_string(),
+            quality: "balanced".to_string(),
+            bitrate_kbps: None,
+            encoder_name: None,
+            start_frame: None,
+            end_frame: None,
+            variant: ExportVariant::Panorama,
+            output_dir: None,
+        }
+    }
+}
+
+/// One probed encoder as it crosses to the webview (EXPT-02).
+///
+/// Mirrors `reco_io::ffmpeg::encoder::EncoderInfo` so the frontend never depends
+/// on an engine type directly. `is_hardware` drives the HW/SW tag and the
+/// fallback banner.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct EncoderView {
+    /// FFmpeg encoder name (e.g. `"h264_nvenc"`, `"libx264"`).
+    pub name: String,
+    /// Human-readable description from FFmpeg.
+    pub description: String,
+    /// Whether this is a hardware-accelerated encoder.
+    pub is_hardware: bool,
+}
+
 /// An event emitted by the engine worker and rendered in the webview log pane.
 ///
 /// `Clone + Send + 'static` so it can cross the worker→UI channel; the
@@ -1089,6 +1214,81 @@ pub enum WorkerEvent {
     /// Emitted when an input or lens override changes after a run/load, so the
     /// scorecard never claims to reflect a profile it did not use.
     ResultInvalidated,
+
+    /// Per-frame export progress with elapsed and ETA (EXPT-04).
+    ///
+    /// Emitted from `StitchJob::on_progress` on the worker thread. `percent` is
+    /// `0.0` when `total` is unknown; `eta_ms` is `None` until at least one frame
+    /// has completed and the total is known — an honest unknown, never a
+    /// fabricated `0` (UI-SPEC Real-values rule).
+    ExportProgress {
+        /// Frames encoded so far.
+        frames_completed: u64,
+        /// Total output frames, when derivable from the source + trim window.
+        total: Option<u64>,
+        /// Milliseconds elapsed since the run started.
+        elapsed_ms: u64,
+        /// Estimated milliseconds remaining, or `None` when not derivable.
+        eta_ms: Option<u64>,
+        /// Percent complete (`0.0..=100.0`; `0.0` when `total` is unknown).
+        percent: f64,
+    },
+
+    /// A completed export (EXPT-04).
+    ///
+    /// `encoder` is the resolved encoder the engine actually used
+    /// (`StitchResult.encoder_name`, authoritative); `hardware` mirrors the
+    /// probed `is_hardware` flag so the completion surface never guesses.
+    ExportFinished {
+        /// The resolved output path that was written.
+        path: String,
+        /// The resolved encoder name (authoritative).
+        encoder: String,
+        /// Whether the resolved encoder is hardware-accelerated.
+        hardware: bool,
+        /// The variant that was exported.
+        variant: ExportVariant,
+    },
+
+    /// A cancelled export (EXPT-04).
+    ///
+    /// The cancel was observed through the dedicated shared flag. No output path
+    /// is claimed — the worker never reports a partial file as a result.
+    ExportCancelled,
+
+    /// A failed export with a plain-language message (EXPT-04).
+    ///
+    /// Authored in Rust from the typed engine error. No output path is claimed.
+    ExportFailed {
+        /// The user-facing cause.
+        message: String,
+    },
+
+    /// The available encoders for a codec, in preference order (EXPT-02).
+    ///
+    /// `auto` is the best allowed candidate (the head of the list) and
+    /// `auto_hardware` its hardware flag; the frontend renders the fallback
+    /// banner when `auto_hardware` is false. Mirrors into `types.ts`.
+    EncoderList {
+        /// Every available encoder, hardware first, software last.
+        encoders: Vec<EncoderView>,
+        /// The auto-selected encoder (the list head, or a "none" placeholder).
+        auto: EncoderView,
+        /// Whether the auto-selected encoder is hardware-accelerated.
+        auto_hardware: bool,
+    },
+
+    /// Hardware was unavailable (or an override was rejected) and software was
+    /// used (EXPT-02).
+    ///
+    /// The typed half of the explicit, never-silent fallback; the matching WARN
+    /// log line names both encoders (UI-SPEC Copywriting Contract).
+    ExportFallback {
+        /// The requested encoder (an operator override or the hardware auto pick).
+        requested: String,
+        /// The software encoder that will actually run.
+        used: String,
+    },
 }
 
 /// The UI-facing shape of an event-log line (UI-SPEC Event Log Contract).
@@ -1492,6 +1692,65 @@ impl WorkerEvent {
                 level: Level::Warn,
                 message: "result invalidated — inputs changed; re-run calibration".to_string(),
             },
+            WorkerEvent::ExportProgress {
+                frames_completed,
+                total,
+                percent,
+                ..
+            } => LogLine {
+                level: Level::Info,
+                message: match total {
+                    Some(total) => format!(
+                        "export progress: {percent:.0}% ({frames_completed}/{total} frames)"
+                    ),
+                    None => format!("export progress: {frames_completed} frames"),
+                },
+            },
+            WorkerEvent::ExportFinished {
+                path,
+                encoder,
+                hardware,
+                ..
+            } => LogLine {
+                level: Level::Info,
+                message: format!(
+                    "export complete: {path} ({} encoder {encoder})",
+                    if *hardware { "hardware" } else { "software" }
+                ),
+            },
+            WorkerEvent::ExportCancelled => LogLine {
+                level: Level::Warn,
+                message: "export cancelled — no file was written".to_string(),
+            },
+            WorkerEvent::ExportFailed { message } => LogLine {
+                level: Level::Error,
+                message: message.clone(),
+            },
+            WorkerEvent::EncoderList {
+                encoders,
+                auto,
+                auto_hardware,
+            } => LogLine {
+                level: Level::Info,
+                message: format!(
+                    "export encoders: {} available — auto {} ({})",
+                    encoders.len(),
+                    auto.name,
+                    if *auto_hardware {
+                        "hardware"
+                    } else {
+                        "software"
+                    }
+                ),
+            },
+            WorkerEvent::ExportFallback { requested, used } => LogLine {
+                level: Level::Warn,
+                // The locked WARN copy (UI-SPEC Copywriting Contract): names both
+                // encoders so the fallback is never silent.
+                message: format!(
+                    "Export encoder fallback: {requested} unavailable, using {used} (software)"
+                ),
+            },
         }
     }
 }
@@ -1566,6 +1825,11 @@ pub enum WorkerError {
     /// outer variant is what crosses the channel (CONVENTIONS.md:135).
     #[error("{0}")]
     Engine(String),
+
+    /// An export is in flight and the app is modal: preview/edit commands are
+    /// rejected rather than silently dropped (EXPT-04 / CONTEXT modal decision).
+    #[error("export in progress — wait for it to finish or cancel it")]
+    ExportInProgress,
 }
 
 // Compile-time bound check: both halves of the protocol are `Clone + Send +
@@ -1578,6 +1842,12 @@ const _: fn() = || {
     assert_clone_send::<WorkerEvent>();
     assert_clone_send::<WorkerError>();
     assert_clone_send::<crate::commands::WorkerCommand>();
+    // EXPT-01/EXPT-02: the export DTOs cross the same boundary, so they carry
+    // the same `Clone + Send + 'static` bound.
+    assert_clone_send::<ExportSettings>();
+    assert_clone_send::<ExportPreset>();
+    assert_clone_send::<ExportVariant>();
+    assert_clone_send::<EncoderView>();
 };
 
 #[cfg(test)]
@@ -2532,5 +2802,190 @@ mod tests {
         let line = saved.to_log_line();
         assert_eq!(line.level, Level::Info);
         assert!(line.message.contains("/media/manual.json"), "{line:?}");
+    }
+
+    #[test]
+    fn export_settings_roundtrip_with_snake_case_preset_and_variant() {
+        // EXPT-01: the typed settings cross the boundary as values; the preset
+        // and variant serialize snake_case and mirror into types.ts.
+        let settings = ExportSettings {
+            preset: ExportPreset::P1080,
+            width: 1920,
+            height: 1080,
+            codec: "h264".to_string(),
+            quality: "high".to_string(),
+            bitrate_kbps: None,
+            encoder_name: Some("libx264".to_string()),
+            start_frame: Some(10),
+            end_frame: Some(300),
+            variant: ExportVariant::SideBySide,
+            output_dir: Some("/tmp".to_string()),
+        };
+        let json = serde_json::to_string(&settings).unwrap();
+        assert!(json.contains("\"preset\":\"p1080\""), "json: {json}");
+        assert!(
+            json.contains("\"variant\":\"side_by_side\""),
+            "json: {json}"
+        );
+        assert!(json.contains("\"start_frame\":10"), "json: {json}");
+        let back: ExportSettings = serde_json::from_str(&json).unwrap();
+        assert_eq!(settings, back);
+
+        // The preset names are stable across the wire (P4K's digits would
+        // otherwise make serde emit `p4_k`).
+        assert_eq!(
+            serde_json::to_string(&ExportPreset::P4K).unwrap(),
+            "\"p4k\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ExportPreset::SourceMatch).unwrap(),
+            "\"source_match\""
+        );
+
+        // The variant suffix is the single naming source (CONTEXT).
+        assert_eq!(ExportVariant::Panorama.suffix(), "_panorama");
+        assert_eq!(ExportVariant::SideBySide.suffix(), "_sbs");
+        assert_eq!(ExportVariant::Stacked.suffix(), "_stacked");
+
+        // The engine-default export is a real, complete value.
+        let default = ExportSettings::default();
+        assert_eq!(default.preset, ExportPreset::SourceMatch);
+        assert_eq!(default.variant, ExportVariant::Panorama);
+        assert_eq!((default.width, default.height), (1920, 1080));
+    }
+
+    #[test]
+    fn export_events_roundtrip_and_project_to_typed_log_lines() {
+        // EXPT-04: progress carries frames/elapsed/ETA/percent; finished names
+        // the resolved encoder + hardware; cancelled claims no path; failed is a
+        // plain-language ERROR.
+        let progress = WorkerEvent::ExportProgress {
+            frames_completed: 50,
+            total: Some(100),
+            elapsed_ms: 1000,
+            eta_ms: Some(1000),
+            percent: 50.0,
+        };
+        let json = serde_json::to_string(&progress).unwrap();
+        assert!(
+            json.contains("\"kind\":\"export_progress\""),
+            "json: {json}"
+        );
+        assert_eq!(
+            serde_json::from_str::<WorkerEvent>(&json).unwrap(),
+            progress
+        );
+        assert_eq!(progress.to_log_line().level, Level::Info);
+
+        let finished = WorkerEvent::ExportFinished {
+            path: "/out/clip_panorama.mp4".to_string(),
+            encoder: "h264_nvenc".to_string(),
+            hardware: true,
+            variant: ExportVariant::Panorama,
+        };
+        let json = serde_json::to_string(&finished).unwrap();
+        assert!(
+            json.contains("\"kind\":\"export_finished\""),
+            "json: {json}"
+        );
+        assert!(json.contains("\"variant\":\"panorama\""), "json: {json}");
+        assert_eq!(
+            serde_json::from_str::<WorkerEvent>(&json).unwrap(),
+            finished
+        );
+        let line = finished.to_log_line();
+        assert_eq!(line.level, Level::Info);
+        assert!(
+            line.message.contains("hardware encoder h264_nvenc"),
+            "{line:?}"
+        );
+
+        let cancelled = WorkerEvent::ExportCancelled;
+        let json = serde_json::to_string(&cancelled).unwrap();
+        assert!(
+            json.contains("\"kind\":\"export_cancelled\""),
+            "json: {json}"
+        );
+        assert_eq!(
+            serde_json::from_str::<WorkerEvent>(&json).unwrap(),
+            WorkerEvent::ExportCancelled
+        );
+        assert_eq!(cancelled.to_log_line().level, Level::Warn);
+        assert!(
+            cancelled
+                .to_log_line()
+                .message
+                .contains("no file was written"),
+            "a cancel must claim no output path"
+        );
+
+        let failed = WorkerEvent::ExportFailed {
+            message: "the encoder produced no video frames".to_string(),
+        };
+        let json = serde_json::to_string(&failed).unwrap();
+        assert!(json.contains("\"kind\":\"export_failed\""), "json: {json}");
+        assert_eq!(serde_json::from_str::<WorkerEvent>(&json).unwrap(), failed);
+        assert_eq!(failed.to_log_line().level, Level::Error);
+    }
+
+    #[test]
+    fn encoder_list_and_fallback_events_project_to_the_locked_copy() {
+        // EXPT-02: the probe list carries HW/SW flags; the fallback is a WARN
+        // naming both encoders (never a silent hardware→software switch).
+        let list = WorkerEvent::EncoderList {
+            encoders: vec![
+                EncoderView {
+                    name: "h264_nvenc".to_string(),
+                    description: "NVIDIA NVENC H.264".to_string(),
+                    is_hardware: true,
+                },
+                EncoderView {
+                    name: "libx264".to_string(),
+                    description: "libx264 H.264".to_string(),
+                    is_hardware: false,
+                },
+            ],
+            auto: EncoderView {
+                name: "h264_nvenc".to_string(),
+                description: "NVIDIA NVENC H.264".to_string(),
+                is_hardware: true,
+            },
+            auto_hardware: true,
+        };
+        let json = serde_json::to_string(&list).unwrap();
+        assert!(json.contains("\"kind\":\"encoder_list\""), "json: {json}");
+        assert!(json.contains("\"is_hardware\":true"), "json: {json}");
+        assert_eq!(serde_json::from_str::<WorkerEvent>(&json).unwrap(), list);
+        assert_eq!(list.to_log_line().level, Level::Info);
+
+        let fallback = WorkerEvent::ExportFallback {
+            requested: "h264_nvenc".to_string(),
+            used: "libx264".to_string(),
+        };
+        let json = serde_json::to_string(&fallback).unwrap();
+        assert!(
+            json.contains("\"kind\":\"export_fallback\""),
+            "json: {json}"
+        );
+        assert_eq!(
+            serde_json::from_str::<WorkerEvent>(&json).unwrap(),
+            fallback
+        );
+        let line = fallback.to_log_line();
+        assert_eq!(line.level, Level::Warn);
+        assert_eq!(
+            line.message,
+            "Export encoder fallback: h264_nvenc unavailable, using libx264 (software)"
+        );
+    }
+
+    #[test]
+    fn export_in_progress_error_renders_plain_language() {
+        assert_eq!(
+            WorkerError::ExportInProgress.to_string(),
+            "export in progress — wait for it to finish or cancel it"
+        );
+        let event = WorkerEvent::Failed(WorkerError::ExportInProgress);
+        assert_eq!(event.to_log_line().level, Level::Error);
     }
 }

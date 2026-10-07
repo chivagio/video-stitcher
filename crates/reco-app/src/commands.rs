@@ -68,18 +68,63 @@ pub async fn preview(state: tauri::State<'_, WorkerHandle>) -> Result<(), Worker
     state.send(WorkerCommand::Preview)
 }
 
-/// Run the hardcoded file→file export to the fixed output path (D-08).
+/// Run a typed export with the operator's preset/encoder/trim/variant (EXPT-01).
 ///
-/// Thin, same contract as [`import`]: post `Export` and return. Export runs on
-/// the worker thread (the engine's one-shot file→file job), never on the
-/// webview/main thread.
+/// Thin, same contract as [`import`]: post `Export { settings }` and return.
+/// Export runs on the worker thread (the engine's one-shot file→file job),
+/// never on the webview/main thread. The typed settings are parsed with a
+/// default-on-unknown inside the worker (T-05-01) — the command handler never
+/// names an engine type.
 ///
 /// # Errors
 ///
 /// Returns [`WorkerError::ChannelClosed`] if the worker has already exited.
 #[tauri::command]
-pub async fn export(state: tauri::State<'_, WorkerHandle>) -> Result<(), WorkerError> {
-    state.send(WorkerCommand::Export)
+pub async fn export_with(
+    state: tauri::State<'_, WorkerHandle>,
+    settings: crate::events::ExportSettings,
+) -> Result<(), WorkerError> {
+    state.send(WorkerCommand::Export { settings })
+}
+
+/// Cancel a running export (EXPT-04).
+///
+/// # The documented control-plane bypass
+///
+/// Export runs synchronously on the worker thread (like calibration), so a
+/// command posted to the worker's channel would not be observed until the
+/// export already returned. This handler therefore sets the shared
+/// [`Arc<AtomicBool>`](std::sync::atomic::AtomicBool) that `StitchJob::run`
+/// polls **directly** — it deliberately posts nothing to the blocked channel.
+/// The flag is distinct from the calibration flag, so a stray export cancel can
+/// never abort a calibration (prohibition).
+///
+/// # Errors
+///
+/// Never fails; returns `Ok(())` so the frontend can always clear its
+/// "Cancelling…" state.
+#[tauri::command]
+pub async fn cancel_export(
+    state: tauri::State<'_, crate::worker::ExportCancel>,
+) -> Result<(), WorkerError> {
+    state.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    Ok(())
+}
+
+/// Probe the available encoders for a codec (EXPT-02).
+///
+/// Thin, same contract as [`import`]: post `ProbeEncoders { codec }` and
+/// return; the worker emits the typed `EncoderList` event.
+///
+/// # Errors
+///
+/// Returns [`WorkerError::ChannelClosed`] if the worker has already exited.
+#[tauri::command]
+pub async fn probe_encoders(
+    state: tauri::State<'_, WorkerHandle>,
+    codec: String,
+) -> Result<(), WorkerError> {
+    state.send(WorkerCommand::ProbeEncoders { codec })
 }
 
 /// Begin/continue playing the preview session (PREV-02).
@@ -1053,8 +1098,35 @@ pub enum WorkerCommand {
     /// Start the live stitched-frame preview loop (D-07).
     Preview,
 
-    /// Run the hardcoded file→file export to the fixed output path (D-08).
-    Export,
+    /// Run a typed export described by `settings` (EXPT-01).
+    ///
+    /// Replaces Phase 1's fixed-path `Export`: the settings carry the preset
+    /// parameters, encoder override, trim window, variant, and output directory.
+    /// The worker builds a `reco_io::StitchJob` from them and emits typed
+    /// progress/finished/cancelled/failed events. A job: it blocks the worker
+    /// thread until the run finishes or the shared export-cancel flag is set.
+    Export {
+        /// The typed export request.
+        settings: crate::events::ExportSettings,
+    },
+
+    /// Cancel a running export (EXPT-04).
+    ///
+    /// A typed mirror of the `cancel_export` command; because the export blocks
+    /// the worker loop, the real cancel path writes the shared
+    /// [`ExportCancel`](crate::worker::ExportCancel) flag directly. This command
+    /// exists for protocol completeness and the same direct-write handler.
+    CancelExport,
+
+    /// Probe the available encoders for `codec` and emit an `EncoderList`
+    /// (EXPT-02).
+    ///
+    /// A cheap job: the worker enumerates encoders via FFmpeg and reports them
+    /// in preference order (hardware first).
+    ProbeEncoders {
+        /// The codec name to enumerate encoders for (`"h264"` / `"hevc"` / `"av1"`).
+        codec: String,
+    },
 
     /// Forward a transport-agnostic input intent (pan / zoom / quality) to the
     /// worker's pose state on the same message-passing path as the other

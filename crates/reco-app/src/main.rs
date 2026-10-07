@@ -64,7 +64,9 @@ fn main() -> anyhow::Result<()> {
         .invoke_handler(tauri::generate_handler![
             commands::import,
             commands::preview,
-            commands::export,
+            commands::export_with,
+            commands::cancel_export,
+            commands::probe_encoders,
             commands::play,
             commands::pause,
             commands::seek,
@@ -228,12 +230,19 @@ fn run_skeleton(app: &mut tauri::App) -> Result<(), SkeletonError> {
     // the documented bypass of the command channel the blocked worker cannot
     // drain (RESEARCH E8 / Pitfall 3).
     let calibration_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // The export-cancel flag (EXPT-04) mirrors the calibration one: a clone goes
+    // to the worker (which passes it to `StitchJob::run`), and the original is
+    // managed as Tauri state so `cancel_export` can set it directly. It is
+    // deliberately a DIFFERENT flag from `calibration_cancel` so a stray export
+    // cancel can never abort a calibration (prohibition).
+    let export_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (worker, events, readback_tx, manual_frame_slot) = worker::spawn_gpu_worker(
         instance,
         presenter_chain,
         rect,
         startup_fallback,
         std::sync::Arc::clone(&calibration_cancel),
+        std::sync::Arc::clone(&export_cancel),
     )?;
     // The webview bridge: drain typed worker events on an async Tauri task and
     // forward each one to the frontend. The JS `listen("worker-event")` side
@@ -286,6 +295,7 @@ fn run_skeleton(app: &mut tauri::App) -> Result<(), SkeletonError> {
     // manual preview/validation RGBA off the JSON `worker-event-typed` bridge.
     app.manage(worker::ManualFrameSender(manual_frame_slot));
     app.manage(worker::CalibrationCancel(calibration_cancel));
+    app.manage(worker::ExportCancel(export_cancel));
     app.manage(window);
 
     Ok(())

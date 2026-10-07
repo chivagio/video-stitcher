@@ -94,6 +94,16 @@ pub struct ReadbackSender(pub Sender<tauri::ipc::Channel<tauri::ipc::Response>>)
 /// between steps. Reset to `false` at the start of every calibration run.
 pub struct CalibrationCancel(pub Arc<AtomicBool>);
 
+/// The shared export-cancel flag, managed as Tauri app state (EXPT-04).
+///
+/// Mirrors [`CalibrationCancel`]: `cancel_export` writes `true` into this flag
+/// directly because the export job blocks the single worker loop, so a posted
+/// `CancelExport` command would not be observed until the job already returned.
+/// The flag is **distinct** from the calibration flag so a stray export cancel
+/// can never abort a calibration (prohibition: never reuse the calibration
+/// flag). Reset to `false` at the start of every export run.
+pub struct ExportCancel(pub Arc<AtomicBool>);
+
 /// The webview readback channel type (raw frame bytes as an `ArrayBuffer`).
 pub type ReadbackChannel = tauri::ipc::Channel<tauri::ipc::Response>;
 
@@ -489,6 +499,93 @@ impl EventSink {
     /// Emit that the current result no longer matches the inputs (D3-08).
     fn result_invalidated(&self) {
         let _ = self.tx.send(WorkerEvent::ResultInvalidated);
+    }
+
+    /// Emit per-frame export progress (EXPT-04).
+    ///
+    /// The percent/frames/elapsed/ETA ride the typed channel; the process log
+    /// gets the same line via [`WorkerEvent::to_log_line`] so a headless run sees
+    /// the progress narrative too. The real backend's `on_progress` closure is
+    /// `Send + 'static` and sends directly through a cloned `Sender`, so only the
+    /// GPU-free mock (and tests) reach this helper.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn export_progress(
+        &self,
+        frames_completed: u64,
+        total: Option<u64>,
+        elapsed_ms: u64,
+        eta_ms: Option<u64>,
+        percent: f64,
+    ) {
+        let _ = self.tx.send(WorkerEvent::ExportProgress {
+            frames_completed,
+            total,
+            elapsed_ms,
+            eta_ms,
+            percent,
+        });
+    }
+
+    /// Emit a completed export with the resolved encoder (EXPT-04).
+    fn export_finished(
+        &self,
+        path: impl Into<String>,
+        encoder: impl Into<String>,
+        hardware: bool,
+        variant: crate::events::ExportVariant,
+    ) {
+        let event = WorkerEvent::ExportFinished {
+            path: path.into(),
+            encoder: encoder.into(),
+            hardware,
+            variant,
+        };
+        let line = event.to_log_line();
+        log::info!("{}", line.message);
+        let _ = self.tx.send(event);
+    }
+
+    /// Emit a cancelled export (EXPT-04). No output path is claimed.
+    fn export_cancelled(&self) {
+        log::warn!("export cancelled — no file was written");
+        let _ = self.tx.send(WorkerEvent::ExportCancelled);
+    }
+
+    /// Emit a failed export with a plain-language message (EXPT-04).
+    ///
+    /// No output path is claimed. Mirrored to the process log at ERROR.
+    fn export_failed(&self, message: impl Into<String>) {
+        let message = message.into();
+        log::error!("export failed: {message}");
+        let _ = self.tx.send(WorkerEvent::ExportFailed { message });
+    }
+
+    /// Emit the probed encoder list for a codec (EXPT-02).
+    fn encoder_list(
+        &self,
+        encoders: Vec<crate::events::EncoderView>,
+        auto: crate::events::EncoderView,
+        auto_hardware: bool,
+    ) {
+        let _ = self.tx.send(WorkerEvent::EncoderList {
+            encoders,
+            auto,
+            auto_hardware,
+        });
+    }
+
+    /// Emit the explicit hardware→software fallback (EXPT-02).
+    ///
+    /// Mirrored to the process log at WARN so the fallback is never silent. The
+    /// typed half lets the webview render the locked banner copy.
+    fn export_fallback(&self, requested: impl Into<String>, used: impl Into<String>) {
+        let event = WorkerEvent::ExportFallback {
+            requested: requested.into(),
+            used: used.into(),
+        };
+        let line = event.to_log_line();
+        log::warn!("{}", line.message);
+        let _ = self.tx.send(event);
     }
 
     /// Emit that a manual calibration session opened (MANU-01 / MANU-03).
@@ -1563,8 +1660,32 @@ pub trait EngineBackend: Send {
     /// reset). Must run at a command boundary (no `SurfaceTexture` alive).
     fn resize_viewport(&mut self, width: u32, height: u32, events: &EventSink);
 
-    /// Run the hardcoded file→file export until `interrupted` is set.
-    fn export(&mut self, events: &EventSink, interrupted: &AtomicBool) -> Result<(), WorkerError>;
+    /// Run the file→file export described by `settings` until `interrupted` is
+    /// set (EXPT-01/EXPT-02/EXPT-04).
+    ///
+    /// Builds a `reco_io::StitchJob` from the typed settings — the worker never
+    /// calls FFmpeg or the encoder directly. Emits `ExportProgress` per frame,
+    /// `ExportFinished`/`ExportCancelled`/`ExportFailed` on completion, and a
+    /// typed `ExportFallback` + WARN when hardware is unavailable.
+    fn export(
+        &mut self,
+        settings: &crate::events::ExportSettings,
+        events: &EventSink,
+        interrupted: &AtomicBool,
+    ) -> Result<(), WorkerError>;
+
+    /// The backend's shared export-cancel flag (EXPT-04).
+    ///
+    /// `cancel_export` sets the same `Arc` from the Tauri command layer (the
+    /// loop is blocked during a run); the loop reads it to clear a stale cancel
+    /// and passes it to [`Self::export`]. Distinct from the calibration flag.
+    fn export_cancel(&self) -> Arc<AtomicBool>;
+
+    /// Probe the available encoders for `codec` and emit a typed `EncoderList`
+    /// (EXPT-02).
+    ///
+    /// The worker owns the probe; the webview never enumerates encoders itself.
+    fn probe_encoders(&self, codec: &str, events: &EventSink);
 
     /// Dispatch a transport-agnostic input intent to the worker's pose state.
     fn dispatch_intent(&mut self, intent: reco_control::ControlIntent);
@@ -2002,12 +2123,26 @@ fn handle_command<B: EngineBackend>(
                 events.failed(e);
             }
         }
-        WorkerCommand::Export => {
-            interrupted.store(false, Ordering::SeqCst);
-            match backend.export(events, interrupted) {
-                Ok(()) => events.info("export finished"),
-                Err(e) => events.failed(e),
+        WorkerCommand::Export { settings } => {
+            // EXPT-04: use the dedicated export-cancel flag, not the loop's
+            // `interrupted` (which is the shutdown flag). Clear a stale cancel
+            // from a previous run first. The backend emits the typed
+            // finished/cancelled/failed events; the loop only surfaces a
+            // programming-level `Err`.
+            let cancel = backend.export_cancel();
+            cancel.store(false, Ordering::SeqCst);
+            if let Err(e) = backend.export(&settings, events, cancel.as_ref()) {
+                events.failed(e);
             }
+        }
+        WorkerCommand::CancelExport => {
+            // The loop is blocked inside the export job, so this arm is reached
+            // only after the run; the real cancel path is the Tauri command
+            // writing the same shared flag directly (mirroring `cancel_calibration`).
+            backend.export_cancel().store(true, Ordering::SeqCst);
+        }
+        WorkerCommand::ProbeEncoders { codec } => {
+            backend.probe_encoders(&codec, events);
         }
         WorkerCommand::Intent(intent) => backend.dispatch_intent(intent),
         WorkerCommand::RepublishProjection => backend.republish_projection(events),
@@ -2037,6 +2172,137 @@ fn emit_transport<B: EngineBackend>(backend: &mut B, events: &EventSink) {
     let state = transport.state();
     let loop_enabled = transport.loop_enabled();
     events.transport(state, loop_enabled);
+}
+
+/// Whether `cmd` is a preview/edit command that the modal export must reject
+/// while an export is in flight (EXPT-04 / CONTEXT modal decision).
+fn is_modal_forbidden(cmd: &WorkerCommand) -> bool {
+    matches!(
+        cmd,
+        WorkerCommand::Preview
+            | WorkerCommand::Play
+            | WorkerCommand::SetInput { .. }
+            | WorkerCommand::ClearInput { .. }
+            | WorkerCommand::StartCalibration { .. }
+            | WorkerCommand::ManualBegin { .. }
+            | WorkerCommand::ManualSetFrame { .. }
+            | WorkerCommand::ManualExit
+            | WorkerCommand::ManualDetectSync
+            | WorkerCommand::ManualSetSync { .. }
+            | WorkerCommand::ManualAddPin { .. }
+            | WorkerCommand::ManualMovePin { .. }
+            | WorkerCommand::ManualRemovePin { .. }
+            | WorkerCommand::ManualClearPins
+            | WorkerCommand::ManualSetLens { .. }
+            | WorkerCommand::ManualSetLayout { .. }
+            | WorkerCommand::ManualResetLens
+            | WorkerCommand::ManualResetRig
+            | WorkerCommand::ManualValidate { .. }
+            | WorkerCommand::ManualSave { .. }
+    )
+}
+
+/// Estimated milliseconds remaining for an export (EXPT-04).
+///
+/// `eta = elapsed × (total − completed) / completed`. Returns `None` when the
+/// total is unknown or no frame has completed yet — an honest unknown, never a
+/// division by zero and never a fabricated `0` (the UI renders `Not reported`).
+pub fn eta_ms(elapsed_ms: u64, completed: u64, total: Option<u64>) -> Option<u64> {
+    let total = total?;
+    if completed == 0 || total == 0 {
+        return None;
+    }
+    Some(elapsed_ms.saturating_mul(total.saturating_sub(completed)) / completed)
+}
+
+/// Parse an output codec name, defaulting to H.264 on an unknown string.
+///
+/// T-05-01: the string is parsed through the engine's own `FromStr`; an unknown
+/// value is never injected as a raw encoder argument — it falls back to H.264
+/// and the caller logs a WARN naming the rejected value.
+fn parse_output_codec(name: &str) -> (reco_io::output::Codec, Option<String>) {
+    match name.parse::<reco_io::output::Codec>() {
+        Ok(codec) => (codec, None),
+        Err(e) => (reco_io::output::Codec::default(), Some(e)),
+    }
+}
+
+/// Parse an output quality name, defaulting to Balanced on an unknown string.
+fn parse_output_quality(name: &str) -> (reco_io::output::Quality, Option<String>) {
+    match name.parse::<reco_io::output::Quality>() {
+        Ok(quality) => (quality, None),
+        Err(e) => (reco_io::output::Quality::default(), Some(e)),
+    }
+}
+
+/// Resolve the encoder an export will use from the probed candidates (EXPT-02).
+///
+/// `available` is in preference order (hardware first). `requested` is the
+/// operator's override, or `None` for Auto. Returns the chosen encoder and, when
+/// the choice is a **software fallback**, the `(requested, used)` pair for the
+/// typed fallback event + WARN. An override that names an unavailable encoder
+/// falls back to the auto candidate (the "override unavailable" edge probe).
+fn choose_encoder(
+    available: &[reco_io::ffmpeg::encoder::EncoderInfo],
+    requested: Option<&str>,
+) -> (
+    reco_io::ffmpeg::encoder::EncoderInfo,
+    Option<(String, String)>,
+) {
+    let auto = available.first();
+    match requested {
+        // Auto: pick the best allowed candidate. If even the head is software,
+        // the hardware was unavailable — an explicit fallback naming the head as
+        // both requested and used (the banner shows the software encoder).
+        None => match auto {
+            Some(enc) => {
+                let fallback = (!enc.is_hardware).then(|| (enc.name.clone(), enc.name.clone()));
+                (enc.clone(), fallback)
+            }
+            None => (
+                no_encoder_placeholder(),
+                Some(("auto".to_string(), "none".to_string())),
+            ),
+        },
+        // Override: use it only when the probe knows it. An unknown name is an
+        // unavailable override → fall back to auto.
+        Some(name) => match available.iter().find(|e| e.name == name) {
+            Some(enc) => (enc.clone(), None),
+            None => match auto {
+                Some(enc) => (enc.clone(), Some((name.to_string(), enc.name.clone()))),
+                None => (
+                    no_encoder_placeholder(),
+                    Some((name.to_string(), "none".to_string())),
+                ),
+            },
+        },
+    }
+}
+
+/// The placeholder encoder used when the probe finds no encoder for a codec.
+fn no_encoder_placeholder() -> reco_io::ffmpeg::encoder::EncoderInfo {
+    reco_io::ffmpeg::encoder::EncoderInfo {
+        name: "none".to_string(),
+        description: "no encoder available for this codec".to_string(),
+        is_hardware: false,
+    }
+}
+
+/// Resolve the output path from a directory, the source stem, and the variant.
+///
+/// Deterministic naming (CONTEXT): `<dir>/<stem><suffix>.mp4`. Plan 03 owns
+/// collision handling; this is the single resolution point the worker uses so
+/// the webview never writes a path the worker did not resolve (T-05-02).
+fn resolve_export_output(
+    output_dir: Option<&str>,
+    stem: &str,
+    variant: crate::events::ExportVariant,
+) -> std::path::PathBuf {
+    let dir = output_dir
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let safe_stem = if stem.is_empty() { "export" } else { stem };
+    dir.join(format!("{safe_stem}{}.mp4", variant.suffix()))
 }
 
 /// The worker loop: drain pending commands (FIFO), tick an active session, then
@@ -2071,9 +2337,18 @@ fn worker_loop<B: EngineBackend>(
 
         // Drain everything pending, in arrival order (FOUND-03 adjacency).
         let mut ran_job = false;
+        // EXPT-04 modal enforcement: once an Export has run in this drain pass,
+        // any preview/edit command queued behind it is rejected with a typed
+        // "export in progress" response rather than silently executed (the
+        // export blocks the loop, so those commands were issued during the run).
+        let mut export_ran = false;
         loop {
             match rx.try_recv() {
                 Ok(cmd) => {
+                    if export_ran && is_modal_forbidden(&cmd) {
+                        events.failed(WorkerError::ExportInProgress);
+                        continue;
+                    }
                     // Flush a coalesced manual preview before teardown so a
                     // pending frame is not lost when the worker stops; `shutdown`
                     // tears down engine state the preview render needs.
@@ -2082,17 +2357,19 @@ fn worker_loop<B: EngineBackend>(
                     {
                         events.failed(e);
                     }
+                    let is_export = matches!(cmd, WorkerCommand::Export { .. });
                     let is_job = matches!(
                         cmd,
                         WorkerCommand::Import
                             | WorkerCommand::Preview
-                            | WorkerCommand::Export
+                            | WorkerCommand::Export { .. }
                             | WorkerCommand::SetInput { .. }
                             | WorkerCommand::StartCalibration { .. }
                             | WorkerCommand::LoadProfile { .. }
                             | WorkerCommand::SaveProfile { .. }
                     );
                     let keep_going = handle_command(cmd, &mut backend, &events, &interrupted);
+                    export_ran |= is_export;
                     ran_job |= is_job;
                     if !keep_going {
                         return;
@@ -2662,6 +2939,11 @@ pub struct GpuEngineBackend {
     /// [`CalibrationCancel`] managed in Tauri state; `calibrate` passes it to
     /// `calibrate_videos_with_gpu`, which polls it between steps.
     calibration_cancel: Arc<AtomicBool>,
+    /// The shared export-cancel flag (EXPT-04). A clone of the [`ExportCancel`]
+    /// managed in Tauri state; `export` passes it to `StitchJob::run`, which
+    /// polls it per frame. Distinct from `calibration_cancel` (prohibition: a
+    /// stray export cancel must never abort a calibration).
+    export_cancel: Arc<AtomicBool>,
     /// The single GPU device owner (FOUND-03). Declared **last** so it drops
     /// after the decode source, renderer, and presenter surface — the documented
     /// teardown order (FOUND-06 / RESEARCH Pattern 6). Actually field 1 held the
@@ -2768,6 +3050,7 @@ impl GpuEngineBackend {
         viewport: crate::presenter::ViewportRect,
         startup_fallback: Option<String>,
         calibration_cancel: Arc<AtomicBool>,
+        export_cancel: Arc<AtomicBool>,
     ) -> Result<Self, WorkerError> {
         // The presenter chain (PREV-05), strongest-first, pre-built on the setup
         // thread. Index each presenter into its fixed chain slot; the first entry
@@ -2878,6 +3161,7 @@ impl GpuEngineBackend {
             device_lost,
             recovery_attempts: 0,
             calibration_cancel,
+            export_cancel,
             renderer: None,
             renderer_input: None,
         })
@@ -4929,21 +5213,196 @@ impl EngineBackend for GpuEngineBackend {
         self.reconfigure_viewport(events);
     }
 
-    fn export(&mut self, events: &EventSink, interrupted: &AtomicBool) -> Result<(), WorkerError> {
-        let paths =
-            crate::hardcoded::media_paths().map_err(|e| WorkerError::Engine(e.to_string()))?;
-        let output = crate::hardcoded::export_output_path()
-            .map_err(|e| WorkerError::Engine(e.to_string()))?;
-        events.info("export started");
-        reco_io::StitchJob::new(
-            paths.left.as_path(),
-            paths.right.as_path(),
-            paths.calibration.as_path(),
+    fn export(
+        &mut self,
+        settings: &crate::events::ExportSettings,
+        events: &EventSink,
+        interrupted: &AtomicBool,
+    ) -> Result<(), WorkerError> {
+        use crate::events::InputRole;
+
+        // ── Resolve inputs (operator-chosen, else the hardcoded import pair) ──
+        let hardcoded = crate::hardcoded::media_paths().ok();
+        let left = self
+            .input_paths
+            .get(&InputRole::Left)
+            .cloned()
+            .or_else(|| hardcoded.as_ref().map(|p| p.left.display().to_string()));
+        let right = self
+            .input_paths
+            .get(&InputRole::Right)
+            .cloned()
+            .or_else(|| hardcoded.as_ref().map(|p| p.right.display().to_string()));
+        let (Some(left), Some(right)) = (left, right) else {
+            events.export_failed("no clips are loaded — select both camera inputs first");
+            return Ok(());
+        };
+
+        // ── Resolve the retained calibration (never re-read the file) ──
+        let Some(cal) = self
+            .current_calibration
+            .clone()
+            .or_else(|| self.calibration.clone())
+        else {
+            events.export_failed("no calibration result — calibrate the cameras first");
+            return Ok(());
+        };
+
+        // ── Parse the typed codec/quality with a default on unknown (T-05-01) ──
+        let (codec, codec_warn) = parse_output_codec(&settings.codec);
+        if let Some(warn) = &codec_warn {
+            events.info(format!("export codec {warn} — using H.264"));
+        }
+        let (quality, quality_warn) = parse_output_quality(&settings.quality);
+        if let Some(warn) = &quality_warn {
+            events.info(format!("export quality {warn} — using Balanced"));
+        }
+        if settings.bitrate_kbps.is_some() {
+            // The engine exposes quality tiers, not a kbps target; surface the
+            // limitation rather than silently dropping the operator's value.
+            events.info("explicit bitrate is not supported yet — using the quality tier");
+        }
+
+        // ── Probe encoders and resolve the encoder (EXPT-02) ──
+        let video_codec: reco_io::ffmpeg::encoder::VideoCodec = codec.into();
+        let available = reco_io::ffmpeg::encoder::available_encoders(video_codec);
+        if available.is_empty() {
+            events.export_failed(format!("no encoder available for {video_codec:?}"));
+            return Ok(());
+        }
+        let (chosen, fallback) = choose_encoder(&available, settings.encoder_name.as_deref());
+        if let Some((requested, used)) = fallback {
+            // Explicit, never-silent hardware→software fallback (EXPT-02).
+            events.export_fallback(requested, used);
+        }
+        events.info(format!(
+            "Export encoder: {} ({})",
+            chosen.name,
+            if chosen.is_hardware {
+                "hardware"
+            } else {
+                "software"
+            }
+        ));
+
+        // ── Resolve the deterministic output path (T-05-02) ──
+        let stem = std::path::Path::new(&left)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("export")
+            .to_string();
+        let output = match settings.output_dir.as_deref() {
+            Some(dir) => resolve_export_output(Some(dir), &stem, settings.variant),
+            None => {
+                let dir = std::path::Path::new(&left)
+                    .parent()
+                    .map(|p| p.display().to_string());
+                resolve_export_output(dir.as_deref(), &stem, settings.variant)
+            }
+        };
+
+        // ── Frame rate for the trim window (the SAME fps the engine uses) ──
+        let fps = reco_io::adapters::FfmpegFileSource::frame_rate(std::path::Path::new(&left))
+            .map(|(n, d)| if d != 0 { n as f64 / d as f64 } else { 30.0 })
+            .unwrap_or_else(|_| {
+                events.info("source frame rate unavailable — assuming 30 fps for the trim window");
+                30.0
+            });
+
+        // ── Total output frames for the ETA (honest None when unknown) ──
+        let source_total = self.loaded.as_ref().and_then(|t| t.total_frames());
+        let total = match (settings.start_frame, settings.end_frame, source_total) {
+            (Some(s), Some(e), _) if e > s => Some(e - s),
+            (Some(s), None, Some(t)) if t > s => Some(t - s),
+            (None, Some(e), _) => Some(e),
+            (None, None, Some(t)) => Some(t),
+            _ => None,
+        };
+
+        events.info(format!("export started: {}", output.display()));
+
+        // ── Build the job from typed settings (the ONLY encode path) ──
+        let mut job = reco_io::StitchJob::with_calibration(
+            left.as_str(),
+            right.as_str(),
+            cal.clone(),
             output.as_path(),
         )
-        .run(interrupted)
-        .map_err(|e| WorkerError::Engine(e.to_string()))?;
+        .codec(codec)
+        .quality(quality)
+        .resolution(settings.width, settings.height)
+        .encoder_name(chosen.name.clone())
+        .sync_offset(cal.sync_offset);
+        if let Some(start) = settings.start_frame {
+            job = job.start_time(start as f64 / fps);
+        }
+        if let Some(end) = settings.end_frame {
+            job = job.end_time(end as f64 / fps);
+        }
+
+        // Per-frame progress → typed ExportProgress with ETA (EXPT-04).
+        let tx = events.sender_clone();
+        job = job.on_progress(move |p: &reco_core::session::types::FrameProgress| {
+            let elapsed_ms = p.elapsed.as_millis() as u64;
+            let percent = match total {
+                Some(t) if t > 0 => 100.0 * p.frames_completed as f64 / t as f64,
+                _ => 0.0,
+            };
+            let _ = tx.send(WorkerEvent::ExportProgress {
+                frames_completed: p.frames_completed,
+                total,
+                elapsed_ms,
+                eta_ms: eta_ms(elapsed_ms, p.frames_completed, total),
+                percent,
+            });
+        });
+
+        let result = job.run(interrupted);
+
+        // The typed terminal event: cancel/finish/fail — never a claimed path on
+        // cancel or failure (prohibition).
+        if interrupted.load(Ordering::SeqCst) {
+            events.export_cancelled();
+        } else {
+            match result {
+                Ok(r) => events.export_finished(
+                    output.display().to_string(),
+                    r.encoder_name,
+                    chosen.is_hardware,
+                    settings.variant,
+                ),
+                Err(e) => events.export_failed(e.to_string()),
+            }
+        }
         Ok(())
+    }
+
+    fn export_cancel(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.export_cancel)
+    }
+
+    fn probe_encoders(&self, codec: &str, events: &EventSink) {
+        let (codec, _) = parse_output_codec(codec);
+        let video_codec: reco_io::ffmpeg::encoder::VideoCodec = codec.into();
+        let encoders: Vec<crate::events::EncoderView> =
+            reco_io::ffmpeg::encoder::available_encoders(video_codec)
+                .into_iter()
+                .map(|e| crate::events::EncoderView {
+                    name: e.name,
+                    description: e.description,
+                    is_hardware: e.is_hardware,
+                })
+                .collect();
+        let auto = encoders
+            .first()
+            .cloned()
+            .unwrap_or_else(|| crate::events::EncoderView {
+                name: "none".to_string(),
+                description: "no encoder available for this codec".to_string(),
+                is_hardware: false,
+            });
+        let auto_hardware = auto.is_hardware;
+        events.encoder_list(encoders, auto, auto_hardware);
     }
 
     fn dispatch_intent(&mut self, intent: reco_control::ControlIntent) {
@@ -5662,6 +6121,7 @@ pub fn spawn_gpu_worker(
     viewport: crate::presenter::ViewportRect,
     startup_fallback: Option<String>,
     calibration_cancel: Arc<AtomicBool>,
+    export_cancel: Arc<AtomicBool>,
 ) -> Result<SpawnedWorker, WorkerError> {
     let backend = GpuEngineBackend::new(
         instance,
@@ -5669,6 +6129,7 @@ pub fn spawn_gpu_worker(
         viewport,
         startup_fallback,
         calibration_cancel,
+        export_cancel,
     )?;
     let readback_tx = backend.readback_sender();
     let (worker, events, manual_frame_slot) = EngineWorker::spawn_with_manual_slot(backend);
@@ -5980,6 +6441,15 @@ mod tests {
         has_result: bool,
         /// The mock's shared calibration-cancel flag (CALB-02).
         calibration_cancel: Arc<AtomicBool>,
+        /// The mock's shared export-cancel flag (EXPT-04). Defaults to a fresh
+        /// `false` flag; a test can share one via [`MockBackend::with_export_cancel`]
+        /// to set it and assert `ExportCancelled`.
+        export_cancel: Arc<AtomicBool>,
+        /// A per-frame delay the mock's export sleeps, so a test can set the
+        /// export-cancel flag mid-run (the worker clears a stale cancel at the
+        /// start of every run, so a pre-set flag is intentionally ignored).
+        /// `ZERO` by default, so ordinary tests stay fast.
+        mock_export_delay: Duration,
         /// The mock's modelled native-view visibility (UI-SPEC Screen Router).
         ///
         /// Mirrors the real backend's `presenter.set_visible(screen == Preview)`
@@ -6057,6 +6527,8 @@ mod tests {
                 mock_field_roi: None,
                 has_result: false,
                 calibration_cancel: Arc::new(AtomicBool::new(false)),
+                export_cancel: Arc::new(AtomicBool::new(false)),
+                mock_export_delay: Duration::ZERO,
                 screen_visible: Arc::new(std::sync::Mutex::new(None)),
                 manual_open: false,
                 manual_pins: Vec::new(),
@@ -6090,6 +6562,20 @@ mod tests {
         /// moved onto the worker thread.
         fn with_screen_visible(mut self, visible: Arc<std::sync::Mutex<Option<bool>>>) -> Self {
             self.screen_visible = visible;
+            self
+        }
+
+        /// Share the export-cancel flag with the test (EXPT-04), so a test can
+        /// set it before posting `Export` and assert `ExportCancelled`.
+        fn with_export_cancel(mut self, flag: Arc<AtomicBool>) -> Self {
+            self.export_cancel = flag;
+            self
+        }
+
+        /// Give the mock's export a per-frame delay so a test can set the
+        /// export-cancel flag while the run is in flight (EXPT-04).
+        fn with_export_delay(mut self, delay: Duration) -> Self {
+            self.mock_export_delay = delay;
             self
         }
 
@@ -6979,12 +7465,62 @@ mod tests {
 
         fn export(
             &mut self,
-            _events: &EventSink,
+            _settings: &crate::events::ExportSettings,
+            events: &EventSink,
             interrupted: &AtomicBool,
         ) -> Result<(), WorkerError> {
             self.record("export");
-            interrupted.store(true, Ordering::SeqCst);
+            // Emit a few per-frame progress ticks, then honour a set cancel flag
+            // (EXPT-04): a cancelled run emits `ExportCancelled` and claims no
+            // path; otherwise the mock completes with a software encoder. The
+            // optional delay lets a test set the flag mid-run (the worker clears
+            // a stale cancel at the start, so a pre-set flag is ignored).
+            let total = 3u64;
+            for i in 1..=total {
+                if interrupted.load(Ordering::SeqCst) {
+                    events.export_cancelled();
+                    return Ok(());
+                }
+                events.export_progress(
+                    i,
+                    Some(total),
+                    i * 10,
+                    eta_ms(i * 10, i, Some(total)),
+                    100.0 * i as f64 / total as f64,
+                );
+                if !self.mock_export_delay.is_zero() {
+                    thread::sleep(self.mock_export_delay);
+                }
+            }
+            if interrupted.load(Ordering::SeqCst) {
+                events.export_cancelled();
+                return Ok(());
+            }
+            events.export_finished(
+                "/tmp/mock_panorama.mp4".to_string(),
+                "libx264".to_string(),
+                false,
+                crate::events::ExportVariant::Panorama,
+            );
             Ok(())
+        }
+
+        fn export_cancel(&self) -> Arc<AtomicBool> {
+            Arc::clone(&self.export_cancel)
+        }
+
+        fn probe_encoders(&self, _codec: &str, events: &EventSink) {
+            let hw = crate::events::EncoderView {
+                name: "h264_nvenc".to_string(),
+                description: "NVIDIA NVENC H.264".to_string(),
+                is_hardware: true,
+            };
+            let sw = crate::events::EncoderView {
+                name: "libx264".to_string(),
+                description: "libx264 H.264".to_string(),
+                is_hardware: false,
+            };
+            events.encoder_list(vec![hw.clone(), sw], hw, true);
         }
 
         fn dispatch_intent(&mut self, intent: reco_control::ControlIntent) {
@@ -9640,7 +10176,11 @@ mod tests {
                 reco_control::PoseIntent::Reset,
             )))
             .unwrap();
-        handle.send(WorkerCommand::Export).unwrap();
+        handle
+            .send(WorkerCommand::Export {
+                settings: crate::events::ExportSettings::default(),
+            })
+            .unwrap();
         handle.send(WorkerCommand::Shutdown).unwrap();
 
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
@@ -10447,6 +10987,125 @@ mod tests {
         // The intent variant's payload is itself `Clone + Send` (asserted in
         // `reco-control`), so it travels the same path as the other commands.
         assert_clone_send::<reco_control::ControlIntent>();
+    }
+
+    #[test]
+    fn eta_ms_is_none_until_a_frame_completes_and_the_total_is_known() {
+        // EXPT-04 edge probe: a zero completed count or an unknown total must
+        // never divide by zero — the UI renders `Not reported`.
+        assert_eq!(eta_ms(1_000, 0, Some(100)), None);
+        assert_eq!(eta_ms(1_000, 10, None), None);
+        assert_eq!(eta_ms(1_000, 10, Some(0)), None);
+        // The plan's formula: elapsed × (total − completed) / completed.
+        assert_eq!(eta_ms(1_000, 50, Some(100)), Some(1_000));
+        // Completed at/over the total is a real zero, not an unknown.
+        assert_eq!(eta_ms(1_000, 100, Some(100)), Some(0));
+    }
+
+    #[test]
+    fn mock_export_emits_per_frame_progress_then_finishes() {
+        // EXPT-04: an export emits per-frame `ExportProgress` and terminates
+        // with `ExportFinished` carrying the resolved encoder.
+        let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (worker, events) = EngineWorker::spawn(MockBackend::new(Arc::clone(&ops)));
+        let handle = worker.handle();
+        handle
+            .send(WorkerCommand::Export {
+                settings: crate::events::ExportSettings::default(),
+            })
+            .unwrap();
+
+        let mut seen = Vec::new();
+        let start = std::time::Instant::now();
+        let mut finished = false;
+        while start.elapsed() < Duration::from_secs(2) {
+            match events.recv_timeout(Duration::from_millis(100)) {
+                Ok(evt) => {
+                    finished = matches!(evt, WorkerEvent::ExportFinished { .. });
+                    seen.push(evt);
+                    if finished {
+                        break;
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        handle.send(WorkerCommand::Shutdown).unwrap();
+
+        assert!(
+            seen.iter()
+                .any(|e| matches!(e, WorkerEvent::ExportProgress { .. })),
+            "an export must emit per-frame ExportProgress: {seen:?}"
+        );
+        assert!(
+            finished,
+            "an export must terminate with ExportFinished: {seen:?}"
+        );
+        assert!(
+            ops.lock().unwrap().contains(&"export"),
+            "the mock export must have run"
+        );
+    }
+
+    #[test]
+    fn mock_export_with_a_set_cancel_emits_export_cancelled() {
+        // EXPT-04: the dedicated `export_cancel` flag (not the calibration flag)
+        // stops the run and yields a typed `ExportCancelled` — never a finished
+        // event and never a claimed output path. The flag is set mid-run (the
+        // worker clears a stale cancel at export start, so a pre-set flag is
+        // intentionally ignored).
+        let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mock = MockBackend::new(Arc::clone(&ops))
+            .with_export_cancel(Arc::clone(&cancel))
+            .with_export_delay(Duration::from_millis(40));
+        let (worker, events) = EngineWorker::spawn(mock);
+        let handle = worker.handle();
+        handle
+            .send(WorkerCommand::Export {
+                settings: crate::events::ExportSettings::default(),
+            })
+            .unwrap();
+
+        let mut seen = Vec::new();
+        let start = std::time::Instant::now();
+        let mut cancelled = false;
+        let mut set_cancel = false;
+        while start.elapsed() < Duration::from_secs(3) {
+            match events.recv_timeout(Duration::from_millis(100)) {
+                Ok(evt) => {
+                    // Set the cancel as soon as the run is provably in flight.
+                    if !set_cancel && matches!(evt, WorkerEvent::ExportProgress { .. }) {
+                        cancel.store(true, Ordering::SeqCst);
+                        set_cancel = true;
+                    }
+                    cancelled = matches!(evt, WorkerEvent::ExportCancelled);
+                    seen.push(evt);
+                    if cancelled {
+                        break;
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        handle.send(WorkerCommand::Shutdown).unwrap();
+
+        assert!(
+            set_cancel,
+            "the export must have started before the cancel was set: {seen:?}"
+        );
+        assert!(
+            cancelled,
+            "a mid-run export_cancel must yield ExportCancelled: {seen:?}"
+        );
+        assert!(
+            !seen
+                .iter()
+                .any(|e| matches!(e, WorkerEvent::ExportFinished { .. })),
+            "a cancelled export must not report finished: {seen:?}"
+        );
     }
 }
 
