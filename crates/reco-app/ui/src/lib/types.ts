@@ -496,6 +496,7 @@ export type WorkerEventTyped =
     }
   | { kind: "export_cancelled"; data: null }
   | { kind: "export_failed"; data: { message: string } }
+  | { kind: "export_path_preview"; data: { path: string } }
   | {
       kind: "encoder_list";
       data: {

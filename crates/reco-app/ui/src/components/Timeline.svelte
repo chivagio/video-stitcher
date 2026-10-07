@@ -4,16 +4,30 @@
   Disabled when no session (empty/loading states).
 -->
 <script lang="ts">
+  import TrimHandles from "./TrimHandles.svelte";
+
   let {
     frame,
     total,
     disabled = false,
     onSeek,
+    inFrame = null,
+    outFrame = null,
+    formatTimecode,
+    onTrimChange,
   }: {
     frame: number;
     total: number | null;
     disabled?: boolean;
     onSeek: (frame: number) => void;
+    /** The trim in point, or `null` for the clip start (EXPT-03). */
+    inFrame?: number | null;
+    /** The trim out point, or `null` for the clip end (EXPT-03). */
+    outFrame?: number | null;
+    /** Format a frame index as a timecode (the transport's exact formatter). */
+    formatTimecode?: (frame: number) => string;
+    /** Emit a trim change; `null` on a side means "the clip edge". */
+    onTrimChange?: (inFrame: number | null, outFrame: number | null) => void;
   } = $props();
 
   let dragging = $state(false);
@@ -74,28 +88,56 @@
   // for the CSS gradient stop. Guarded against a zero-length track (no session
   // yet) so the gradient stays 0% instead of dividing by zero to NaN.
   const progress = $derived(max > 0 ? Math.min(100, (value / max) * 100) : 0);
+
+  // The trim readout's frame→timecode formatter; the transport's exact
+  // formatter is passed in, with a plain frame-index fallback for a caller that
+  // has no rate yet.
+  function defaultFormat(frame: number): string {
+    return `${frame}`;
+  }
 </script>
 
-<input
-  type="range"
-  class="timeline"
-  min="0"
-  {max}
-  step="1"
-  {value}
-  {disabled}
-  style:--progress="{progress}%"
-  aria-label="Timeline"
-  aria-valuetext="{frame} of {total ?? 0}"
-  oninput={handleInput}
-  onchange={handleChange}
-  onkeydown={handleKeyDown}
-  bind:this={el}
-/>
+<div class="timeline-stack">
+  <input
+    type="range"
+    class="timeline"
+    min="0"
+    {max}
+    step="1"
+    {value}
+    {disabled}
+    style:--progress="{progress}%"
+    aria-label="Timeline"
+    aria-valuetext="{frame} of {total ?? 0}"
+    oninput={handleInput}
+    onchange={handleChange}
+    onkeydown={handleKeyDown}
+    bind:this={el}
+  />
+
+  {#if total !== null && total > 1 && onTrimChange}
+    <TrimHandles
+      {total}
+      {inFrame}
+      {outFrame}
+      format={formatTimecode ?? defaultFormat}
+      onChange={onTrimChange}
+    />
+  {/if}
+</div>
 
 <style>
-  .timeline {
+  .timeline-stack {
+    display: flex;
     flex: 1;
+    flex-direction: column;
+    gap: var(--space-xs);
+    min-width: 0;
+  }
+
+  .timeline {
+    flex: none;
+    width: 100%;
     height: 4px;
     -webkit-appearance: none;
     appearance: none;

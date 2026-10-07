@@ -1,7 +1,15 @@
 <!--
-  Export screen (EXPT-01 / EXPT-02 / EXPT-04): a form (preset, encoder, variant,
-  naming preview) plus the MODAL progress state (percent bar, frames done/total,
-  elapsed, ETA, Cancel) and the completion / cancelled / failed states.
+  Export screen (EXPT-01 / EXPT-02 / EXPT-03 / EXPT-05 / EXPT-06): a form
+  (preset, encoder, variant, trim summary, naming preview) plus the MODAL
+  progress state (percent bar, frames done/total, elapsed, ETA, Cancel) and the
+  completion / cancelled / failed states.
+
+  The variant picker offers the three locked compositions — Panorama,
+  Side-by-side, Stacked — whose labels are the `VARIANT_LABELS` copy authored
+  once in `lib/export.svelte.ts`. The trim summary mirrors the timeline's in/out
+  (EXPT-03), and the output naming preview renders the worker-resolved path
+  (`ExportPathPreview`) verbatim, with a collision note when a suffix was added
+  (EXPT-06).
 
   The worker is authoritative: progress, the resolved encoder, and the final
   path are the worker's typed values rendered verbatim — the screen never
@@ -157,11 +165,17 @@
       </section>
 
       <p class="trim-line">
-        Trim: Full clip — trim handles arrive with the timeline.
+        Trim: <span class="mono">{exportStore.deriveTrimSummary()}</span>
       </p>
       <p class="path-line">
-        Output: <span class="mono">{namingPreview}</span>
+        Output: <span class="mono">{exportStore.pathPreview?.path ?? namingPreview}</span>
       </p>
+      {#if exportStore.pathPreviewCollision}
+        <InlineNotice
+          level="warn"
+          message={`Name in use — saving as ${exportStore.pathPreview?.path ?? namingPreview}`}
+        />
+      {/if}
       <p class="meta-line">
         <span class="mono">{exportStore.settings.width}×{exportStore.settings.height}</span>
         · <span class="mono">{exportStore.settings.codec}</span>

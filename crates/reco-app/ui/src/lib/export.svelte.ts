@@ -201,11 +201,23 @@ class ExportStore {
   error = $state<string | null>(null);
   /** Whether an encoder probe is in flight. */
   probing = $state(false);
+  /**
+   * The worker-resolved output path preview (EXPT-06).
+   *
+   * The worker owns the directory + stem + variant + collision suffix; this is
+   * its typed `ExportPathPreview` value rendered verbatim. The webview never
+   * constructs an absolute path itself.
+   */
+  pathPreview = $state<{ path: string } | null>(null);
+  /** Whether a path-preview request is in flight. */
+  pathPreviewing = $state(false);
 
   /** The probed left-input metadata, for the "Source match" derivation. */
   #inputMeta: InputMetadata | null = null;
   /** Unlisten function for the typed worker-event listener. */
   #unlisten: (() => void) | null = null;
+  /** The debounce timer for the worker path preview. */
+  #previewTimer: ReturnType<typeof setTimeout> | null = null;
 
   /** Start listening for typed worker events. */
   async init(): Promise<void> {
@@ -271,6 +283,11 @@ class ExportStore {
         this.result = null;
         break;
       }
+      case "export_path_preview": {
+        // EXPT-06: the worker-resolved path, rendered verbatim.
+        this.pathPreview = { path: event.data.path };
+        break;
+      }
       default:
         break;
     }
@@ -286,6 +303,7 @@ class ExportStore {
       start_frame: this.settings.start_frame,
       end_frame: this.settings.end_frame,
     });
+    this.schedulePathPreview();
   }
 
   /** Choose a preset and re-derive its parameters (EXPT-01). */
@@ -298,6 +316,7 @@ class ExportStore {
       start_frame: this.settings.start_frame,
       end_frame: this.settings.end_frame,
     });
+    this.schedulePathPreview();
   }
 
   /** Set the encoder override, or `null` for Auto (EXPT-02). */
@@ -308,11 +327,69 @@ class ExportStore {
   /** Choose the output variant (EXPT-05). */
   setVariant(variant: ExportVariant): void {
     this.settings = { ...this.settings, variant };
+    this.schedulePathPreview();
   }
 
   /** Set the output directory, or `null` for the default. */
   setOutputDir(dir: string | null): void {
     this.settings = { ...this.settings, output_dir: dir };
+    this.schedulePathPreview();
+  }
+
+  /**
+   * Set the trim window (EXPT-03).
+   *
+   * `null` on a side means "the clip edge" — the same representation the
+   * worker's `ExportSettings` uses, so a full clip is `(null, null)`.
+   */
+  setTrim(inFrame: number | null, outFrame: number | null): void {
+    this.settings = { ...this.settings, start_frame: inFrame, end_frame: outFrame };
+  }
+
+  /**
+   * A monospace trim summary for the export form (EXPT-03).
+   *
+   * The worker clamps an invalid window at export time; this is the operator's
+   * requested window, shown so the form and the timeline agree.
+   */
+  deriveTrimSummary(): string {
+    const { start_frame, end_frame } = this.settings;
+    if (start_frame === null && end_frame === null) return "Full clip";
+    const start = start_frame === null ? "start" : `${start_frame}`;
+    const end = end_frame === null ? "end" : `${end_frame}`;
+    return `${start} → ${end}`;
+  }
+
+  /**
+   * Debounce a worker-side path preview for the current settings (EXPT-06).
+   *
+   * A preset/variant/output-dir change re-arms this window; one preview fires
+   * once the window elapses, so a burst of changes does not spam the worker.
+   */
+  schedulePathPreview(): void {
+    if (this.#previewTimer !== null) clearTimeout(this.#previewTimer);
+    this.#previewTimer = setTimeout(() => {
+      this.#previewTimer = null;
+      void this.previewPath();
+    }, 200);
+  }
+
+  /**
+   * Resolve the deterministic output path via the worker (EXPT-06).
+   *
+   * The worker owns the path; this only asks it to resolve and emit the typed
+   * `ExportPathPreview`. A preview failure is non-fatal: the form keeps its last
+   * path rather than surfacing a modal error.
+   */
+  async previewPath(): Promise<void> {
+    this.pathPreviewing = true;
+    try {
+      await invoke("preview_export_path", { settings: this.settings });
+    } catch {
+      // Non-fatal: keep the last resolved path.
+    } finally {
+      this.pathPreviewing = false;
+    }
   }
 
   /** Probe the available encoders for the current codec (EXPT-02). */
@@ -381,6 +458,21 @@ class ExportStore {
     if (this.fallback !== null) return this.fallback.used;
     if (this.result !== null) return this.result.encoder;
     return this.auto?.name ?? "software";
+  }
+
+  /**
+   * Whether the worker's resolved preview path carries a collision suffix
+   * (EXPT-06).
+   *
+   * True when the basename does not end with the plain `<suffix>.mp4` pattern,
+   * i.e. the worker appended `_1`/`_2` to avoid overwriting an existing file.
+   * The form announces this rather than silently overwriting.
+   */
+  get pathPreviewCollision(): boolean {
+    const path = this.pathPreview?.path;
+    if (!path) return false;
+    const base = path.split(/[\\/]/).pop() ?? path;
+    return !base.endsWith(`${VARIANT_SUFFIX[this.settings.variant]}.mp4`);
   }
 
   /** The monospace progress line (UI-SPEC Copywriting Contract). */

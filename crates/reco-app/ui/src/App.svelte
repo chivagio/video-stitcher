@@ -64,6 +64,13 @@
   // shrinks the native viewport to match.
   let fieldRoiOpen = $state(false);
 
+  // Trim window (EXPT-03). Owned here so the Preview timeline and the Export
+  // form agree on one window; every change is mirrored into the export store,
+  // which stays the single source of the export settings. `null` on a side is
+  // "the clip edge" (a full clip is `(null, null)`).
+  let inFrame = $state<number | null>(null);
+  let outFrame = $state<number | null>(null);
+
   // Initialize stores on mount, then reconcile with the worker.
   onMount(() => {
     void (async () => {
@@ -146,6 +153,20 @@
 
   function handleSeek(frame: number): void {
     void transport.seek(frame);
+  }
+
+  // Trim change (EXPT-03): mirror the Preview timeline's in/out into the export
+  // store so the Export form renders the same window.
+  function handleTrimChange(nextIn: number | null, nextOut: number | null): void {
+    inFrame = nextIn;
+    outFrame = nextOut;
+    exportStore.setTrim(nextIn, nextOut);
+  }
+
+  // The trim readout's exact timecode formatter (bound so `this` is preserved
+  // when passed as a prop).
+  function formatTimecode(frame: number): string {
+    return transport.formatTimecode(frame);
   }
 
   // View toggle.
@@ -339,6 +360,10 @@
           total={transport.total}
           disabled={!controlsEnabled}
           onSeek={handleSeek}
+          {inFrame}
+          {outFrame}
+          {formatTimecode}
+          onTrimChange={handleTrimChange}
         />
         <TimecodeReadout
           current={transport.currentTimecode}
