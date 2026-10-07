@@ -10,10 +10,14 @@ name: Release App (Tauri)
 # not notarized. The seven secret names are recorded in
 # `.planning/phases/01-walking-skeleton-native-surface-gate/01-CREDENTIALS.md` §4.
 #
-# This workflow does NOT bundle FFmpeg or ONNX Runtime into the installer: the
-# downloads below support the build and are not copied into the bundle, and
-# `tauri.conf.json` declares no `bundle.resources`. The app requires those
+# This workflow does NOT bundle FFmpeg or ONNX Runtime into the installer:
+# `tauri.conf.json` declares no `bundle.resources`, and the app requires those
 # runtimes to be installed at runtime — see RUNTIME-PREREQUISITES.md (WR-03).
+# ONNX Runtime is statically linked into the binary by `ort-sys`'s own
+# `download-binaries` build path (the app enables the `ort` feature, not
+# `load-dynamic`), so there is no ORT download step here. FFmpeg import
+# libraries are downloaded only on Windows; the Linux/macOS builds use the
+# system FFmpeg dev packages installed below.
 #
 # NOTE on the signing gates: GitHub Actions does NOT allow the `secrets`
 # context inside a step-level `if:` ("Secrets cannot be directly referenced in
@@ -110,36 +114,6 @@ jobs:
           echo "FFMPEG_DIR=$dir" >> $env:GITHUB_ENV
           echo "FFMPEG_DLL_DIR=$dir\bin" >> $env:GITHUB_ENV
           echo "Bundled FFmpeg: $($asset.name)"
-
-      # ONNX Runtime for AI detection — the same 1.24.4 artifacts `release.yml`
-      # bundles for the CLI (DirectML on Windows, CPU elsewhere). This workflow
-      # does NOT copy them into the app installer; the app requires ONNX Runtime
-      # at runtime, per RUNTIME-PREREQUISITES.md (WR-03).
-      - name: Download ONNX Runtime (Windows - DirectML)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $nupkg = "$env:RUNNER_TEMP\ort-dml.nupkg"
-          Invoke-WebRequest -Uri "https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime.directml/1.24.4/microsoft.ml.onnxruntime.directml.1.24.4.nupkg" -OutFile $nupkg
-          Expand-Archive -Path $nupkg -DestinationPath "$env:RUNNER_TEMP\ort-dml"
-          $dll = "$env:RUNNER_TEMP\ort-dml\runtimes\win-x64\native\onnxruntime.dll"
-          echo "ORT_DLL=$dll" >> $env:GITHUB_ENV
-
-      - name: Download ONNX Runtime (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          curl -sL "https://github.com/microsoft/onnxruntime/releases/download/v1.24.4/onnxruntime-osx-arm64-1.24.4.tgz" -o /tmp/ort.tgz
-          tar xzf /tmp/ort.tgz -C /tmp
-          ORT_LIB=$(find /tmp/onnxruntime-* -name "libonnxruntime*.dylib" | head -1)
-          echo "ORT_LIB=$ORT_LIB" >> "$GITHUB_ENV"
-
-      - name: Download ONNX Runtime (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          curl -sL "https://github.com/microsoft/onnxruntime/releases/download/v1.24.4/onnxruntime-linux-x64-1.24.4.tgz" -o /tmp/ort.tgz
-          tar xzf /tmp/ort.tgz -C /tmp
-          ORT_LIB=$(find /tmp/onnxruntime-* -name "libonnxruntime.so*" -not -type l | head -1)
-          echo "ORT_LIB=$ORT_LIB" >> "$GITHUB_ENV"
 
       - name: Setup Node
         uses: actions/setup-node@v6
