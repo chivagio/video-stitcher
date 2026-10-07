@@ -2148,6 +2148,122 @@ pub fn fov_ceiling_from(
     })
 }
 
+/// Re-assert the worker's whole projection state on `events`.
+///
+/// **The single projection seam.** [`GpuEngineBackend::republish_projection`]
+/// gathers the live backend state and calls this; the G-02-9 regression test
+/// calls it directly with constructed state. Both therefore exercise the exact
+/// code the production path runs, rather than a divergent mock copy that can
+/// drift from it (WR-02). It is pure in its inputs — no GPU, no live session —
+/// so the delivery contract is unit-testable headlessly.
+///
+/// The presenter line is the fallback-WARN delivery point (F1
+/// subscribe-after-emit ordering): `active_reason` is `Some` only on a fallback
+/// and projects to exactly one locked `Presenter fallback to …` WARN; `None`
+/// projects to the INFO `presenter: <Kind>` line. A `transport` of `None` (no
+/// session and nothing loaded) emits no position/transport, matching the
+/// original `publish_position` preference for the session over the import-built
+/// transport.
+fn republish_projection_events(
+    transport: Option<&crate::transport::Transport>,
+    pose: &reco_control::pose_control::PoseControl,
+    fov_ceiling: f32,
+    view_mode: crate::presenter::ViewMode,
+    active_kind: crate::presenter::PresenterKind,
+    active_reason: &Option<String>,
+    events: &EventSink,
+) {
+    if let Some(transport) = transport {
+        events.position(
+            transport.frame(),
+            transport.total_frames(),
+            transport.fps_rational(),
+        );
+        events.transport(transport.state(), transport.loop_enabled());
+    }
+    // The pose is read from the control, not from the last render: with no
+    // session there is no tick, so a drag while paused must still be reflected
+    // in what the frontend reconciles.
+    let current = pose.current_pose();
+    events.pose(
+        current.yaw,
+        current.pitch,
+        pose.current_fov_deg(),
+        fov_ceiling,
+    );
+    events.view(view_mode);
+    events.presenter(active_kind, active_reason.clone());
+}
+
+/// Emit the already-active no-op for a manual presenter selection.
+///
+/// A no-op selection must not mutate state: the current reason is re-asserted,
+/// so an active fallback keeps announcing itself on a later reconcile instead of
+/// being silently erased for the rest of the session (WR-03). When the active
+/// presenter is not a fallback the event projects to the INFO `presenter: <Kind>`
+/// line.
+fn emit_presenter_already_active(
+    kind: crate::presenter::PresenterKind,
+    current_reason: &Option<String>,
+    events: &EventSink,
+) {
+    events.info(format!("presenter: {} (already active)", kind.name()));
+    events.presenter(kind, current_reason.clone());
+}
+
+/// Apply and emit the outcome of a manual presenter selection.
+///
+/// **The single emission + reason-lifecycle seam for
+/// [`EngineBackend::set_presenter`].** `requested` is the operator's choice;
+/// `chosen`/`reason` are the chain decision from
+/// [`choose_presenter`](crate::presenter::choose_presenter). Returns the new
+/// `active_reason` for the caller to store. Free and GPU-free so both contracts
+/// below are directly testable:
+///
+/// * `reason: Some(err)` — every attempted arm failed: the reason is retained
+///   and exactly ONE typed `Presenter` event is emitted (it projects to the
+///   locked fallback WARN). Emitting `fallback_warn_line` again would duplicate
+///   the line (WR-01).
+/// * `reason: None` — a presenter was selected without a fallback: the reason
+///   is cleared and an INFO line is emitted (a distinct line when the requested
+///   kind resolved to a weaker one).
+fn emit_manual_presenter_selection(
+    requested: crate::presenter::PresenterKind,
+    chosen: crate::presenter::PresenterKind,
+    reason: Option<crate::presenter::PresenterError>,
+    events: &EventSink,
+) -> Option<String> {
+    match reason {
+        Some(err) => {
+            let reason = err.to_string();
+            // The typed event IS the single emission: `to_log_line` projects
+            // `Presenter { reason: Some(_) }` to the locked `Presenter fallback
+            // to <kind>: <reason>. <remediation>.` WARN. Emitting
+            // `fallback_warn_line` again here duplicated that line (WR-01); the
+            // automatic/startup path relies on this projection alone.
+            events.presenter(chosen, Some(reason.clone()));
+            Some(reason)
+        }
+        // Successful manual selection: an INFO line, no WARN.
+        None if chosen == requested => {
+            events.info(format!("presenter switched to {}", chosen.name()));
+            events.presenter(chosen, None);
+            None
+        }
+        // The requested kind failed with fall-through but a weaker kind
+        // succeeded: report the resolution without a WARN.
+        None => {
+            events.info(format!(
+                "presenter override to {} resolved to {}",
+                requested.name(),
+                chosen.name()
+            ));
+            events.presenter(chosen, None);
+            None
+        }
+    }
+}
+
 /// Handle a single command. Returns `false` when the loop should stop.
 fn handle_command<B: EngineBackend>(
     cmd: WorkerCommand,
@@ -5837,29 +5953,24 @@ impl EngineBackend for GpuEngineBackend {
     }
 
     fn republish_projection(&mut self, events: &EventSink) {
-        self.publish_position(events);
-        if let Some(transport) = self.session.as_ref().or(self.loaded.as_ref()) {
-            events.transport(transport.state(), transport.loop_enabled());
-        }
-        // The pose is read from the control, not from the last render: with no
-        // session there is no tick, so a drag while paused must still be
-        // reflected in what the frontend reconciles.
-        let pose = self.pose.current_pose();
-        events.pose(
-            pose.yaw,
-            pose.pitch,
-            self.pose.current_fov_deg(),
-            self.fov_ceiling(),
-        );
-        events.view(self.view_mode);
-        // Re-assert the resolved presenter with its fallback reason. The
-        // frontend subscribes and only then invokes `republish_projection`
-        // (App.svelte), so this is the single delivery point for a startup
+        // Gather the live state and delegate to the shared seam. The frontend
+        // subscribes and only then invokes `republish_projection` (App.svelte),
+        // so the presenter line is the single delivery point for a startup
         // fallback WARN: the reason is delivered exactly once per reconcile
         // instead of at worker boot, where the F1 subscribe-after-emit ordering
-        // would drop it. When `active_reason` is `None` (the native path) this
-        // still projects to the `presenter: <Kind>` INFO line.
-        events.presenter(self.active_kind, self.active_reason.clone());
+        // would drop it. When `active_reason` is `None` (the native path) it
+        // still projects to the `presenter: <Kind>` INFO line. The body lives in
+        // `republish_projection_events` so the regression test exercises the
+        // exact production code (WR-02).
+        republish_projection_events(
+            self.session.as_ref().or(self.loaded.as_ref()),
+            &self.pose,
+            self.fov_ceiling(),
+            self.view_mode,
+            self.active_kind,
+            &self.active_reason,
+            events,
+        );
     }
 
     fn set_chrome(&mut self, chrome: crate::presenter::ChromeState, events: &EventSink) {
@@ -6311,11 +6422,11 @@ impl EngineBackend for GpuEngineBackend {
 
         // Already active: report success without a churn (position/pose are
         // untouched either way; a swap happens only at this command boundary).
+        // A no-op must not mutate `active_reason`: an active fallback's reason
+        // must survive so a later reconcile still emits the locked fallback WARN
+        // (WR-03).
         if kind == self.active_presenter() {
-            events.info(format!("presenter: {} (already active)", kind.name()));
-            // The active presenter is the requested one and is not a fallback.
-            self.active_reason = None;
-            events.presenter(kind, None);
+            emit_presenter_already_active(kind, &self.active_reason, events);
             return;
         }
 
@@ -6346,39 +6457,11 @@ impl EngineBackend for GpuEngineBackend {
         }
 
         let (chosen, reason) = crate::presenter::choose_presenter(&attempts);
-        match reason {
-            // Fallback to a weaker presenter: exactly one WARN line carrying the
-            // reason and the remediation (Phase 1 D-05; never silent).
-            Some(err) => {
-                let reason = err.to_string();
-                // Keep `active_reason` in sync so `republish_projection` (which
-                // re-asserts the presenter after subscribe) reports the same
-                // resolved fallback the set_presenter path just announced.
-                self.active_reason = Some(reason.clone());
-                events.presenter(chosen, Some(reason.clone()));
-                events.log(
-                    Level::Warn,
-                    crate::presenter::fallback_warn_line(chosen, &reason),
-                );
-            }
-            // Successful manual selection: an INFO line, no WARN.
-            None if chosen == kind => {
-                self.active_reason = None;
-                events.info(format!("presenter switched to {}", chosen.name()));
-                events.presenter(chosen, None);
-            }
-            // The requested kind failed with fall-through but a weaker kind
-            // succeeded: report the fallback without a WARN.
-            None => {
-                self.active_reason = None;
-                events.info(format!(
-                    "presenter override to {} resolved to {}",
-                    kind.name(),
-                    chosen.name()
-                ));
-                events.presenter(chosen, None);
-            }
-        }
+        // The single emission + reason-lifecycle seam (WR-01/WR-03): keep
+        // `active_reason` in sync so `republish_projection` (which re-asserts the
+        // presenter after subscribe) reports the same resolved fallback the
+        // set_presenter path just announced.
+        self.active_reason = emit_manual_presenter_selection(kind, chosen, reason, events);
     }
 
     fn active_presenter(&self) -> crate::presenter::PresenterKind {
@@ -8694,15 +8777,22 @@ mod tests {
 
         fn republish_projection(&mut self, events: &EventSink) {
             self.record("republish_projection");
-            self.publish_position(events);
-            if let Some(t) = self.session.as_ref().or(self.loaded.as_ref()) {
-                events.transport(t.state(), t.loop_enabled());
-            }
-            let pose = self.pose.lock().unwrap().current_pose();
-            let fov = self.pose.lock().unwrap().current_fov_deg();
-            events.pose(pose.yaw, pose.pitch, fov, self.fov_ceiling());
-            events.view(self.view_mode);
-            events.presenter(self.active_kind, self.active_reason.clone());
+            // Delegate to the same seam the real backend uses, so the mock's
+            // projection cannot drift from the production delivery contract
+            // (WR-02). Read `fov_ceiling` BEFORE locking `pose`: the mock's
+            // `fov_ceiling` locks the same mutex, and `std::sync::Mutex` is not
+            // reentrant.
+            let fov_ceiling = self.fov_ceiling();
+            let pose = self.pose.lock().unwrap();
+            republish_projection_events(
+                self.session.as_ref().or(self.loaded.as_ref()),
+                &pose,
+                fov_ceiling,
+                self.view_mode,
+                self.active_kind,
+                &self.active_reason,
+                events,
+            );
         }
 
         fn set_chrome(&mut self, chrome: crate::presenter::ChromeState, _events: &EventSink) {
@@ -10611,6 +10701,18 @@ mod tests {
         );
     }
 
+    /// Drain every event currently buffered on `rx`, without waiting.
+    ///
+    /// For a seam called synchronously on the test thread: every event it emits
+    /// is already in the channel when it returns.
+    fn drain_channel(rx: &Receiver<WorkerEvent>) -> Vec<WorkerEvent> {
+        let mut seen = Vec::new();
+        while let Ok(evt) = rx.try_recv() {
+            seen.push(evt);
+        }
+        seen
+    }
+
     /// Drain events until `Shutdown`'s info line arrives, or time out.
     fn drain_until_shutdown(rx: &Receiver<WorkerEvent>) -> Vec<WorkerEvent> {
         let mut seen = Vec::new();
@@ -12121,27 +12223,37 @@ mod tests {
     fn startup_fallback_republish_reasserts_the_resolved_kind_and_one_locked_warn() {
         // G-02-9 regression: a chain lacking Native (the native arm failed to
         // construct on a Wayland handle) activates the first available arm with
-        // the recorded native error as its reason. `republish_projection` — the
-        // single post-subscribe delivery point (F1) — must re-assert BOTH the
-        // resolved kind and the locked fallback WARN, exactly once. No existing
-        // test covers this: `MockBackend` hardcodes `active_kind = Native`.
+        // the recorded native error as its reason. The post-subscribe delivery
+        // point (F1) must re-assert BOTH the resolved kind and the locked
+        // fallback WARN, exactly once.
+        //
+        // This drives the shared `republish_projection_events` seam that the
+        // real `GpuEngineBackend::republish_projection` AND `MockBackend` both
+        // call — not a divergent mock copy — so a regression in the delivery
+        // contract cannot hide behind a reimplementation (WR-02). It needs no
+        // GPU and no live session.
         let reason = crate::presenter::PresenterError::Unsupported {
-            reason: "parent window handle is Wayland(...), not Xlib — Wayland has no \
+            reason: "parent window handle is Wayland, not Xlib — Wayland has no \
                      X11-style child embedding (D-05)"
                 .to_string(),
         }
         .to_string();
 
-        let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let mut mock = MockBackend::new(Arc::clone(&ops));
-        mock.active_kind = crate::presenter::PresenterKind::SeparateWindow;
-        mock.active_reason = Some(reason.clone());
-        let (worker, events) = EngineWorker::spawn(mock);
-        let handle = worker.handle();
-        handle.send(WorkerCommand::RepublishProjection).unwrap();
-        handle.send(WorkerCommand::Shutdown).unwrap();
+        let pose = reco_control::pose_control::PoseControl::with_defaults();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let events = EventSink::new(tx);
 
-        let seen = drain_until_shutdown(&events);
+        republish_projection_events(
+            None,
+            &pose,
+            50.87,
+            crate::presenter::ViewMode::Panorama,
+            crate::presenter::PresenterKind::SeparateWindow,
+            &Some(reason.clone()),
+            &events,
+        );
+
+        let seen = drain_channel(&rx);
         let fallback_events: Vec<_> = seen
             .iter()
             .filter_map(|e| match e {
@@ -12160,6 +12272,7 @@ mod tests {
         );
         let (kind, reported) = &fallback_events[0];
         assert_eq!(*kind, crate::presenter::PresenterKind::SeparateWindow);
+        assert_eq!(reported, &reason);
 
         // The resolved event projects to the locked WARN shape.
         let line = WorkerEvent::Presenter {
@@ -12180,16 +12293,22 @@ mod tests {
                 .starts_with("Presenter fallback to Separate window: ")
         );
 
-        // The native path emits no fallback: with `active_reason == None`,
-        // `republish_projection` projects to the INFO `presenter: <Kind>` line.
-        // This half also fails if a duplicate boot emission is introduced.
-        let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let (worker, events) = EngineWorker::spawn(MockBackend::new(Arc::clone(&ops)));
-        let handle = worker.handle();
-        handle.send(WorkerCommand::RepublishProjection).unwrap();
-        handle.send(WorkerCommand::Shutdown).unwrap();
+        // The native path emits no fallback: with `active_reason == None` the
+        // seam projects to the INFO `presenter: <Kind>` line. This half also
+        // fails if a duplicate boot emission is introduced.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let events = EventSink::new(tx);
+        republish_projection_events(
+            None,
+            &pose,
+            50.87,
+            crate::presenter::ViewMode::Panorama,
+            crate::presenter::PresenterKind::Native,
+            &None,
+            &events,
+        );
 
-        let seen = drain_until_shutdown(&events);
+        let seen = drain_channel(&rx);
         let fallback_count = seen
             .iter()
             .filter(|e| {
@@ -12205,6 +12324,122 @@ mod tests {
         assert_eq!(
             fallback_count, 0,
             "the native path must emit no fallback Presenter event"
+        );
+        let native = seen
+            .iter()
+            .find_map(|e| match e {
+                WorkerEvent::Presenter { reason: None, .. } => Some(e.to_log_line()),
+                _ => None,
+            })
+            .expect("the native path emits the INFO presenter line");
+        assert_eq!(native.level, Level::Info);
+        assert_eq!(native.message, "presenter: Native");
+    }
+
+    #[test]
+    fn manual_presenter_fallback_emits_exactly_one_locked_warn() {
+        // WR-01: the manual-override fallback arm must emit the locked WARN
+        // exactly once, through the typed event's projection — the same single
+        // emission the automatic/startup path uses. This drives the shared
+        // `emit_manual_presenter_selection` seam the real `set_presenter` runs,
+        // so the contract is pinned without a GPU.
+        let err = crate::presenter::PresenterError::Unsupported {
+            reason: "parent window handle is Wayland, not Xlib — Wayland has no \
+                     X11-style child embedding (D-05)"
+                .to_string(),
+        };
+        let expected_reason = err.to_string();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let events = EventSink::new(tx);
+        let stored = emit_manual_presenter_selection(
+            crate::presenter::PresenterKind::Readback,
+            crate::presenter::PresenterKind::SeparateWindow,
+            Some(err),
+            &events,
+        );
+
+        assert_eq!(
+            stored,
+            Some(expected_reason.clone()),
+            "the fallback reason must be retained for `republish_projection`"
+        );
+
+        let seen = drain_channel(&rx);
+        let lines: Vec<_> = seen.iter().map(WorkerEvent::to_log_line).collect();
+        let warns: Vec<_> = lines.iter().filter(|l| l.level == Level::Warn).collect();
+        assert_eq!(warns.len(), 1, "exactly one WARN, got {lines:?}");
+        assert_eq!(
+            warns[0].message,
+            crate::presenter::fallback_warn_line(
+                crate::presenter::PresenterKind::SeparateWindow,
+                &expected_reason
+            )
+        );
+        assert!(
+            warns[0]
+                .message
+                .starts_with("Presenter fallback to Separate window: ")
+        );
+    }
+
+    #[test]
+    fn manual_presenter_noop_preserves_the_active_fallback_reason() {
+        // WR-03: selecting the already-active fallback presenter must not clear
+        // its reason, so a later reconcile still announces the fallback.
+        let reason = "native presenter unavailable on Wayland".to_string();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let events = EventSink::new(tx);
+        emit_presenter_already_active(
+            crate::presenter::PresenterKind::SeparateWindow,
+            &Some(reason.clone()),
+            &events,
+        );
+
+        let seen = drain_channel(&rx);
+        let presenter = seen
+            .iter()
+            .find_map(|e| match e {
+                WorkerEvent::Presenter { reason, .. } => Some(reason.clone()),
+                _ => None,
+            })
+            .expect("the no-op emits a Presenter event");
+        assert_eq!(
+            presenter,
+            Some(reason),
+            "the active fallback reason must survive a no-op selection"
+        );
+        // The re-asserted reason projects to exactly one fallback WARN.
+        let warns = seen
+            .iter()
+            .map(WorkerEvent::to_log_line)
+            .filter(|l| l.level == Level::Warn)
+            .count();
+        assert_eq!(warns, 1, "the preserved reason must re-emit one WARN");
+
+        // With no active fallback the no-op is an INFO line, never a WARN.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let events = EventSink::new(tx);
+        emit_presenter_already_active(crate::presenter::PresenterKind::Native, &None, &events);
+        let seen = drain_channel(&rx);
+        assert_eq!(
+            seen.iter()
+                .map(WorkerEvent::to_log_line)
+                .filter(|l| l.level == Level::Warn)
+                .count(),
+            0,
+            "a non-fallback no-op emits no WARN"
+        );
+        let lines: Vec<_> = seen.iter().map(WorkerEvent::to_log_line).collect();
+        assert!(
+            lines.iter().any(|l| l.message == "presenter: Native"),
+            "the no-op re-asserts the active presenter: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.message == "presenter: Native (already active)"),
+            "the no-op reports the already-active INFO line: {lines:?}"
         );
     }
 
