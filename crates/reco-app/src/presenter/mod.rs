@@ -311,6 +311,10 @@ pub enum Screen {
     Preview,
     /// The Phase 5 export screen (opaque; native view suspended).
     Export,
+    /// The Phase 5 System Info / logs screen (opaque; native view suspended).
+    ///
+    /// A rail affordance (not a sequential step), reachable from every screen.
+    System,
 }
 
 /// The webview chrome's collapsible state (UI-SPEC Surface Layout Contract).
@@ -950,11 +954,17 @@ mod tests {
             serde_json::to_string(&Screen::Export).unwrap(),
             "\"export\""
         );
+        assert_eq!(
+            serde_json::to_string(&Screen::System).unwrap(),
+            "\"system\""
+        );
         // Round-trips back from the wire form the frontend sends.
         let parsed: Screen = serde_json::from_str("\"preview\"").unwrap();
         assert_eq!(parsed, Screen::Preview);
         let parsed_export: Screen = serde_json::from_str("\"export\"").unwrap();
         assert_eq!(parsed_export, Screen::Export);
+        let parsed_system: Screen = serde_json::from_str("\"system\"").unwrap();
+        assert_eq!(parsed_system, Screen::System);
     }
 
     #[test]

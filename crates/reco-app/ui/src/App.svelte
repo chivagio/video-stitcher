@@ -28,6 +28,7 @@
   import { calibration } from "./lib/calibration.svelte";
   import { fieldRoi } from "./lib/roi.svelte";
   import { exportStore } from "./lib/export.svelte";
+  import { systemStore } from "./lib/system.svelte";
   import PreviewSurface from "./components/PreviewSurface.svelte";
   import Timeline from "./components/Timeline.svelte";
   import TimecodeReadout from "./components/TimecodeReadout.svelte";
@@ -40,6 +41,7 @@
   import ImportScreen from "./components/ImportScreen.svelte";
   import CalibrateScreen from "./components/CalibrateScreen.svelte";
   import ExportScreen from "./components/ExportScreen.svelte";
+  import SystemInfoScreen from "./components/SystemInfoScreen.svelte";
   import FieldRoiEditor from "./components/FieldRoiEditor.svelte";
   import ConfirmDialog from "./components/ConfirmDialog.svelte";
   import type { PresenterKind, Screen, ViewMode } from "./lib/types";
@@ -88,6 +90,11 @@
       // (A10 ordering), so its EncoderList/ExportProgress listeners are live.
       await exportStore.init();
       void exportStore.probeEncoders();
+      // Subscribe the system store (DIAG-01/02/05) before the reconcile as well,
+      // so its SystemInfo/Preflight/LogRecord listeners are live, then ask the
+      // worker to probe the system and run the runtime preflight.
+      await systemStore.init();
+      void systemStore.refresh();
       // Subscribe first, *then* ask the worker to re-assert its state. The
       // worker boots and imports before the webview has loaded, and the event
       // bridge only reaches listeners registered at emit time — so its opening
@@ -109,6 +116,7 @@
       calibration.destroy();
       fieldRoi.destroy();
       exportStore.destroy();
+      systemStore.destroy();
     };
   });
 
@@ -342,6 +350,10 @@
     <!-- Modal Export screen (EXPT-01/02/04). The native view is suspended by
          Rust on this screen; the webview owns the whole surface. -->
     <ExportScreen />
+  {:else if screen === "system"}
+    <!-- System Info + structured logs (DIAG-01/02/05). Opaque; Rust suspends
+         the native view on this screen. -->
+    <SystemInfoScreen />
   {:else}
     <!-- Preview surface (transparent in native mode) -->
     <PreviewSurface

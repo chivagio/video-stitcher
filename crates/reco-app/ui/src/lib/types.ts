@@ -378,6 +378,50 @@ export interface EncoderView {
 }
 
 /**
+ * The probed system information (mirror `system::SystemInfoView`, DIAG-01).
+ *
+ * Every GPU field is `null` when unknown — the panel renders `Not reported`,
+ * never a fabricated `0`. `devices_note` carries an honest reason when the
+ * platform does not enumerate camera devices.
+ */
+export interface SystemInfoView {
+  gpu_name: string | null;
+  backend: string | null;
+  driver: string | null;
+  encoders: EncoderView[];
+  devices: string[];
+  devices_note: string | null;
+}
+
+/** One structured engine log record (mirror `system::LogRecord`, DIAG-02). */
+export interface LogRecord {
+  /** Lowercase tracing level (`info` / `warn` / `error` / `debug` / `trace`). */
+  level: string;
+  /** The emitting module path. */
+  target: string;
+  /** The formatted message. */
+  message: string;
+  /** Unix epoch time in milliseconds. */
+  timestamp_ms: number;
+}
+
+/** One checked runtime prerequisite (mirror `preflight::PreflightItem`, DIAG-05). */
+export interface PreflightItem {
+  id: string;
+  label: string;
+  ok: boolean;
+  detail: string;
+  /** Actionable next step; non-empty whenever `ok` is false. */
+  remediation: string;
+}
+
+/** The runtime preflight verdict (mirror `preflight::PreflightReport`, DIAG-05). */
+export interface PreflightReport {
+  items: PreflightItem[];
+  all_ok: boolean;
+}
+
+/**
  * The subset of the typed `WorkerEvent` union this phase consumes.
  *
  * Serde shape is internally tagged: `{ kind, data }`. The import store reads
@@ -506,8 +550,11 @@ export type WorkerEventTyped =
       };
     }
   | { kind: "export_fallback"; data: { requested: string; used: string } }
+  | { kind: "system_info"; data: { info: SystemInfoView } }
+  | { kind: "preflight"; data: { report: PreflightReport } }
+  | { kind: "log_record"; data: { record: LogRecord } }
   | { kind: "log"; data: LogLine }
   | { kind: "failed"; data: unknown };
 
 /** The workflow-rail screens (D3-01). Import is the landing screen. */
-export type Screen = "import" | "calibrate" | "preview" | "export";
+export type Screen = "import" | "calibrate" | "preview" | "export" | "system";

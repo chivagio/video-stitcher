@@ -75,14 +75,26 @@
       </button>
     {/each}
   </div>
-  <button
-    type="button"
-    class="log-toggle"
-    aria-pressed={logExpanded}
-    onclick={onToggleLog}
-  >
-    Log
-  </button>
+  <div class="rail-actions">
+    <button
+      type="button"
+      class="system-toggle"
+      class:active={active === "system"}
+      aria-current={active === "system" ? "page" : undefined}
+      title="System info and logs"
+      onclick={() => onNavigate("system")}
+    >
+      System
+    </button>
+    <button
+      type="button"
+      class="log-toggle"
+      aria-pressed={logExpanded}
+      onclick={onToggleLog}
+    >
+      Log
+    </button>
+  </div>
 </nav>
 
 <style>
@@ -141,12 +153,35 @@
     cursor: pointer;
   }
 
+  .rail-actions {
+    display: flex;
+    align-items: center;
+    gap: var(--space-xs);
+  }
+
+  .system-toggle {
+    padding: var(--space-xs) var(--space-sm);
+    border: 1px solid transparent;
+    border-radius: var(--space-xs);
+    background: transparent;
+    color: var(--color-body-text);
+    font-family: var(--font-ui);
+    font-size: var(--text-body);
+    cursor: pointer;
+  }
+
+  .system-toggle.active {
+    color: var(--color-accent);
+    border-color: var(--color-accent);
+  }
+
   .log-toggle[aria-pressed="true"] {
     color: var(--color-accent);
     border-color: var(--color-accent);
   }
 
   .step:focus-visible,
+  .system-toggle:focus-visible,
   .log-toggle:focus-visible {
     outline: none;
     box-shadow: 0 0 0 2px var(--color-accent);
@@ -154,6 +189,7 @@
 
   @media (prefers-reduced-motion: reduce) {
     .step,
+    .system-toggle,
     .log-toggle {
       transition: none;
     }
