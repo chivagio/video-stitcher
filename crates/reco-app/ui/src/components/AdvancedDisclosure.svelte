@@ -113,8 +113,11 @@
           max={FRAMES_MAX}
           step="1"
           placeholder="Engine default"
-          bind:value={framesRaw}
-          oninput={emit}
+          value={framesRaw}
+          oninput={(e) => {
+            framesRaw = e.currentTarget.value;
+            emit();
+          }}
         />
         {#if frameError}<span class="field-error">{frameError}</span>{/if}
       </label>
@@ -131,8 +134,11 @@
           max={SKIP_MAX}
           step="0.1"
           placeholder="Engine default"
-          bind:value={skipStartRaw}
-          oninput={emit}
+          value={skipStartRaw}
+          oninput={(e) => {
+            skipStartRaw = e.currentTarget.value;
+            emit();
+          }}
         />
         {#if skipStartError}<span class="field-error">{skipStartError}</span>{/if}
       </label>
@@ -149,8 +155,11 @@
           max={SKIP_MAX}
           step="0.1"
           placeholder="Engine default"
-          bind:value={skipEndRaw}
-          oninput={emit}
+          value={skipEndRaw}
+          oninput={(e) => {
+            skipEndRaw = e.currentTarget.value;
+            emit();
+          }}
         />
         {#if skipEndError}<span class="field-error">{skipEndError}</span>{/if}
       </label>
