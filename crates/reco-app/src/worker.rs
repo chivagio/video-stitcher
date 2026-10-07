@@ -5982,7 +5982,11 @@ impl EngineBackend for GpuEngineBackend {
                     chosen.is_hardware,
                     settings.variant,
                 ),
-                Err(e) => events.export_failed(e.to_string()),
+                Err(e) => {
+                    // A failed export likewise leaves no partial file (WR-02).
+                    remove_partial_output(&output);
+                    events.export_failed(e.to_string());
+                }
             }
         }
         Ok(())
