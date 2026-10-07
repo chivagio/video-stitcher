@@ -14,7 +14,6 @@
   import { manual } from "../lib/manual.svelte";
   import type { ManualPinView } from "../lib/types";
   import PinCanvas from "./PinCanvas.svelte";
-  import SolveStatus from "./SolveStatus.svelte";
   import ActionButton from "./ActionButton.svelte";
   import Icon from "./Icon.svelte";
   import InlineNotice from "./InlineNotice.svelte";
@@ -41,9 +40,10 @@
 </script>
 
 <section class="pin-step" aria-label="Pin">
+  <!-- The shared `SolveStatus` chip is flow chrome, rendered once in
+       `ManualCalibrationFlow`'s header — not duplicated per step (UI-REVIEW). -->
   <div class="pin-head">
     <h3 class="step-heading">Pin</h3>
-    <SolveStatus />
   </div>
 
   <p class="instruction" aria-live="polite">

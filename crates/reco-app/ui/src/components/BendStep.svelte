@@ -13,7 +13,6 @@
   import { manual, type ManualPreview } from "../lib/manual.svelte";
   import LensHandles from "./LensHandles.svelte";
   import LayoutHandles from "./LayoutHandles.svelte";
-  import SolveStatus from "./SolveStatus.svelte";
   import ActionButton from "./ActionButton.svelte";
   import Icon from "./Icon.svelte";
 
@@ -52,9 +51,10 @@
 </script>
 
 <section class="bend-step" aria-label="Bend">
+  <!-- The shared `SolveStatus` chip is flow chrome, rendered once in
+       `ManualCalibrationFlow`'s header — not duplicated per step (UI-REVIEW). -->
   <div class="bend-head">
     <h3 class="step-heading">Bend</h3>
-    <SolveStatus />
   </div>
 
   <h4 class="section-heading">Lens correction</h4>
