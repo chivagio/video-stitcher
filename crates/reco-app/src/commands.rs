@@ -172,6 +172,68 @@ pub async fn run_preflight(state: tauri::State<'_, WorkerHandle>) -> Result<(), 
     state.send(WorkerCommand::RunPreflight)
 }
 
+/// Save the current working state as a `.reco` project (PROJ-01).
+///
+/// Thin: validate the path, post `SaveProject { path, settings }`. The worker
+/// assembles the manifest from its retained state plus the webview-owned export
+/// settings, writes it atomically, and emits a typed `ProjectSaved` or a
+/// `Failed(ProjectSave)`. The webview never writes a manifest itself.
+///
+/// # Errors
+///
+/// Returns [`WorkerError::InvalidInput`] for an empty/non-local path, or
+/// [`WorkerError::ChannelClosed`] if the worker has already exited.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn save_project(
+    state: tauri::State<'_, WorkerHandle>,
+    path: String,
+    settings: crate::events::ExportSettings,
+) -> Result<(), WorkerError> {
+    validate_project_path(&path)?;
+    state.send(WorkerCommand::SaveProject { path, settings })
+}
+
+/// Open a `.reco` project and restore the whole working state (PROJ-01).
+///
+/// Thin: validate the path, post `OpenProject { path }`. The worker parses and
+/// validates the manifest, probes each referenced input, and emits either a
+/// typed `ProjectOpened` (full restore) or `ProjectMissingInputs` (a relocate
+/// list) — a missing input never fails the open.
+///
+/// # Errors
+///
+/// Returns [`WorkerError::InvalidInput`] for an empty/non-local path, or
+/// [`WorkerError::ChannelClosed`] if the worker has already exited.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn open_project(
+    state: tauri::State<'_, WorkerHandle>,
+    path: String,
+) -> Result<(), WorkerError> {
+    validate_project_path(&path)?;
+    state.send(WorkerCommand::OpenProject { path })
+}
+
+/// Relocate one missing project input and re-run the restore (PROJ-01).
+///
+/// Thin: validate the path, post `RelocateProjectInput { role, path }`. The
+/// worker replaces the named role's referenced path on the retained pending
+/// project and re-probes; a complete set restores, a still-missing set re-emits
+/// `ProjectMissingInputs`.
+///
+/// # Errors
+///
+/// Returns [`WorkerError::InvalidInput`] for an empty/non-local path, or
+/// [`WorkerError::ChannelClosed`] if the worker has already exited.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn relocate_project_input(
+    state: tauri::State<'_, WorkerHandle>,
+    role: crate::events::InputRole,
+    path: String,
+) -> Result<(), WorkerError> {
+    validate_project_path(&path)?;
+    state.send(WorkerCommand::RelocateProjectInput { role, path })
+}
+
 /// Begin/continue playing the preview session (PREV-02).
 ///
 /// Thin, same contract as [`import`]: post `Play` and return. The worker owns
@@ -571,6 +633,16 @@ fn validate_profile_path(path: &str) -> Result<(), WorkerError> {
         });
     }
     Ok(())
+}
+
+/// Validate an operator-supplied `.reco` path at the command boundary (PROJ-01).
+///
+/// A project is a local file chosen by the native dialog; the same
+/// empty/forbidden-prefix guard as a profile path applies, so the worker never
+/// opens a non-local path. Reuses [`validate_profile_path`] rather than
+/// duplicating the prefix set.
+fn validate_project_path(path: &str) -> Result<(), WorkerError> {
+    validate_profile_path(path)
 }
 
 /// Load a calibration profile from a local `.json` file (IMPT-05 / D3-15).
@@ -1195,6 +1267,44 @@ pub enum WorkerCommand {
     /// A cheap job: the worker probes FFmpeg, ONNX Runtime (when detection is
     /// built), and the webview runtime, then emits a typed `Preflight` report.
     RunPreflight,
+
+    /// Save the current working state as a `.reco` project (PROJ-01).
+    ///
+    /// A job: the worker assembles a `RecoProject` from its retained state
+    /// (inputs, lens overrides, calibration path + inline snapshot, pose) plus
+    /// the `settings` the webview owns (the export settings live in the webview,
+    /// so it passes them with the command — FIFO ordering means the value is
+    /// current), writes it atomically, and emits `ProjectSaved`. No media is
+    /// copied.
+    SaveProject {
+        /// The local `.reco` path to write.
+        path: String,
+        /// The webview's current export settings to persist.
+        settings: crate::events::ExportSettings,
+    },
+
+    /// Open a `.reco` project and restore the whole working state (PROJ-01).
+    ///
+    /// A job: the worker parses and validates the manifest, probes each
+    /// referenced input, and either restores everything and emits
+    /// `ProjectOpened`, or emits `ProjectMissingInputs` (retaining the parsed
+    /// project) — never a partial restore, never a failure on a missing input.
+    OpenProject {
+        /// The local `.reco` path to read.
+        path: String,
+    },
+
+    /// Relocate one missing project input and re-run the restore (PROJ-01).
+    ///
+    /// A job: the worker replaces the named role's referenced path on the
+    /// retained pending project and re-probes; a complete set restores and emits
+    /// `ProjectOpened`, a still-missing set re-emits `ProjectMissingInputs`.
+    RelocateProjectInput {
+        /// Which input to relocate.
+        role: crate::events::InputRole,
+        /// The replacement local file path.
+        path: String,
+    },
 
     /// Forward a transport-agnostic input intent (pan / zoom / quality) to the
     /// worker's pose state on the same message-passing path as the other

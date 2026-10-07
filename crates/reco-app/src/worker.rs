@@ -628,6 +628,54 @@ impl EventSink {
         let _ = self.tx.send(event);
     }
 
+    /// Emit that a `.reco` project was saved (PROJ-01).
+    fn project_saved(&self, path: impl Into<String>) {
+        let event = WorkerEvent::ProjectSaved { path: path.into() };
+        let line = event.to_log_line();
+        log::info!("{}", line.message);
+        let _ = self.tx.send(event);
+    }
+
+    /// Emit that a `.reco` project was opened and fully restored (PROJ-01).
+    ///
+    /// The typed payload carries the restored input paths + lens overrides, the
+    /// pose, and the export settings so the webview reconciles from typed values.
+    #[allow(clippy::too_many_arguments)]
+    fn project_opened(
+        &self,
+        path: impl Into<String>,
+        left: crate::project::ProjectInput,
+        right: crate::project::ProjectInput,
+        calibration_path: Option<String>,
+        has_calibration: bool,
+        pose: crate::project::PoseView,
+        export: crate::events::ExportSettings,
+    ) {
+        let event = WorkerEvent::ProjectOpened {
+            path: path.into(),
+            left,
+            right,
+            calibration_path,
+            has_calibration,
+            pose,
+            export,
+        };
+        let line = event.to_log_line();
+        log::info!("{}", line.message);
+        let _ = self.tx.send(event);
+    }
+
+    /// Emit the missing-input list for a project open (PROJ-01).
+    ///
+    /// The open does not fail: the typed list lets the UI offer a relocate
+    /// flow. Mirrored to the process log at WARN.
+    fn project_missing_inputs(&self, missing: Vec<crate::project::MissingInput>) {
+        let event = WorkerEvent::ProjectMissingInputs { missing };
+        let line = event.to_log_line();
+        log::warn!("{}", line.message);
+        let _ = self.tx.send(event);
+    }
+
     /// Emit that a manual calibration session opened (MANU-01 / MANU-03).
     ///
     /// Mirrored to the process log at INFO; the structured payload rides the
@@ -806,6 +854,28 @@ fn role_index(role: crate::events::InputRole) -> usize {
         crate::events::InputRole::Left => 0,
         crate::events::InputRole::Right => 1,
     }
+}
+
+/// Whether a project-referenced input resolves to a readable video (PROJ-01).
+///
+/// Uses the same FFmpeg probe the import path uses, so a project can never
+/// restore an input the worker could not actually open. A missing or unreadable
+/// path is reported as missing rather than failing the open.
+fn project_input_exists(path: &str) -> bool {
+    reco_io::ffmpeg::calibration_io::probe_video(std::path::Path::new(path)).is_ok()
+}
+
+/// A parsed `.reco` project awaiting relocation (PROJ-01).
+///
+/// Held while one or more referenced inputs are missing, so a
+/// `RelocateProjectInput` command can re-run the restore without re-reading the
+/// file. The originating path is carried so the eventual `ProjectOpened` names
+/// the project that was opened.
+struct PendingProject {
+    /// The `.reco` file path the project was read from.
+    path: String,
+    /// The parsed manifest (its input paths may be updated by a relocate).
+    project: crate::project::RecoProject,
 }
 
 /// Normalize a validated field-ROI polygon pair for storage (CALB-09).
@@ -1752,6 +1822,40 @@ pub trait EngineBackend: Send {
     /// runtime and reports each with an actionable remediation on failure.
     fn run_preflight(&self, events: &EventSink);
 
+    /// Save the current working state as a `.reco` project (PROJ-01).
+    ///
+    /// Builds a [`crate::project::RecoProject`] from the retained state (inputs,
+    /// lens overrides, calibration path + inline snapshot, pose) plus `settings`
+    /// (the export settings live in the webview, so it passes them with the
+    /// command), validates it, writes it **atomically** (no partial file on
+    /// failure), and emits `ProjectSaved`. No media is copied.
+    fn save_project(
+        &mut self,
+        path: String,
+        settings: &crate::events::ExportSettings,
+        events: &EventSink,
+    ) -> Result<(), WorkerError>;
+
+    /// Open a `.reco` project and restore the whole working state (PROJ-01).
+    ///
+    /// Parses and validates the manifest, probes each referenced input, and
+    /// either restores everything + emits `ProjectOpened`, or emits
+    /// `ProjectMissingInputs` (retaining the parsed project for relocation) —
+    /// never a partial restore, never a failure on a missing input.
+    fn open_project(&mut self, path: String, events: &EventSink) -> Result<(), WorkerError>;
+
+    /// Relocate one missing project input and re-run the restore (PROJ-01).
+    ///
+    /// Replaces the named role's referenced path on the retained pending project
+    /// and re-probes; a complete set restores and emits `ProjectOpened`, a
+    /// still-missing set re-emits `ProjectMissingInputs`.
+    fn relocate_project_input(
+        &mut self,
+        role: crate::events::InputRole,
+        path: String,
+        events: &EventSink,
+    ) -> Result<(), WorkerError>;
+
     /// Dispatch a transport-agnostic input intent to the worker's pose state.
     fn dispatch_intent(&mut self, intent: reco_control::ControlIntent);
 
@@ -2222,6 +2326,24 @@ fn handle_command<B: EngineBackend>(
         WorkerCommand::RunPreflight => {
             // DIAG-05: probe the runtime prerequisites on demand.
             backend.run_preflight(events);
+        }
+        WorkerCommand::SaveProject { path, settings } => {
+            // PROJ-01: a job — assemble + write the manifest atomically.
+            if let Err(e) = backend.save_project(path, &settings, events) {
+                events.failed(e);
+            }
+        }
+        WorkerCommand::OpenProject { path } => {
+            // PROJ-01: a job — parse/probe/restore, or emit the missing list.
+            if let Err(e) = backend.open_project(path, events) {
+                events.failed(e);
+            }
+        }
+        WorkerCommand::RelocateProjectInput { role, path } => {
+            // PROJ-01: a job — replace the missing path and re-run the restore.
+            if let Err(e) = backend.relocate_project_input(role, path, events) {
+                events.failed(e);
+            }
         }
         WorkerCommand::Intent(intent) => backend.dispatch_intent(intent),
         WorkerCommand::RepublishProjection => backend.republish_projection(events),
@@ -3152,9 +3274,25 @@ pub struct GpuEngineBackend {
     /// `None` means auto-detect. Passed to calibration as `left_params` /
     /// `right_params` (only when both are set).
     lens_overrides: [Option<reco_core::calibration::CameraParams>; 2],
+    /// The chosen lens-override summaries, indexed by role (PROJ-01).
+    ///
+    /// The resolved [`Self::lens_overrides`] hold `CameraParams`, which cannot be
+    /// reconstructed into a `LensCandidate` (the summary carries the camera/lens
+    /// names a `.reco` stores). Retained so `save_project` can persist the
+    /// operator's override verbatim; kept in sync with `lens_overrides`.
+    lens_override_candidates: [Option<crate::events::LensCandidate>; 2],
     /// The current calibration: the result of a run or a loaded profile
     /// (IMPT-05/06). Consumed by save and, later, by preview/export.
     current_calibration: Option<reco_core::calibration::MatchCalibration>,
+    /// The `.json` the current calibration was loaded from or saved to, when
+    /// known (PROJ-01). Cleared when the result is invalidated and left `None`
+    /// for a fresh run; the `.reco` manifest carries this plus an inline
+    /// snapshot so a never-saved result still round-trips.
+    calibration_path: Option<String>,
+    /// A parsed `.reco` project awaiting relocation because one or more
+    /// referenced inputs were missing (PROJ-01). Retained so a relocate command
+    /// can re-run the restore without re-reading the file; `None` otherwise.
+    pending_project: Option<PendingProject>,
     /// Whether [`Self::current_calibration`] reflects a fresh result/loaded
     /// profile (drives `ResultInvalidated` on input/override changes, D3-08).
     has_result: bool,
@@ -3468,7 +3606,10 @@ impl GpuEngineBackend {
             input_paths: std::collections::HashMap::new(),
             inputs: [None, None],
             lens_overrides: [None, None],
+            lens_override_candidates: [None, None],
             current_calibration: None,
+            calibration_path: None,
+            pending_project: None,
             has_result: false,
             calibration: None,
             manual: None,
@@ -3928,6 +4069,7 @@ impl EngineBackend for GpuEngineBackend {
         self.inputs[idx] = None;
         self.input_paths.remove(&role);
         self.lens_overrides[idx] = None;
+        self.lens_override_candidates[idx] = None;
         events.info(format!("{} cleared", role.label()));
         self.emit_readiness(events);
         self.invalidate_result(events);
@@ -3981,6 +4123,7 @@ impl EngineBackend for GpuEngineBackend {
         match params {
             Some(p) => {
                 self.lens_overrides[idx] = Some(p);
+                self.lens_override_candidates[idx] = Some(candidate.clone());
                 events.info(format!(
                     "{} lens override: {} {}",
                     role.label(),
@@ -3995,6 +4138,7 @@ impl EngineBackend for GpuEngineBackend {
                 // the scorecard must never claim a profile the engine did not
                 // use (D3-07/D3-08 provenance honesty, WR-02).
                 self.lens_overrides[idx] = None;
+                self.lens_override_candidates[idx] = None;
                 events.log(
                     Level::Warn,
                     format!(
@@ -4019,6 +4163,7 @@ impl EngineBackend for GpuEngineBackend {
     ) -> Result<(), WorkerError> {
         let idx = role_index(role);
         self.lens_overrides[idx] = None;
+        self.lens_override_candidates[idx] = None;
         events.info(format!("{} lens override cleared", role.label()));
         events.lens_override_applied(role, None);
         self.emit_readiness(events);
@@ -4319,6 +4464,9 @@ impl EngineBackend for GpuEngineBackend {
         // Adopt the loaded profile as the live result and preview source so the
         // preview/export flows consume it unchanged (D3-15 / WR-05).
         self.adopt_calibration(calibration);
+        // Retain the referenced `.json` so a saved `.reco` can point at it
+        // (PROJ-01).
+        self.calibration_path = Some(path.clone());
         // Pre-populate the field ROI editor from the loaded profile (CALB-09).
         self.emit_field_roi(events);
         events.profile_loaded(path);
@@ -4342,6 +4490,8 @@ impl EngineBackend for GpuEngineBackend {
         calibration
             .to_file(std::path::Path::new(&path))
             .map_err(|e| WorkerError::ProfileSave(e.to_string()))?;
+        // Retain the written path so a `.reco` can reference it (PROJ-01).
+        self.calibration_path = Some(path.clone());
         events.profile_saved(path);
         Ok(())
     }
@@ -5108,6 +5258,9 @@ impl EngineBackend for GpuEngineBackend {
         // Preview/Export consumes it unchanged (MANU-07). This mirrors
         // `load_profile`'s adoption.
         self.adopt_calibration(calibration);
+        // The manual save wrote a `.json`, so the referenced path is known
+        // (PROJ-01).
+        self.calibration_path = Some(path.clone());
         events.manual_saved(path);
         Ok(())
     }
@@ -5795,6 +5948,69 @@ impl EngineBackend for GpuEngineBackend {
         events.preflight(crate::preflight::run_preflight());
     }
 
+    fn save_project(
+        &mut self,
+        path: String,
+        settings: &crate::events::ExportSettings,
+        events: &EventSink,
+    ) -> Result<(), WorkerError> {
+        // PROJ-01: build the manifest from the retained state + the webview's
+        // export settings, validate, and write atomically (no partial file).
+        let project = self.build_project(settings);
+        project
+            .validate()
+            .map_err(|e| WorkerError::ProjectSave(e.to_string()))?;
+        project
+            .write_to_file(std::path::Path::new(&path))
+            .map_err(|e| WorkerError::ProjectSave(e.to_string()))?;
+        events.project_saved(path);
+        Ok(())
+    }
+
+    fn open_project(&mut self, path: String, events: &EventSink) -> Result<(), WorkerError> {
+        // PROJ-01: parse + validate the untrusted manifest before applying it
+        // (T-05-14). An unparseable/unsupported version is a typed error, never a
+        // partial restore.
+        let project = crate::project::RecoProject::read_from_file(std::path::Path::new(&path))
+            .map_err(|e| WorkerError::ProjectOpen(e.to_string()))?;
+        let missing = project.missing_inputs(project_input_exists);
+        if !missing.is_empty() {
+            // A missing input never fails the open: retain the parsed project so
+            // a relocate can re-run the restore, and emit the typed list.
+            self.pending_project = Some(PendingProject {
+                path: path.clone(),
+                project,
+            });
+            events.project_missing_inputs(missing);
+            return Ok(());
+        }
+        self.apply_project(path, project, events);
+        Ok(())
+    }
+
+    fn relocate_project_input(
+        &mut self,
+        role: crate::events::InputRole,
+        path: String,
+        events: &EventSink,
+    ) -> Result<(), WorkerError> {
+        let Some(mut pending) = self.pending_project.take() else {
+            return Err(WorkerError::ProjectRelocate(
+                "no project is awaiting relocation".to_string(),
+            ));
+        };
+        pending.project.set_input_path(role, path);
+        let missing = pending.project.missing_inputs(project_input_exists);
+        if !missing.is_empty() {
+            // Still incomplete: keep waiting, re-emit the (updated) list.
+            self.pending_project = Some(pending);
+            events.project_missing_inputs(missing);
+            return Ok(());
+        }
+        self.apply_project(pending.path, pending.project, events);
+        Ok(())
+    }
+
     fn dispatch_intent(&mut self, intent: reco_control::ControlIntent) {
         dispatch_intent(&mut self.pose, intent);
     }
@@ -6171,6 +6387,9 @@ impl GpuEngineBackend {
         if self.has_result {
             self.has_result = false;
             self.current_calibration = None;
+            // The referenced profile no longer describes the clips (WR-01), so
+            // its path is cleared too (PROJ-01).
+            self.calibration_path = None;
             events.result_invalidated();
         }
     }
@@ -6188,10 +6407,152 @@ impl GpuEngineBackend {
         self.current_calibration = Some(calibration.clone());
         self.calibration = Some(calibration);
         self.has_result = true;
+        // A freshly adopted calibration has no referenced `.json` until a caller
+        // that knows one (profile load/save, manual save) sets it (PROJ-01).
+        self.calibration_path = None;
         if self.session.is_none() {
             self.renderer = None;
             self.renderer_input = None;
         }
+    }
+
+    /// Assemble a `.reco` manifest from the retained state (PROJ-01).
+    ///
+    /// References the operator-selected inputs (else the startup hardcoded
+    /// pair), the per-input lens overrides, the calibration path + an inline
+    /// snapshot, the current pose, and the webview-owned export `settings`.
+    /// Media is never copied.
+    fn build_project(
+        &self,
+        settings: &crate::events::ExportSettings,
+    ) -> crate::project::RecoProject {
+        use crate::events::InputRole;
+        let hardcoded = crate::hardcoded::media_paths().ok();
+        let left_path = self
+            .input_paths
+            .get(&InputRole::Left)
+            .cloned()
+            .or_else(|| hardcoded.as_ref().map(|p| p.left.display().to_string()))
+            .unwrap_or_default();
+        let right_path = self
+            .input_paths
+            .get(&InputRole::Right)
+            .cloned()
+            .or_else(|| hardcoded.as_ref().map(|p| p.right.display().to_string()))
+            .unwrap_or_default();
+        let pose = self.pose.current_pose();
+        crate::project::RecoProject {
+            version: crate::project::PROJECT_VERSION,
+            left: crate::project::ProjectInput {
+                path: left_path,
+                lens_override: self.lens_override_candidates[0].clone(),
+            },
+            right: crate::project::ProjectInput {
+                path: right_path,
+                lens_override: self.lens_override_candidates[1].clone(),
+            },
+            calibration_path: self.calibration_path.clone(),
+            calibration: self.current_calibration.clone(),
+            pose: crate::project::PoseView {
+                yaw: pose.yaw,
+                pitch: pose.pitch,
+                fov_degrees: self.pose.current_fov_deg(),
+            },
+            export: settings.clone(),
+        }
+    }
+
+    /// Restore a fully-present project's state and emit `ProjectOpened` (PROJ-01).
+    ///
+    /// Applies inputs → lens overrides → calibration → pose, then publishes the
+    /// restored inputs/pose/export as a typed `ProjectOpened` so the webview
+    /// reconciles from typed values. Called only when every referenced input is
+    /// present, so the restore is never partial.
+    fn apply_project(
+        &mut self,
+        path: String,
+        project: crate::project::RecoProject,
+        events: &EventSink,
+    ) {
+        use crate::events::InputRole;
+        // The typed payload the webview reconciles from, captured before the
+        // project is consumed.
+        let opened_left = project.left.clone();
+        let opened_right = project.right.clone();
+        let calibration_path = project.calibration_path.clone();
+        let pose = project.pose;
+        let export = project.export.clone();
+
+        // 1. Inputs (probe + metadata). `set_input` invalidates any prior result,
+        //    which is fine: the calibration is re-adopted below.
+        for (role, input) in [
+            (InputRole::Left, &project.left),
+            (InputRole::Right, &project.right),
+        ] {
+            if let Err(e) = self.set_input(role, input.path.clone(), events) {
+                events.failed(e);
+                return;
+            }
+        }
+
+        // 2. Lens overrides (or clear back to auto-detect).
+        for (role, input) in [
+            (InputRole::Left, &project.left),
+            (InputRole::Right, &project.right),
+        ] {
+            match &input.lens_override {
+                Some(candidate) => {
+                    if let Err(e) = self.set_lens_override(role, candidate.clone(), events) {
+                        events.failed(e);
+                        return;
+                    }
+                }
+                None => {
+                    let idx = role_index(role);
+                    self.lens_overrides[idx] = None;
+                    self.lens_override_candidates[idx] = None;
+                    events.lens_override_applied(role, None);
+                }
+            }
+        }
+
+        // 3. Calibration: the inline snapshot wins (a never-saved result has no
+        //    path), then the referenced `.json` (module docs).
+        let calibration = project.calibration.clone().or_else(|| {
+            project.calibration_path.as_ref().and_then(|p| {
+                reco_core::calibration::MatchCalibration::from_file(std::path::Path::new(p)).ok()
+            })
+        });
+        let has_calibration = calibration.is_some();
+        if let Some(cal) = calibration {
+            self.adopt_calibration(cal);
+            // Re-assert the referenced path (adopt clears it).
+            self.calibration_path = calibration_path.clone();
+            self.emit_field_roi(events);
+        }
+
+        // 4. Pose: restore the operator's view through the existing intent path.
+        self.dispatch_intent(reco_control::ControlIntent::Pose(
+            reco_control::PoseIntent::SetYawRad(pose.yaw),
+        ));
+        self.dispatch_intent(reco_control::ControlIntent::Pose(
+            reco_control::PoseIntent::SetPitchRad(pose.pitch),
+        ));
+        self.dispatch_intent(reco_control::ControlIntent::Pose(
+            reco_control::PoseIntent::SetFovDeg(pose.fov_degrees),
+        ));
+
+        // 5. The project is no longer pending; publish the restored state.
+        self.pending_project = None;
+        events.project_opened(
+            path,
+            opened_left,
+            opened_right,
+            calibration_path,
+            has_calibration,
+            pose,
+            export,
+        );
     }
 
     /// The left/right clip paths a manual session extracts from (MANU-01).
@@ -6609,6 +6970,14 @@ mod tests {
         }
     }
 
+    /// Whether a project-referenced input exists, for the GPU-free mock (PROJ-01).
+    ///
+    /// The real backend probes with FFmpeg; the mock only checks existence so a
+    /// test can stage missing/present inputs with plain files.
+    fn mock_project_input_exists(path: &str) -> bool {
+        std::path::Path::new(path).exists()
+    }
+
     /// A fabricated CALB-03 scorecard for the mock's calibration result.
     fn mock_scorecard() -> crate::events::Scorecard {
         crate::events::Scorecard {
@@ -6829,8 +7198,14 @@ mod tests {
         input_paths: [Option<String>; 2],
         /// The mock's per-role lens overrides (IMPT-04).
         lens_overrides: [Option<reco_core::calibration::CameraParams>; 2],
+        /// The mock's per-role lens-override summaries (PROJ-01).
+        lens_override_candidates: [Option<crate::events::LensCandidate>; 2],
         /// The mock's current calibration (IMPT-05/06).
         current_calibration: Option<reco_core::calibration::MatchCalibration>,
+        /// The `.json` the mock's calibration came from, when known (PROJ-01).
+        calibration_path: Option<String>,
+        /// A parsed project awaiting relocation in the mock (PROJ-01).
+        pending_project: Option<super::PendingProject>,
         /// The field ROI a test wants `load_profile` to install (CALB-09), so the
         /// pre-population emit can be asserted without a real profile file.
         mock_field_roi: Option<reco_core::calibration::FieldRoi>,
@@ -6920,7 +7295,10 @@ mod tests {
                 mock_metadata: [None, None],
                 input_paths: [None, None],
                 lens_overrides: [None, None],
+                lens_override_candidates: [None, None],
                 current_calibration: None,
+                calibration_path: None,
+                pending_project: None,
                 mock_field_roi: None,
                 has_result: false,
                 calibration_cancel: Arc::new(AtomicBool::new(false)),
@@ -7062,8 +7440,114 @@ mod tests {
             if self.has_result {
                 self.has_result = false;
                 self.current_calibration = None;
+                self.calibration_path = None;
                 events.result_invalidated();
             }
+        }
+
+        /// Assemble a `.reco` manifest from the mock's state (PROJ-01).
+        fn build_mock_project(
+            &self,
+            settings: &crate::events::ExportSettings,
+        ) -> crate::project::RecoProject {
+            let (yaw, pitch, fov_degrees) = {
+                let pose = self.pose.lock().unwrap();
+                let current = pose.current_pose();
+                (current.yaw, current.pitch, pose.current_fov_deg())
+            };
+            crate::project::RecoProject {
+                version: crate::project::PROJECT_VERSION,
+                left: crate::project::ProjectInput {
+                    path: self.input_paths[0].clone().unwrap_or_default(),
+                    lens_override: self.lens_override_candidates[0].clone(),
+                },
+                right: crate::project::ProjectInput {
+                    path: self.input_paths[1].clone().unwrap_or_default(),
+                    lens_override: self.lens_override_candidates[1].clone(),
+                },
+                calibration_path: self.calibration_path.clone(),
+                calibration: self.current_calibration.clone(),
+                pose: crate::project::PoseView {
+                    yaw,
+                    pitch,
+                    fov_degrees,
+                },
+                export: settings.clone(),
+            }
+        }
+
+        /// Restore a fully-present project in the mock and emit `ProjectOpened`
+        /// (PROJ-01). Mirrors the real backend's protocol without a GPU/file.
+        fn apply_mock_project(
+            &mut self,
+            path: String,
+            project: crate::project::RecoProject,
+            events: &EventSink,
+        ) {
+            use crate::events::InputRole;
+            let opened_left = project.left.clone();
+            let opened_right = project.right.clone();
+            let calibration_path = project.calibration_path.clone();
+            let pose = project.pose;
+            let export = project.export.clone();
+
+            for (role, input) in [
+                (InputRole::Left, &project.left),
+                (InputRole::Right, &project.right),
+            ] {
+                let _ = self.set_input(role, input.path.clone(), events);
+            }
+            for (role, input) in [
+                (InputRole::Left, &project.left),
+                (InputRole::Right, &project.right),
+            ] {
+                match &input.lens_override {
+                    Some(candidate) => {
+                        let _ = self.set_lens_override(role, candidate.clone(), events);
+                    }
+                    None => {
+                        let idx = role_index(role);
+                        self.lens_overrides[idx] = None;
+                        self.lens_override_candidates[idx] = None;
+                        events.lens_override_applied(role, None);
+                    }
+                }
+            }
+            let has_calibration = match project.calibration.clone() {
+                Some(cal) => {
+                    self.current_calibration = Some(cal);
+                    self.has_result = true;
+                    true
+                }
+                None => false,
+            };
+            self.calibration_path = calibration_path.clone();
+            {
+                let mut p = self.pose.lock().unwrap();
+                for intent in [
+                    reco_control::ControlIntent::Pose(reco_control::PoseIntent::SetYawRad(
+                        pose.yaw,
+                    )),
+                    reco_control::ControlIntent::Pose(reco_control::PoseIntent::SetPitchRad(
+                        pose.pitch,
+                    )),
+                    reco_control::ControlIntent::Pose(reco_control::PoseIntent::SetFovDeg(
+                        pose.fov_degrees,
+                    )),
+                ] {
+                    dispatch_intent(&mut p, intent);
+                }
+            }
+            self.pending_project = None;
+            events.project_opened(
+                path,
+                opened_left,
+                opened_right,
+                calibration_path,
+                has_calibration,
+                pose,
+                export,
+            );
         }
     }
 
@@ -7120,6 +7604,7 @@ mod tests {
             self.inputs[idx] = None;
             self.input_paths[idx] = None;
             self.lens_overrides[idx] = None;
+            self.lens_override_candidates[idx] = None;
             events.info(format!("{} cleared", role.label()));
             self.emit_mock_readiness(events);
             self.invalidate_mock_result(events);
@@ -7161,6 +7646,7 @@ mod tests {
                 cy: candidate.height as f64 / 2.0,
                 d: [0.0; 4],
             });
+            self.lens_override_candidates[idx] = Some(candidate.clone());
             events.lens_override_applied(role, Some(candidate));
             self.emit_mock_readiness(events);
             self.invalidate_mock_result(events);
@@ -7175,6 +7661,7 @@ mod tests {
             self.record("clear_lens_override");
             let idx = role_index(role);
             self.lens_overrides[idx] = None;
+            self.lens_override_candidates[idx] = None;
             events.lens_override_applied(role, None);
             self.emit_mock_readiness(events);
             self.invalidate_mock_result(events);
@@ -7299,6 +7786,7 @@ mod tests {
             calibration.field_roi = self.mock_field_roi.clone();
             self.current_calibration = Some(calibration);
             self.has_result = true;
+            self.calibration_path = Some(path.clone());
             // Mirror the real backend: publish the loaded profile's ROI (CALB-09)
             // so the editor pre-populates.
             match self.mock_field_roi.clone() {
@@ -7317,6 +7805,7 @@ mod tests {
                     "no calibration result to save".to_string(),
                 ));
             }
+            self.calibration_path = Some(path.clone());
             events.profile_saved(path);
             Ok(())
         }
@@ -7943,6 +8432,66 @@ mod tests {
         fn run_preflight(&self, events: &EventSink) {
             self.record("run_preflight");
             events.preflight(crate::preflight::run_preflight());
+        }
+
+        fn save_project(
+            &mut self,
+            path: String,
+            settings: &crate::events::ExportSettings,
+            events: &EventSink,
+        ) -> Result<(), WorkerError> {
+            self.record("save_project");
+            // Mirror the real backend without a GPU: assemble from the mock's
+            // state and write atomically.
+            let project = self.build_mock_project(settings);
+            project
+                .validate()
+                .map_err(|e| WorkerError::ProjectSave(e.to_string()))?;
+            project
+                .write_to_file(std::path::Path::new(&path))
+                .map_err(|e| WorkerError::ProjectSave(e.to_string()))?;
+            events.project_saved(path);
+            Ok(())
+        }
+
+        fn open_project(&mut self, path: String, events: &EventSink) -> Result<(), WorkerError> {
+            self.record("open_project");
+            let project = crate::project::RecoProject::read_from_file(std::path::Path::new(&path))
+                .map_err(|e| WorkerError::ProjectOpen(e.to_string()))?;
+            let missing = project.missing_inputs(mock_project_input_exists);
+            if !missing.is_empty() {
+                self.pending_project = Some(super::PendingProject {
+                    path: path.clone(),
+                    project,
+                });
+                events.project_missing_inputs(missing);
+                return Ok(());
+            }
+            self.apply_mock_project(path, project, events);
+            Ok(())
+        }
+
+        fn relocate_project_input(
+            &mut self,
+            role: crate::events::InputRole,
+            path: String,
+            events: &EventSink,
+        ) -> Result<(), WorkerError> {
+            self.record("relocate_project_input");
+            let Some(mut pending) = self.pending_project.take() else {
+                return Err(WorkerError::ProjectRelocate(
+                    "no project is awaiting relocation".to_string(),
+                ));
+            };
+            pending.project.set_input_path(role, path);
+            let missing = pending.project.missing_inputs(mock_project_input_exists);
+            if !missing.is_empty() {
+                self.pending_project = Some(pending);
+                events.project_missing_inputs(missing);
+                return Ok(());
+            }
+            self.apply_mock_project(pending.path, pending.project, events);
+            Ok(())
         }
 
         fn dispatch_intent(&mut self, intent: reco_control::ControlIntent) {
@@ -9588,6 +10137,180 @@ mod tests {
             }
         }
         seen
+    }
+
+    /// A unique temp dir for a project test (cleared first).
+    fn project_temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("reco-project-worker-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A minimal `.reco` JSON referencing `left` and `right` (PROJ-01).
+    fn sample_project_json(left: &str, right: &str) -> String {
+        crate::project::RecoProject {
+            version: crate::project::PROJECT_VERSION,
+            left: crate::project::ProjectInput {
+                path: left.to_string(),
+                lens_override: None,
+            },
+            right: crate::project::ProjectInput {
+                path: right.to_string(),
+                lens_override: None,
+            },
+            calibration_path: None,
+            calibration: None,
+            pose: crate::project::PoseView::default(),
+            export: crate::events::ExportSettings::default(),
+        }
+        .to_json()
+    }
+
+    #[test]
+    fn open_project_with_missing_inputs_emits_the_typed_relocate_list() {
+        let dir = project_temp_dir("missing");
+        let path = dir.join("p.reco");
+        std::fs::write(
+            &path,
+            sample_project_json("/nonexistent/left.mp4", "/nonexistent/right.mp4"),
+        )
+        .unwrap();
+
+        let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (worker, events) = EngineWorker::spawn(MockBackend::new(Arc::clone(&ops)));
+        let handle = worker.handle();
+        handle
+            .send(WorkerCommand::OpenProject {
+                path: path.display().to_string(),
+            })
+            .unwrap();
+        handle.send(WorkerCommand::Shutdown).unwrap();
+
+        let seen = drain_until_shutdown(&events);
+        let missing = seen
+            .iter()
+            .find_map(|e| match e {
+                WorkerEvent::ProjectMissingInputs { missing } => Some(missing.clone()),
+                _ => None,
+            })
+            .expect("a missing input must emit ProjectMissingInputs, never fail the open");
+        assert_eq!(missing.len(), 2);
+        assert!(
+            !seen
+                .iter()
+                .any(|e| matches!(e, WorkerEvent::ProjectOpened { .. })),
+            "a missing input must never partially restore"
+        );
+    }
+
+    #[test]
+    fn relocate_project_input_restores_the_project_once_inputs_exist() {
+        let dir = project_temp_dir("relocate");
+        let left = dir.join("left.mp4");
+        let right_present = dir.join("right.mp4");
+        std::fs::write(&left, b"").unwrap();
+        std::fs::write(&right_present, b"").unwrap();
+        // The project references a `right` path that does not exist, so the open
+        // always reports it missing; the relocate then points at the present file
+        // and completes the restore. (No race: the open's missing path is fixed.)
+        let path = dir.join("p.reco");
+        std::fs::write(
+            &path,
+            sample_project_json(&left.display().to_string(), "/nonexistent/right.mp4"),
+        )
+        .unwrap();
+
+        let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (worker, events) = EngineWorker::spawn(MockBackend::new(Arc::clone(&ops)));
+        let handle = worker.handle();
+        handle
+            .send(WorkerCommand::OpenProject {
+                path: path.display().to_string(),
+            })
+            .unwrap();
+        handle
+            .send(WorkerCommand::RelocateProjectInput {
+                role: crate::events::InputRole::Right,
+                path: right_present.display().to_string(),
+            })
+            .unwrap();
+        handle.send(WorkerCommand::Shutdown).unwrap();
+
+        let seen = drain_until_shutdown(&events);
+        assert!(
+            seen.iter()
+                .any(|e| matches!(e, WorkerEvent::ProjectMissingInputs { .. })),
+            "the first open must report the missing right input"
+        );
+        let opened = seen
+            .iter()
+            .find_map(|e| match e {
+                WorkerEvent::ProjectOpened { left, right, .. } => {
+                    Some((left.path.clone(), right.path.clone()))
+                }
+                _ => None,
+            })
+            .expect("relocating the missing input must restore and emit ProjectOpened");
+        assert_eq!(opened.0, left.display().to_string());
+        assert_eq!(opened.1, right_present.display().to_string());
+    }
+
+    #[test]
+    fn save_project_then_reopen_restores_the_inputs() {
+        let dir = project_temp_dir("roundtrip");
+        let left = dir.join("left.mp4");
+        let right = dir.join("right.mp4");
+        std::fs::write(&left, b"").unwrap();
+        std::fs::write(&right, b"").unwrap();
+        let project_path = dir.join("p.reco");
+
+        let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (worker, events) = EngineWorker::spawn(MockBackend::new(Arc::clone(&ops)));
+        let handle = worker.handle();
+        handle
+            .send(WorkerCommand::SetInput {
+                role: crate::events::InputRole::Left,
+                path: left.display().to_string(),
+            })
+            .unwrap();
+        handle
+            .send(WorkerCommand::SetInput {
+                role: crate::events::InputRole::Right,
+                path: right.display().to_string(),
+            })
+            .unwrap();
+        handle
+            .send(WorkerCommand::SaveProject {
+                path: project_path.display().to_string(),
+                settings: crate::events::ExportSettings::default(),
+            })
+            .unwrap();
+        handle
+            .send(WorkerCommand::OpenProject {
+                path: project_path.display().to_string(),
+            })
+            .unwrap();
+        handle.send(WorkerCommand::Shutdown).unwrap();
+
+        let seen = drain_until_shutdown(&events);
+        assert!(
+            seen.iter()
+                .any(|e| matches!(e, WorkerEvent::ProjectSaved { .. })),
+            "save must emit ProjectSaved"
+        );
+        let opened = seen
+            .iter()
+            .find_map(|e| match e {
+                WorkerEvent::ProjectOpened { left, right, .. } => {
+                    Some((left.path.clone(), right.path.clone()))
+                }
+                _ => None,
+            })
+            .expect("reopening a saved project must restore and emit ProjectOpened");
+        assert_eq!(opened.0, left.display().to_string());
+        assert_eq!(opened.1, right.display().to_string());
     }
 
     #[test]

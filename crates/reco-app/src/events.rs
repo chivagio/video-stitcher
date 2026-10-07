@@ -812,6 +812,11 @@ pub struct EncoderView {
 ///
 /// `Clone + Send + 'static` so it can cross the worker→UI channel; the
 /// compile-time assertion at the bottom of this file enforces that bound.
+// The `ProjectOpened` variant carries the whole restored snapshot (inputs, pose,
+// export settings), which makes it the largest variant. The enum is transient
+// (one event per message) so boxing it would only add indirection; the same
+// allow is used by `reco-cli`'s command enum.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 #[non_exhaustive]
@@ -1332,6 +1337,51 @@ pub enum WorkerEvent {
         /// The structured record.
         record: crate::system::LogRecord,
     },
+
+    /// A `.reco` project was written (PROJ-01).
+    ///
+    /// No media is copied; the manifest references the input paths. Mirrored to
+    /// an INFO [`LogLine`].
+    ProjectSaved {
+        /// The path that was written.
+        path: String,
+    },
+
+    /// A `.reco` project was opened and fully restored (PROJ-01).
+    ///
+    /// Carries everything the webview owns (the input paths + lens overrides,
+    /// the pose, and the export settings) so the stores reconcile from typed
+    /// values, never by parsing the manifest themselves. `has_calibration` is
+    /// true when a calibration (inline snapshot or referenced `.json`) was
+    /// restored; `calibration_path` is the referenced `.json` when known.
+    ProjectOpened {
+        /// The path that was opened.
+        path: String,
+        /// The restored left input (path + lens override).
+        left: crate::project::ProjectInput,
+        /// The restored right input (path + lens override).
+        right: crate::project::ProjectInput,
+        /// The referenced calibration `.json`, when known.
+        calibration_path: Option<String>,
+        /// Whether a calibration was restored.
+        has_calibration: bool,
+        /// The restored pose.
+        pose: crate::project::PoseView,
+        /// The restored export settings.
+        export: ExportSettings,
+    },
+
+    /// One or more referenced inputs are missing when opening a project
+    /// (PROJ-01).
+    ///
+    /// The open does **not** fail and does **not** partially restore: the worker
+    /// retains the parsed project and emits this typed list so the UI can offer a
+    /// relocate flow. Relocating an input re-runs the restore; only a complete
+    /// set of present inputs produces [`WorkerEvent::ProjectOpened`].
+    ProjectMissingInputs {
+        /// The referenced inputs that were not found, by role.
+        missing: Vec<crate::project::MissingInput>,
+    },
 }
 
 /// The UI-facing shape of an event-log line (UI-SPEC Event Log Contract).
@@ -1838,6 +1888,29 @@ impl WorkerEvent {
                 },
                 message: format!("[{}] {}", record.target, record.message),
             },
+            WorkerEvent::ProjectSaved { path } => LogLine {
+                level: Level::Info,
+                message: format!("project saved: {path}"),
+            },
+            WorkerEvent::ProjectOpened { path, .. } => LogLine {
+                level: Level::Info,
+                message: format!("project opened: {path}"),
+            },
+            // Missing inputs need operator action, so the narrative line is a
+            // WARN naming the first missing path; the full typed list rides the
+            // typed channel for the relocate dialog (PROJ-01).
+            WorkerEvent::ProjectMissingInputs { missing } => LogLine {
+                level: Level::Warn,
+                message: match missing.first() {
+                    Some(first) => format!(
+                        "project inputs missing: {} of 2 — {} {}",
+                        missing.len(),
+                        first.role.name(),
+                        first.path
+                    ),
+                    None => "project inputs missing".to_string(),
+                },
+            },
         }
     }
 }
@@ -1917,6 +1990,25 @@ pub enum WorkerError {
     /// rejected rather than silently dropped (EXPT-04 / CONTEXT modal decision).
     #[error("export in progress — wait for it to finish or cancel it")]
     ExportInProgress,
+
+    /// Saving a `.reco` project failed (PROJ-01).
+    ///
+    /// The inner message is the typed [`crate::project::ProjectError`]'s
+    /// `Display` text; no partial file is left at the target path.
+    #[error("cannot save project: {0}")]
+    ProjectSave(String),
+
+    /// Opening a `.reco` project failed (PROJ-01).
+    ///
+    /// The inner message is the typed [`crate::project::ProjectError`]'s
+    /// `Display` text (parse, unsupported version, or validation failure) — the
+    /// open never partially restores.
+    #[error("cannot open project: {0}")]
+    ProjectOpen(String),
+
+    /// A relocate was requested with no project awaiting one (PROJ-01).
+    #[error("cannot relocate project input: {0}")]
+    ProjectRelocate(String),
 }
 
 // Compile-time bound check: both halves of the protocol are `Clone + Send +
@@ -1941,6 +2033,12 @@ const _: fn() = || {
     assert_clone_send::<crate::system::LogRecord>();
     assert_clone_send::<crate::preflight::PreflightReport>();
     assert_clone_send::<crate::preflight::PreflightItem>();
+    // PROJ-01: the project manifest and its parts are cloned into the worker's
+    // retained pending project and sent over the typed channel.
+    assert_clone_send::<crate::project::RecoProject>();
+    assert_clone_send::<crate::project::ProjectInput>();
+    assert_clone_send::<crate::project::PoseView>();
+    assert_clone_send::<crate::project::MissingInput>();
 };
 
 #[cfg(test)]

@@ -30,6 +30,7 @@ mod export_naming;
 mod hardcoded;
 mod preflight;
 mod presenter;
+mod project;
 mod system;
 mod transport;
 mod worker;
@@ -85,6 +86,9 @@ fn main() -> anyhow::Result<()> {
             commands::preview_export_path,
             commands::system_info,
             commands::run_preflight,
+            commands::save_project,
+            commands::open_project,
+            commands::relocate_project_input,
             commands::play,
             commands::pause,
             commands::seek,
