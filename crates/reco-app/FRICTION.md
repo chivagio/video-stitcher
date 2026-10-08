@@ -522,3 +522,45 @@ needs MSVC import libs, tauri-build runs winres; only
 child-view arm (WebView2 / wgpu child HWND embedded under the chrome webview),
 which would make `Native` the chain head on Windows and retire the readback
 posture.
+
+### A15. Two Tauri components read `bundle.icon`, and only one has a fallback
+
+**Impact:** High, and it blocked `npx tauri build` on Windows **twice** — which
+made the failure look like it was repeating when it was actually two different
+checks failing in sequence. The repo shipped a single 32×32 `icons/icon.png`
+(Phase 1's stopgap, 01-01 SUMMARY V4) with `bundle.icon: ["icons/icon.png"]`,
+which satisfies neither consumer:
+
+- `tauri-build` (runs in `build.rs`) resolves the exe's Windows resource icon as
+  `WindowsAttributes::window_icon_path` → first `bundle.icon` entry ending in
+  `.ico` → the hardcoded default `icons/icon.ico`. A generated `icons/icon.ico`
+  **on disk** is enough; declaring it in `bundle.icon` is not required.
+- `tauri-bundler`'s MSI/Wix target resolves it as `bundle.windows.iconPath` →
+  first `bundle.icon` entry ending in `.ico`, and has **no on-disk fallback** —
+  it fails with `Couldn't find a .ico icon`.
+
+So a clean checkout failed first with `icons/icon.ico not found; required for
+generating a Windows Resource file during tauri-build`, and once that file
+existed on disk the next build failed with `Couldn't find a .ico icon`. Each fix
+unblocked exactly one check, so a partial fix reads as "it broke again".
+NSIS is unaffected throughout: it embeds the exe's own resource icon and never
+consults `bundle.icon`, so `--bundles nsis` succeeds while `--bundles msi` fails.
+CI never caught it because `test-build-gui.yml` builds `reco-gui` (Slint, no
+`tauri-build`) and `release-app.yml` runs the same `npx tauri build` with no
+icon-generation step.
+
+**Resolution (this change):** `npx tauri icon icons/icon.png` output is
+committed — `icon.ico` (layers 16/24/32/48/64/256, all PNG-encoded, matching the
+CLI's encoder), `icon.icns`, and the desktop PNGs `32x32` / `128x128` /
+`128x128@2x` — and `bundle.icon` now lists the standard Tauri v2 desktop set
+instead of the single PNG. Regeneration noise (the appx / android / iOS trees
+and `64x64.png`) is gitignored, so `npx tauri icon` re-runs leave the tree
+clean.
+
+**Residual gap:** the source is still the 32×32 placeholder, so every layer
+above 32 px is an upscale and reads blurry in Explorer and the installer chrome;
+nothing enforces replacing it with a real 1024×1024 master before release. The
+duplicated resolution logic is upstream (two components, one fallback), so the
+next icon change has to be validated against both consumers — and a CI gate
+(either assert `bundle.icon` contains a `.ico`, or bundle on a branch before a
+release) is the only thing that keeps this from recurring.
