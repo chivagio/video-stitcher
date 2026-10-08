@@ -2,3 +2,13 @@
 # regenerates these; they are never committed (the Tauri build consumes them).
 node_modules/
 ui/dist/
+
+# `npx tauri icon icons/icon.png` output. Only the desktop set referenced by
+# `bundle.icon` is committed (icon.ico / icon.icns / 32x32 / 128x128 /
+# 128x128@2x); the appx / android / iOS trees and the extra PNG are
+# regenerated on demand by that command and stay untracked.
+icons/64x64.png
+icons/StoreLogo.png
+icons/Square*Logo.png
+icons/android/
+icons/gen/
