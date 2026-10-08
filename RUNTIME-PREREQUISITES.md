@@ -20,7 +20,7 @@ prerequisite — this file documents what that panel reports.
 | Prerequisite | Platform | Why it is needed | Bundled with the installer? | Remediation |
 |---|---|---|---|---|
 | **FFmpeg shared libraries** (`libavcodec`, `libavformat`, `libavutil`, `libswscale`, `libavfilter`, `libavdevice`, `libswresample`) | Linux | Decode the camera clips and encode the stitched panorama. `reco-io` links these dynamically. | **Declared as package dependencies** — `bundle.linux.deb.depends` lists the FFmpeg runtime libraries the binary links (`libavcodec61`, `libavformat61`, `libavutil59`, `libswscale8`, `libswresample5`), so installing the `deb` pulls them in from the distribution. The AppImage target cannot express package dependencies, so AppImage users install them manually. | `deb` installs them automatically. Manual / AppImage: `sudo apt install libavcodec61 libavformat61 libavutil59 libswscale8 libswresample5` (Debian/Ubuntu) or `sudo dnf install ffmpeg-libs` (Fedora). |
-| **FFmpeg DLLs** | Windows | Same decode/encode path as above. | **No** — the app installer does not ship FFmpeg DLLs. (The `release.yml` *CLI* artifacts copy them; `release-app.yml` does not bundle them.) | Download [BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds/releases) (`n7.1 win64-gpl-shared`), extract, and place the DLLs next to `reco-app.exe`. |
+| **FFmpeg DLLs** | Windows | Same decode/encode path as above. | **Yes** — the Windows NSIS/MSI installer and the `reco-app-<version>-windows-x86_64.zip` portable artifact both place the FFmpeg DLLs next to `reco-app.exe` (via `bundle.resources`), and ship FFmpeg's GPLv3 license text (`FFMPEG-LICENSE.txt`) plus a written source-offer notice (`FFMPEG-SOURCE-OFFER.txt`). | None for a released installer / portable ZIP. For a hand-built/dev copy, download [BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds/releases) (`n7.1 win64-gpl-shared`), extract, and place the DLLs next to `reco-app.exe`. |
 | **FFmpeg libraries** | macOS | Same decode/encode path. | **No** — the app bundle does not embed FFmpeg dylibs. | `brew install ffmpeg`. |
 | **ONNX Runtime** (`libonnxruntime`) | Linux / macOS / Windows | AI detection backends (camera control / subject tracking) when the `ort` feature is built. | **Statically linked — shipped inside the `reco-app` binary** for the default feature set (`ort`'s prebuilt CPU runtime is linked in; verified: no `libonnxruntime` `DT_NEEDED`, ONNX Runtime symbols embedded). No install and no package dependency. A `--features load-dynamic` build instead loads the library at runtime. | Default build: none required. `load-dynamic` build: download the matching [ONNX Runtime release](https://github.com/microsoft/onnxruntime/releases/tag/v1.24.4) and place `libonnxruntime.so` / `libonnxruntime.dylib` / `onnxruntime.dll` next to the app binary. |
 | **WebView2 runtime** | Windows | The app UI is a webview; Windows ships no built-in webview. | **Bootstrapped** — `bundle.windows.webviewInstallMode = downloadBootstrapper`: the NSIS/MSI installer downloads Microsoft's WebView2 bootstrapper from the official endpoint and installs it if absent. | Already handled by the installer. Manual: [WebView2 Evergreen Bootstrapper](https://developer.microsoft.com/microsoft-edge/webview2/) (Microsoft download page). |
@@ -33,8 +33,9 @@ prerequisite — this file documents what that panel reports.
   `deb` declares the exact runtime shared libraries the binary links in
   `bundle.linux.deb.depends`, so `dpkg`/`apt` installs them. This is the "shipped"
   mechanism for Linux (DIAG-05 / ROADMAP SC5); the libraries are never bundled as
-  loose files. Windows and macOS installers do **not** bundle FFmpeg — those
-  users follow the table above.
+  loose files. macOS installers do **not** bundle FFmpeg, while the Windows
+  installers and the portable ZIP **do** (via `bundle.resources`) — see the table
+  above.
 - **ONNX Runtime ships inside the binary, not as a package dependency.** With
   the default feature set (`ort`, `download-binaries`) `ort-sys` statically
   links its prebuilt CPU runtime into `reco-app`, so there is nothing to install
