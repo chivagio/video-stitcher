@@ -40,7 +40,6 @@ mod worker;
 #[cfg(all(unix, not(target_os = "macos")))]
 use presenter::x11::X11Presenter;
 use presenter::{ChromeState, PresenterError, ViewportRect};
-#[cfg(all(unix, not(target_os = "macos")))]
 use tauri::Manager as _;
 
 /// Install the standard tracing subscriber + log bridge.
@@ -161,7 +160,9 @@ fn main() -> anyhow::Result<()> {
 ///
 /// Returns a typed error so the exact A1/A3 failure is visible (the caller logs
 /// it; the gate report (Plan 05) folds it in).
-#[cfg(all(unix, not(target_os = "macos")))]
+///
+/// This function is cross-platform: every target runs this same body and only
+/// the X11 native arm is compile-time gated inside it.
 fn run_skeleton(
     app: &mut tauri::App,
     log_tx: std::sync::mpsc::Sender<events::WorkerEvent>,
@@ -189,7 +190,12 @@ fn run_skeleton(
     // fall-through (e.g. a native Wayland handle, D-05), record the reason and
     // omit the arm — mirroring 02-06's catch-and-omit shape for the
     // separate-window arm. A non-fall-through construction failure stays fatal.
+    // On targets with no X11 presenter impl the arm is not compiled at all and
+    // the identical D-05 posture is recorded as `native_error`, so
+    // `startup_fallback_reason` reports it and the chain head is the strongest
+    // arm that did construct.
     let mut native_error: Option<PresenterError> = None;
+    #[cfg(all(unix, not(target_os = "macos")))]
     let native_presenter: Option<X11Presenter> = match X11Presenter::new(&window, &instance, rect) {
         Ok(mut presenter) => {
             presenter.lower();
@@ -202,6 +208,13 @@ fn run_skeleton(
         }
         Err(e) => return Err(SkeletonError::Presenter(e)),
     };
+    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    {
+        native_error = Some(PresenterError::Unsupported {
+            reason: "native child-view compositing is not yet implemented for this target (D-05)"
+                .to_string(),
+        });
+    }
 
     // Pre-create the Rust-owned, webview-less preview window on the SETUP thread
     // (PREV-05 / RESEARCH Pattern 5): it starts hidden, and the separate-window
@@ -228,17 +241,23 @@ fn run_skeleton(
     // events over the preview region land on this webview (it is above).
     add_chrome_webview(app, &window)?;
 
-    // The presenter chain (PREV-05): native → separate window → readback. All
-    // three are pre-created here on the setup thread; the worker installs the
-    // active one and can swap at a tick boundary on a manual override (Task 3).
-    // Readback is trivially cheap (no surface; it shares the worker's device).
+    // The presenter chain (PREV-05): native → separate window → readback. The
+    // native arm is pre-created here on the setup thread only on X11 targets
+    // (the `X11Presenter::new` attempt above is cfg-gated); every other target
+    // chains separate window → readback, so the worker's head-activation never
+    // sees an absent Native arm. The worker installs the active one and can swap
+    // at a tick boundary on a manual override (Task 3). Readback is trivially
+    // cheap (no surface; it shares the worker's device).
     //
     // The chain is built conditionally from the arms that constructed, in fixed
     // strongest-first order — Native → SeparateWindow → Readback — because the
     // worker activates the FIRST entry it receives.
     let mut presenter_chain: worker::PresenterChain = Vec::new();
-    if let Some(native) = native_presenter {
-        presenter_chain.push((presenter::PresenterKind::Native, Box::new(native)));
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        if let Some(native) = native_presenter {
+            presenter_chain.push((presenter::PresenterKind::Native, Box::new(native)));
+        }
     }
     if let Some(separate) = separate_window_presenter {
         presenter_chain.push((presenter::PresenterKind::SeparateWindow, Box::new(separate)));
@@ -349,7 +368,6 @@ fn run_skeleton(
 /// handler can take ownership of the worker and join it. Held in a `Mutex` (the
 /// only lock in `reco-app`, and it is never held across a render tick — it only
 /// guards the one-shot close path, so it cannot poison a hot path).
-#[cfg(all(unix, not(target_os = "macos")))]
 struct TeardownState {
     worker: std::sync::Mutex<Option<worker::EngineWorker>>,
 }
@@ -371,7 +389,6 @@ const SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// posted through `resize_handle`; the worker recomputes the native viewport
 /// from the new size + reported chrome state and reconfigures the surface,
 /// without resetting the playhead or pose.
-#[cfg(all(unix, not(target_os = "macos")))]
 fn install_close_handler(
     window: &tauri::window::Window,
     worker: worker::EngineWorker,
@@ -428,7 +445,6 @@ fn install_close_handler(
 /// `{ level, message }` and never invents text. The bridge never blocks the
 /// event loop — `spawn_blocking` runs the blocking `recv` off the async
 /// scheduler, and `emit` is a non-blocking fan-out.
-#[cfg(all(unix, not(target_os = "macos")))]
 fn install_event_bridge(
     app: tauri::AppHandle,
     events: std::sync::mpsc::Receiver<worker::WorkerEvent>,
@@ -458,34 +474,6 @@ fn install_event_bridge(
             }
         }
     });
-}
-
-/// Fallback path for targets without a native child-view presenter yet.
-///
-/// Builds the window + a fallback presenter that reports `Unsupported` (D-05)
-/// so a Wayland-only / unported build still links and reports cleanly.
-#[cfg(not(all(unix, not(target_os = "macos"))))]
-fn run_skeleton(
-    app: &mut tauri::App,
-    _log_tx: std::sync::mpsc::Sender<events::WorkerEvent>,
-    _log_rx: std::sync::mpsc::Receiver<events::WorkerEvent>,
-    _log_buffer: diagnostics::LogBuffer,
-) -> Result<(), SkeletonError> {
-    let _window = build_window(app)?;
-    let rect = ViewportRect::for_chrome(1280, 800, &ChromeState::default());
-    let presenter = presenter::fallback::FallbackPresenter::new(
-        "native child-view compositing is not yet implemented for this target (D-05)",
-        rect,
-    );
-    // No device is created on this path: capability negotiation has no target
-    // to negotiate against, so the recorded posture is emitted directly and the
-    // process exits cleanly (never panics). Plan 05's gate report folds this
-    // into the per-OS verdict.
-    log::warn!(
-        "D-05 fallback posture on this target: {}",
-        presenter.reason()
-    );
-    Ok(())
 }
 
 /// Create the one resizable, transparent window (no chrome yet).

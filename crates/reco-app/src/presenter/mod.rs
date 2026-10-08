@@ -272,7 +272,6 @@ pub fn fallback_warn_line(kind: PresenterKind, reason: &str) -> String {
 ///
 /// Returns `None` for an empty chain (a programmer error the worker rejects
 /// separately) so the helper never invents a reason for a chain that has none.
-#[cfg(all(unix, not(target_os = "macos")))]
 pub fn startup_fallback_reason(
     chain: &[PresenterKind],
     native_error: Option<&PresenterError>,
@@ -1239,7 +1238,6 @@ mod tests {
         assert!(!line.contains(".."));
     }
 
-    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn startup_fallback_reason_reports_a_chain_head_other_than_native() {
         // G-02-9: when the native arm did not construct, the chain head is a
@@ -1261,7 +1259,6 @@ mod tests {
         );
     }
 
-    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn startup_fallback_reason_is_none_when_native_is_active() {
         // A native/X11 chain head is the strongest presenter: no fallback, so
@@ -1273,7 +1270,6 @@ mod tests {
         assert!(startup_fallback_reason(&chain, Some(&err)).is_none());
     }
 
-    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn startup_fallback_reason_is_none_for_an_empty_chain() {
         // An empty chain is a programmer error the worker rejects separately;

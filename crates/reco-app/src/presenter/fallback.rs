@@ -27,17 +27,18 @@ use super::{PresenterError, SurfacePresenter, ViewportRect, viewport_config};
 ///
 /// Carries the recorded reason and a viewport for layout purposes; every
 /// rendering operation returns [`PresenterError::Unsupported`].
-// The fallback is only *constructed* on targets without a native child-view
-// impl (its caller in `main.rs::run_skeleton` is `#[cfg]`-excluded on Linux).
-// It is exercised by this module's unit tests on every target. Kept compiled
-// everywhere so a Wayland-only build links and reports cleanly (D-05).
-#[cfg_attr(all(unix, not(target_os = "macos")), allow(dead_code))]
+// No target constructs this presenter any more: `main.rs::run_skeleton` is a
+// single cross-platform function whose non-unix arm records the identical D-05
+// posture as `native_error` instead. The type is kept as the typed D-05 record,
+// is exercised by this module's unit tests on every target, and is allowed dead
+// code everywhere so `cargo clippy -- -D warnings` stays clean on Windows too.
+#[allow(dead_code)]
 pub struct FallbackPresenter {
     reason: String,
     viewport: ViewportRect,
 }
 
-#[cfg_attr(all(unix, not(target_os = "macos")), allow(dead_code))]
+#[allow(dead_code)]
 impl FallbackPresenter {
     /// Construct a fallback presenter carrying the recorded reason.
     pub fn new(reason: impl Into<String>, viewport: ViewportRect) -> Self {
