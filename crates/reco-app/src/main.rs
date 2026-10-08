@@ -1,3 +1,5 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 //! `reco-app` — Tauri 2 desktop host that links the Reco engine crates
 //! in-process and composites a native `wgpu::Surface` **below** the Tauri
 //! webview.

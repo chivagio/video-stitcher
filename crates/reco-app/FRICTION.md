@@ -477,3 +477,48 @@ device. The additive choice was deliberate (it keeps the CLI and OBS untouched),
 but it means the invariant is upheld by convention at the call site, not by the
 type system. A future pass could make the device an explicit parameter
 everywhere and delete the self-creating wrapper once no consumer needs it.
+
+### A14. `reco-app` shipped a hollow transparent shell on Windows, plus a stray console window
+
+**Impact:** High, and it made the Windows build unusable.
+`crates/reco-app/src/main.rs` carried two `run_skeleton` implementations split by
+`#[cfg(all(unix, not(target_os = "macos")))]`; the non-unix arm only built the
+transparent window plus a `FallbackPresenter` and returned — no chrome webview,
+no engine worker, no event bridge, no close handler — so Windows opened a
+see-through 1280x800 "Reco" window showing the desktop with no UI shell and a
+single D-05 WARN. The machinery was never the blocker
+(`presenter::separate_window`, `presenter::readback` and `worker.rs` have no cfg
+gates); only `presenter::x11` is gated. Second, independent omission: no
+`#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]`, so the
+release binary is console-subsystem and Windows attaches a console window to a
+GUI app (reco-gui has had the attribute since its first line).
+
+**Resolution (this change):** one cross-platform `run_skeleton` — the
+`X11Presenter::new` attempt and the `use presenter::x11::X11Presenter` import
+stay cfg-gated inside it, every other target records the identical D-05 posture
+as `native_error = Some(PresenterError::Unsupported { .. })` so
+`startup_fallback_reason` reports it through the existing fall-through path (the
+shape the Wayland fall-through already exercised), and the `Native` chain push is
+cfg-gated so non-unix chains are separate-window? + readback.
+`startup_fallback_reason` and its unit tests, `TeardownState`,
+`install_close_handler`, `install_event_bridge` and `use tauri::Manager as _`
+were un-gated (target-independent bodies); `FallbackPresenter`'s dead-code
+allowance is now unconditional (nothing constructs it on any target; it stays the
+typed D-05 record, unit-tested); `build_window`'s `.transparent(true)` is
+retained because in readback mode the webview canvas fills the preview region —
+the same shape the Linux readback presenter already ships.
+
+**Residual gap:** the native arm is still X11-only, so Windows runs the weakest
+available chain head — the throttled readback presenter (`READBACK_FPS = 10`,
+visible degraded banner) unless the separate-window arm constructs — and reports
+the D-05 reason at the single post-subscribe WARN delivery point rather than at
+setup. The console window is gone only for release builds. The Windows runtime is
+user-verified only: this host cannot cross-build (ffmpeg-sys-next's build script
+needs MSVC import libs, tauri-build runs winres; only
+`x86_64-unknown-linux-gnu` is installed), so verification here is host-target
+`cargo check` / `cargo test` / `cargo clippy -p reco-app` plus a Windows
+`npx tauri build` confirming the UI shell renders (transport bar + controls rail
++ log drawer) with no console window. The follow-up is a real Windows native
+child-view arm (WebView2 / wgpu child HWND embedded under the chrome webview),
+which would make `Native` the chain head on Windows and retire the readback
+posture.
