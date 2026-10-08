@@ -36,17 +36,21 @@ pub use reco_core::source::YuvFrame;
 /// `[-h/(2w), h/(2w)]` for Y, where the plane width is normalized to 1.0.
 /// The `left_pixel_nx` / `right_pixel_nx` fields store the original
 /// pixel x-coordinate normalized to `[0, 1]`, used for seam-proximity
-/// weighting during optimization.
+/// weighting during optimization. Following the same swap convention as
+/// `left`/`right`, `left_pixel_nx` is the **right** camera's pixel x and
+/// `right_pixel_nx` is the **left** camera's pixel x.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct MatchedPoint {
     /// Point on the left plane (x-plane in optimizer space).
     pub left: [f64; 2],
     /// Point on the right plane (z-plane in optimizer space).
     pub right: [f64; 2],
-    /// Normalized x-coordinate of the left point in pixel space `[0, 1]`.
+    /// Normalized pixel x of the point on the **right** camera's image `[0, 1]`
+    /// (stored in the swapped `left` plane slot).
     #[serde(default)]
     pub left_pixel_nx: f64,
-    /// Normalized x-coordinate of the right point in pixel space `[0, 1]`.
+    /// Normalized pixel x of the point on the **left** camera's image `[0, 1]`
+    /// (stored in the swapped `right` plane slot).
     #[serde(default)]
     pub right_pixel_nx: f64,
 }
@@ -658,6 +662,27 @@ pub struct CalibrationQuality {
     pub mean_reprojection_error: f64,
     pub trimmed_reprojection_error: f64,
     pub angular_error: f64,
+    /// Solved layout parameters sitting at a solver bound (see
+    /// [`crate::optimizer::railed_parameters`]). Empty for a well-posed solve.
+    #[serde(default)]
+    pub railed_parameters: Vec<String>,
+}
+
+/// Number of bound-railed parameters at which a solve is called degenerate.
+///
+/// A single correction nudging its limit is routine (a few degrees of roll is
+/// normal mounting misalignment). The wide-overlap collapse railed four —
+/// including `intersect` and `camera_axis_offset` — so a threshold above one or
+/// two separates the real degeneracy from ordinary bounded corrections.
+pub const DEGENERATE_RAIL_COUNT: usize = 3;
+
+impl CalibrationQuality {
+    /// Whether the solved layout railed enough parameters to be called
+    /// degenerate (see [`DEGENERATE_RAIL_COUNT`]).
+    #[must_use]
+    pub fn is_degenerate_layout(&self) -> bool {
+        self.railed_parameters.len() >= DEGENERATE_RAIL_COUNT
+    }
 }
 
 #[cfg(test)]

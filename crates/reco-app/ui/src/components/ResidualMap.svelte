@@ -96,8 +96,10 @@
 
     for (const p of allPoints) {
       ctx.fillStyle = colorFor(p);
-      if (leftOk) dot(ctx, leftX + p.x_nx * lw, p.y_nx * lh);
-      if (rightOk) dot(ctx, rightX + p.x_nx * rw, p.y_nx * rh);
+      // Same per-camera convention as the match overlay: left_* on the left
+      // thumbnail, right_* on the right thumbnail.
+      if (leftOk) dot(ctx, leftX + p.left_x_nx * lw, p.left_y_nx * lh);
+      if (rightOk) dot(ctx, rightX + p.right_x_nx * rw, p.right_y_nx * rh);
     }
   }
 

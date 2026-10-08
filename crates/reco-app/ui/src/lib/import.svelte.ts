@@ -54,10 +54,21 @@ export interface InputSlot {
   metadata: InputMetadata | null;
   /** The resolved/overridden lens profile and its tag. */
   lens: { value: LensCandidate | null; tag: LensTag };
-  /** The resolution-aware candidates for this slot's dropdown. */
+}
+
+/**
+ * The engine's resolution-aware lens-candidate list for one slot.
+ *
+ * Held as a **top-level** store field (not nested under `inputs[role]`): the
+ * dropdown must re-render when the async `lens_candidates` response arrives, and
+ * the nested `inputs[role]` mutation did not reliably reach the picker's
+ * reactivity — the menu stayed on "Searching profiles…" even after the list
+ * arrived. A reassigned top-level `$state` record propagates.
+ */
+export interface LensCatalog {
+  status: CandidateStatus;
   candidates: LensCandidate[];
-  candidatesStatus: CandidateStatus;
-  candidatesError: string | null;
+  error: string | null;
 }
 
 /** Video extensions offered in the native open dialog. */
@@ -74,10 +85,12 @@ function emptySlot(role: InputRole): InputSlot {
     error: null,
     metadata: null,
     lens: { value: null, tag: null },
-    candidates: [],
-    candidatesStatus: "idle",
-    candidatesError: null,
   };
+}
+
+/** A fresh, empty lens catalog for one role. */
+function emptyCatalog(): LensCatalog {
+  return { status: "idle", candidates: [], error: null };
 }
 
 /**
@@ -89,6 +102,17 @@ class ImportStore {
     left: emptySlot("left"),
     right: emptySlot("right"),
   });
+
+  /** The lens-candidate catalog per slot (top-level so dropdowns re-render). */
+  lensCatalog = $state<Record<InputRole, LensCatalog>>({
+    left: emptyCatalog(),
+    right: emptyCatalog(),
+  });
+
+  /** Replace one role's lens catalog with a fresh record (identity change). */
+  #setCatalog(role: InputRole, catalog: LensCatalog): void {
+    this.lensCatalog = { ...this.lensCatalog, [role]: catalog };
+  }
 
   /** The severity-sorted readiness report; empty findings means all passed. */
   readiness = $state<ReadinessReport>({
@@ -161,10 +185,7 @@ class ImportStore {
       }
       case "lens_candidates": {
         const { role, candidates } = event.data;
-        const slot = this.inputs[role];
-        slot.candidates = candidates;
-        slot.candidatesStatus = "ready";
-        slot.candidatesError = null;
+        this.#setCatalog(role, { status: "ready", candidates, error: null });
         if (this.#pendingLens === role) this.#pendingLens = null;
         break;
       }
@@ -223,9 +244,8 @@ class ImportStore {
       return;
     }
     if (this.#pendingLens !== null) {
-      const slot = this.inputs[this.#pendingLens];
-      slot.candidatesStatus = "error";
-      slot.candidatesError = message;
+      const role = this.#pendingLens;
+      this.#setCatalog(role, { status: "error", candidates: [], error: message });
       this.#pendingLens = null;
       return;
     }
@@ -296,8 +316,7 @@ class ImportStore {
     slot.status = "loading";
     slot.error = null;
     slot.metadata = null;
-    slot.candidates = [];
-    slot.candidatesStatus = "idle";
+    this.#setCatalog(role, emptyCatalog());
     this.#importQueue.push(role);
     try {
       await invoke("set_input", { role, path });
@@ -331,20 +350,22 @@ class ImportStore {
       // The worker will emit a corrective compatibility/invalidation event.
     }
     this.inputs[role] = emptySlot(role);
+    this.#setCatalog(role, emptyCatalog());
   }
 
   /** Request the resolution-aware lens candidates for one slot. */
   async requestLensCandidates(role: InputRole): Promise<void> {
-    const slot = this.inputs[role];
-    slot.candidatesStatus = "loading";
-    slot.candidatesError = null;
+    this.#setCatalog(role, { status: "loading", candidates: [], error: null });
     this.#pendingLens = role;
     try {
       await invoke("lens_candidates", { role });
     } catch (e) {
       if (this.#pendingLens === role) this.#pendingLens = null;
-      slot.candidatesStatus = "error";
-      slot.candidatesError = formatWorkerError(e);
+      this.#setCatalog(role, {
+        status: "error",
+        candidates: [],
+        error: formatWorkerError(e),
+      });
     }
   }
 
@@ -353,9 +374,11 @@ class ImportStore {
     try {
       await invoke("set_lens_override", { role, candidate });
     } catch (e) {
-      const slot = this.inputs[role];
-      slot.candidatesStatus = "error";
-      slot.candidatesError = formatWorkerError(e);
+      this.#setCatalog(role, {
+        status: "error",
+        candidates: [],
+        error: formatWorkerError(e),
+      });
     }
   }
 

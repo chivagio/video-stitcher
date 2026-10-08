@@ -80,8 +80,11 @@
     const drawClass = (points: DebugPoint[], color: string): void => {
       ctx.fillStyle = color;
       for (const p of points) {
-        if (leftOk) marker(ctx, leftX + p.x_nx * lw, p.y_nx * lh);
-        if (rightOk) marker(ctx, rightX + p.x_nx * rw, p.y_nx * rh);
+        // Each point carries BOTH cameras' positions: draw the left camera's
+        // keypoint on the left thumbnail and the right camera's on the right
+        // thumbnail (never mirror one camera's point onto both).
+        if (leftOk) marker(ctx, leftX + p.left_x_nx * lw, p.left_y_nx * lh);
+        if (rightOk) marker(ctx, rightX + p.right_x_nx * rw, p.right_y_nx * rh);
       }
     };
     // Rejected under verified so surviving matches stay visible on top.

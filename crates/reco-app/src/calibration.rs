@@ -10,7 +10,7 @@
 //! Typed `thiserror` errors only; this module deliberately imports no `anyhow`.
 
 use reco_calibrate::error::CalibrateError;
-use reco_calibrate::geometry::{OptParams, per_point_reprojection_error};
+use reco_calibrate::geometry::{OptParams, per_point_reprojection_error, plane_to_pixel};
 use reco_calibrate::intrinsics::{IntrinsicsRefinement, RefinementReason};
 use reco_calibrate::types::{
     CalibrationConfig, CalibrationResult, CalibrationStep, FrameMatches, LensProfileInfo,
@@ -314,6 +314,24 @@ pub fn diagnose_calibration_failure(
     }
 }
 
+/// Authored warning when the solved layout railed against its bounds.
+///
+/// `None` when the solve was well-posed. Authored once in Rust so the webview
+/// renders the engine's verdict verbatim (the T-04.2-12 idiom, matching the
+/// refinement-reason and diagnosis copy).
+#[must_use]
+pub fn layout_warning(result: &CalibrationResult) -> Option<String> {
+    let quality = result.quality.as_ref()?;
+    if !quality.is_degenerate_layout() {
+        return None;
+    }
+    Some(format!(
+        "Solve settled against its limits ({}). The layout may be degenerate — \
+         check the preview, or use manual calibration.",
+        quality.railed_parameters.join(", ")
+    ))
+}
+
 /// Band a calibration confidence into `High` / `Medium` / `Low` (CALB-03).
 ///
 /// `High` for `>= 0.8`, `Medium` for `>= 0.5`, else `Low`.
@@ -360,6 +378,9 @@ pub fn project_scorecard(result: &CalibrationResult) -> Scorecard {
         // The left camera's solved k1 is the profile value the opt-in refine
         // action will refine (INTR-03); carried so its aria-label can name it.
         k1: result.calibration.left.d[0],
+        // Surface a degenerate (bound-railed) solve rather than letting the
+        // match-count confidence stand alone.
+        layout_warning: layout_warning(result),
         sync: {
             // The provenance chain mark mirrors the method that produced the
             // offset; manual is the only path with no computed confidence.
@@ -526,13 +547,20 @@ pub fn build_debug_report(
     let mut points_capped = false;
 
     if let Some(fm) = frame {
-        // Use the ORIGINAL undistorted frame's aspect for the y normalization
-        // (the thumbnail preserves it only approximately under integer rounding).
-        let (coord_w, coord_h) = debug_frame
-            .map(|df| (df.left_width, df.left_height))
-            .unwrap_or((left_w, left_h));
-        let (cw, ch) = (coord_w.max(1) as f64, coord_h.max(1) as f64);
-        let aspect = cw / ch;
+        // Reconstruct each camera's own pixel position from the optimizer-space
+        // plane coordinates. The engine's historical swap convention stores the
+        // RIGHT camera's point in `p.left` and the LEFT camera's point in
+        // `p.right` (see `reco_calibrate::geometry`), so each plane is inverted
+        // with its own camera's dimensions. This gives a per-camera coordinate
+        // for BOTH thumbnails, so the overlay draws the left camera's keypoints
+        // on the left image and the right camera's on the right image instead of
+        // mirroring one camera's points onto both (the CALB-08 overlay defect).
+        let (lw_px, lh_px) = debug_frame
+            .map(|df| (df.left_width.max(1), df.left_height.max(1)))
+            .unwrap_or((1, 1));
+        let (rw_px, rh_px) = debug_frame
+            .map(|df| (df.right_width.max(1), df.right_height.max(1)))
+            .unwrap_or((1, 1));
 
         // Per-point residual when the fit is available (success path).
         let per_point = layout.map(|l| {
@@ -547,12 +575,19 @@ pub fn build_debug_report(
             };
             per_point_reprojection_error(&fm.points, &params)
         });
-        let to_point = |p: &MatchedPoint, error: f64| DebugPoint {
-            // `right_pixel_nx` is the LEFT camera keypoint's normalized x (the
-            // engine's historical swap convention); `right` is its plane y.
-            x_nx: p.right_pixel_nx.clamp(0.0, 1.0),
-            y_nx: (p.right[1] * aspect + 0.5).clamp(0.0, 1.0),
-            error,
+
+        let to_point = |p: &MatchedPoint, error: f64| {
+            // `p.right` is the LEFT camera's plane point (built with the left
+            // frame's dimensions); `p.left` is the RIGHT camera's.
+            let lp = plane_to_pixel(p.right, lw_px, lh_px);
+            let rp = plane_to_pixel(p.left, rw_px, rh_px);
+            DebugPoint {
+                left_x_nx: (lp[0] / lw_px as f64).clamp(0.0, 1.0),
+                left_y_nx: (lp[1] / lh_px as f64).clamp(0.0, 1.0),
+                right_x_nx: (rp[0] / rw_px as f64).clamp(0.0, 1.0),
+                right_y_nx: (rp[1] / rh_px as f64).clamp(0.0, 1.0),
+                error,
+            }
         };
 
         for (i, p) in fm.points.iter().enumerate() {
@@ -792,6 +827,7 @@ fn map_sync_method(method: EngineSyncMethod) -> SyncMethod {
 mod tests {
     use super::*;
     use crate::events::{MetadataField, Provenance};
+    use reco_calibrate::geometry::normalize_to_plane;
     use reco_calibrate::types::{
         CalibrationConfig, CalibrationResult, DebugFrame, FrameMatches, LensProfileInfo,
         MatchedPoint, ProfileSource, SyncInfo,
@@ -1442,9 +1478,62 @@ mod tests {
         let report = build_debug_report(&frames, None, 0.0);
         assert_eq!(report.verified.len(), 10);
         for p in &report.verified {
-            assert!((0.0..=1.0).contains(&p.x_nx), "x_nx out of range: {p:?}");
-            assert!((0.0..=1.0).contains(&p.y_nx), "y_nx out of range: {p:?}");
+            for (name, v) in [
+                ("left_x_nx", p.left_x_nx),
+                ("left_y_nx", p.left_y_nx),
+                ("right_x_nx", p.right_x_nx),
+                ("right_y_nx", p.right_y_nx),
+            ] {
+                assert!((0.0..=1.0).contains(&v), "{name} out of range: {p:?}");
+            }
         }
+    }
+
+    #[test]
+    fn debug_report_draws_each_camera_at_its_own_position() {
+        // CALB-08 overlay defect: each DebugPoint must carry BOTH cameras'
+        // positions so the right thumbnail is not a mirror of the left. Build a
+        // point whose left/right plane coordinates differ and assert the two
+        // thumbnails get distinct, correctly-oriented normalized positions.
+        let (lw, lh, rw, rh) = (200u32, 100u32, 200u32, 100u32);
+        let frame = FrameMatches {
+            points: vec![MatchedPoint {
+                // Optimizer-space swap: `left` is the RIGHT camera's plane point,
+                // `right` is the LEFT camera's. Put the left point near the frame
+                // right edge (x≈0.5) and the right point near its left edge.
+                left: normalize_to_plane(20.0, 50.0, rw, rh), // right cam: pixel x=20
+                right: normalize_to_plane(190.0, 50.0, lw, lh), // left cam: pixel x=190
+                left_pixel_nx: 20.0 / rw as f64,
+                right_pixel_nx: 190.0 / lw as f64,
+            }],
+            rejected: Vec::new(),
+            keypoints_left: 1,
+            keypoints_right: 1,
+            min_descriptors: 1,
+            post_ratio_test: 1,
+            post_spatial_filter: 1,
+            post_ransac: 1,
+            debug_frame: Some(DebugFrame {
+                left: vec![0u8; (lw * lh * 4) as usize],
+                left_width: lw,
+                left_height: lh,
+                right: vec![0u8; (rw * rh * 4) as usize],
+                right_width: rw,
+                right_height: rh,
+            }),
+        };
+        let report = build_debug_report(&[frame], None, 0.0);
+        let p = report.verified[0];
+        // Left thumbnail shows the left camera's pixel x (190/200 = 0.95); right
+        // thumbnail shows the right camera's pixel x (20/200 = 0.10). They must
+        // NOT be equal (the old single-coordinate payload made them equal).
+        assert!((p.left_x_nx - 0.95).abs() < 1e-6, "left x: {}", p.left_x_nx);
+        assert!(
+            (p.right_x_nx - 0.10).abs() < 1e-6,
+            "right x: {}",
+            p.right_x_nx
+        );
+        assert_ne!(p.left_x_nx, p.right_x_nx);
     }
 
     #[test]

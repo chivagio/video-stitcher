@@ -25,6 +25,9 @@ __pycache__/
 # GSD planning (local-only; Git Tracking = No)
 .planning/
 
+# GSD session/tooling state (local-only)
+.gsd/
+
 # Cargo local config
 .cargo/
 
@@ -45,6 +48,11 @@ calibrate_debug/
 calibration_adjusted.json
 # Repo-root scratch calibration (preview-driven debugging only).
 /match.json
+
+# Test media (generated clips/profiles/symlink dirs; run-app-for-testing.sh stays tracked)
+test-media/*.json
+test-media/uat-xiaomi/
+test-media/xiaomi/
 
 # Logs
 *.log

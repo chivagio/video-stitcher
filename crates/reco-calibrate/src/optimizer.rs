@@ -158,8 +158,11 @@ const SIMPLEX_PERTURBATION: f64 = 0.10;
 
 /// Cost function for argmin's Nelder-Mead solver.
 ///
-/// Wraps the seam-weighted reprojection error with a penalty term
-/// for out-of-bounds parameters (Nelder-Mead is unconstrained).
+/// Wraps the **normalized** seam-weighted reprojection error with a penalty term
+/// for out-of-bounds parameters (Nelder-Mead is unconstrained). Normalizing by
+/// the total seam weight is what keeps the objective honest for wide-overlap
+/// rigs — the older un-normalized trimmed sum was minimizable by shifting the
+/// seam off the observations, which railed every parameter to its bound.
 struct CalibrationCost<'a> {
     points: &'a [MatchedPoint],
     sigma: f64,
@@ -183,16 +186,12 @@ impl CostFunction for CalibrationCost<'_> {
             (false, true) => params_from_vec_no_zrx(p),
             (false, false) => params_from_vec(p),
         };
-        let err = if self.trim_fraction > 0.0 {
-            geometry::trimmed_seam_weighted_reprojection_error(
-                self.points,
-                &params,
-                self.sigma,
-                self.trim_fraction,
-            )
-        } else {
-            geometry::seam_weighted_reprojection_error(self.points, &params, self.sigma)
-        };
+        let err = geometry::trimmed_normalized_seam_weighted_reprojection_error(
+            self.points,
+            &params,
+            self.sigma,
+            self.trim_fraction,
+        );
 
         // Quadratic penalty for out-of-bounds parameters.
         let penalty = bounds_penalty(p, &self.bounds);
@@ -330,6 +329,36 @@ fn run_nelder_mead(
     let p = res.state().get_best_param()?.clone();
     let f = res.state().get_best_cost();
     Some((p, f))
+}
+
+/// Tolerance for calling a solved parameter "railed": within this of a bound.
+const RAIL_TOLERANCE: f64 = 1e-3;
+
+/// Names of the solved layout's parameters that sit at (or within a hair of) a
+/// solver bound.
+///
+/// A railed solve is the signature of a degenerate/degenerate-adjacent
+/// calibration: the optimizer could not improve inside the physical region and
+/// settled on a limit. It does not by itself mean the result is wrong, but on
+/// wide-overlap consumer footage all five parameters railing was exactly the
+/// failure the normalized objective fixed — so it is worth surfacing rather
+/// than reporting a bare, match-count "confidence".
+#[must_use]
+pub fn railed_parameters(layout: &PlaneLayout) -> Vec<&'static str> {
+    let checks: [(&str, f64, (f64, f64)); 5] = [
+        ("camera_axis_offset", layout.camera_axis_offset, BOUNDS_5[0]),
+        ("intersect", layout.intersect, BOUNDS_5[1]),
+        ("x_ty", layout.x_ty, BOUNDS_5[2]),
+        ("x_rz", layout.x_rz, BOUNDS_5[3]),
+        ("z_rx", layout.z_rx, BOUNDS_5[4]),
+    ];
+    checks
+        .iter()
+        .filter(|(_, v, (lo, hi))| {
+            (*v - lo).abs() <= RAIL_TOLERANCE || (*v - hi).abs() <= RAIL_TOLERANCE
+        })
+        .map(|(name, _, _)| *name)
+        .collect()
 }
 
 /// Multi-start Nelder-Mead optimizer.
@@ -595,6 +624,40 @@ mod tests {
         let (layout, _) = optimize(&points, &config).expect("optimization should succeed");
         assert_abs_diff_eq!(layout.camera_axis_offset, 0.24, epsilon = 0.05);
         assert_abs_diff_eq!(layout.intersect, 0.55, epsilon = 0.1);
+    }
+
+    #[test]
+    fn railed_parameters_flags_the_degenerate_collapse() {
+        // The exact shape the normalized objective fixed: intersect railed to
+        // 1.0, cam_d to its floor, and both rolls to opposite limits.
+        let collapsed = PlaneLayout {
+            camera_axis_offset: BOUNDS_5[0].0,
+            intersect: 1.0,
+            x_ty: 0.0,
+            x_rz: -0.3,
+            z_rx: 0.3,
+            x_rx: 0.0,
+            z_rz: 0.0,
+        };
+        let railed = railed_parameters(&collapsed);
+        assert!(railed.contains(&"intersect"), "{railed:?}");
+        assert!(railed.contains(&"camera_axis_offset"), "{railed:?}");
+        assert!(
+            railed.contains(&"x_rz") && railed.contains(&"z_rx"),
+            "{railed:?}"
+        );
+
+        // A well-posed solve rails nothing.
+        let healthy = PlaneLayout {
+            camera_axis_offset: 0.24,
+            intersect: 0.55,
+            x_ty: 0.0,
+            x_rz: 0.0,
+            z_rx: 0.0,
+            x_rx: 0.0,
+            z_rz: 0.0,
+        };
+        assert!(railed_parameters(&healthy).is_empty());
     }
 
     #[test]

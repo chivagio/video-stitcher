@@ -92,6 +92,13 @@
       <dd class="value mono">{scorecard.frames_used}</dd>
     </div>
 
+    {#if scorecard.layout_warning !== null}
+      <div class="row layout-warning" role="status">
+        <dt class="label">Layout</dt>
+        <dd class="value warn-text">{scorecard.layout_warning}</dd>
+      </div>
+    {/if}
+
     <div class="row">
       <dt class="label">Lens profile</dt>
       <dd class="value">
@@ -254,6 +261,10 @@
 
   .save-line.error {
     color: var(--color-log-error);
+  }
+
+  .warn-text {
+    color: var(--color-log-warn);
   }
 
   .sync-value {

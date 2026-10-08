@@ -840,6 +840,17 @@ fn calibrate_impl(
     let total_reproj = geometry::reprojection_error(&all_points, &best_params);
     let angular_err = geometry::angular_error(&all_points, &best_params);
     let trimmed_err = geometry::trimmed_reprojection_error(&all_points, &best_params, 0.2);
+    let railed: Vec<String> = optimizer::railed_parameters(&best_layout)
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    if railed.len() >= types::DEGENERATE_RAIL_COUNT {
+        log::warn!(
+            "calibration solved at solver bounds for: {} — the layout is likely degenerate; \
+             inspect the preview and prefer manual calibration if it looks wrong",
+            railed.join(", ")
+        );
+    }
     log::info!(
         "calibration complete: median_error={best_residual:.6}, trimmed={trimmed_err:.6}, \
          total_reproj={total_reproj:.6}, angular_error={angular_err:.6}, \
@@ -879,6 +890,7 @@ fn calibrate_impl(
             mean_reprojection_error: total_reproj,
             trimmed_reprojection_error: trimmed_err,
             angular_error: angular_err,
+            railed_parameters: railed,
         }),
         // Overwritten by `CalibrationPipeline::calibrate_with_progress` when a
         // pipeline drives this call; the free function has no sync context.

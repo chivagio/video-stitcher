@@ -340,10 +340,16 @@ mod tests {
         assert_abs_diff_eq!(result.layout.x_ty, t.x_ty, epsilon = 0.01);
     }
 
-    /// Guards the trap: the naive no-swap mapping yields a *different* rig with
-    /// a healthy residual, so residual alone cannot detect a wrong swap.
+    /// Guards the trap: the naive no-swap mapping yields a *different* rig, and
+    /// the wrong mapping must not recover the truth.
+    ///
+    /// Historically the wrong-swap solve also produced a deceptively healthy
+    /// residual (the old un-normalized weighted sum could be driven to ~0 by a
+    /// bogus rig). The normalized objective no longer collapses that way, so the
+    /// wrong swap now reports a large residual instead of hiding itself — the
+    /// test asserts both the wrong layout and the non-silent residual.
     #[test]
-    fn no_swap_pins_do_not_recover_the_truth_and_residual_hides_it() {
+    fn no_swap_pins_do_not_recover_the_truth_and_no_longer_hide_the_error() {
         let t = truth();
         let points = synthetic_points(&t, 64);
         let pins = pins_from_points(&points);
@@ -363,25 +369,20 @@ mod tests {
         let wrong = solve_manual_calibration(&[], &naive, (LW, LH), (RW, RH), &config)
             .expect("the wrong-swap solve still returns a rig — that is the trap");
 
-        // The no-swap rig is self-consistent (low residual) but wrong: overlap
-        // collapses to ~0 and the vertical translation drifts off the truth.
+        // The wrong mapping cannot recover the truth, and — unlike the old
+        // objective — it now reports an unhealthy residual rather than hiding.
+        let recovers_truth = (wrong.layout.camera_axis_offset - t.cam_d).abs() < 0.02
+            && (wrong.layout.intersect - t.intersect).abs() < 0.05
+            && (wrong.layout.x_ty - t.x_ty).abs() < 0.01;
         assert!(
-            wrong.residual < 1e-3,
-            "wrong-swap residual should look healthy, got {}",
+            !recovers_truth,
+            "wrong swap must not recover the truth: got cam_d={}, intersect={}, x_ty={}",
+            wrong.layout.camera_axis_offset, wrong.layout.intersect, wrong.layout.x_ty
+        );
+        assert!(
+            wrong.residual > 1e-3,
+            "wrong-swap residual must now surface the mismatch, got {}",
             wrong.residual
-        );
-        assert!(
-            wrong.layout.intersect < 0.1,
-            "wrong swap collapses intersect toward 0, got {}",
-            wrong.layout.intersect
-        );
-        assert!(
-            (wrong.layout.intersect - t.intersect).abs() > 0.2,
-            "wrong-swap intersect must differ from truth"
-        );
-        assert!(
-            (wrong.layout.x_ty - t.x_ty).abs() > 0.01,
-            "wrong-swap x_ty must differ from truth"
         );
     }
 

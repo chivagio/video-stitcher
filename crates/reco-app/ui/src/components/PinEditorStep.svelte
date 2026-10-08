@@ -62,10 +62,19 @@
   {/if}
 
   {#if degenerate}
-    <InlineNotice
-      level="warn"
-      message="Pins are too close together to solve — spread them across the frames."
-    />
+    {#if pinCount < 2}
+      <!-- A single correspondence is always degenerate (one point pair cannot
+           constrain the layout), so this is guidance, not an error. -->
+      <InlineNotice
+        level="info"
+        message="Add more pins to solve — a single correspondence can't constrain the calibration. Place a few spread across the frames."
+      />
+    {:else}
+      <InlineNotice
+        level="warn"
+        message="Pins are collinear or coincident — spread them across the frames."
+      />
+    {/if}
   {/if}
 
   <PinCanvas bind:activeId bind:pairing bind:pendingLeft />

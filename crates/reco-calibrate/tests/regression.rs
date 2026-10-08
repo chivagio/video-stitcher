@@ -263,3 +263,71 @@ fn regression_ratio_consistency() {
         );
     }
 }
+
+/// The Xiaomi phone pair is wide-overlap consumer footage on which the old
+/// un-normalized seam-weighted objective collapsed: every parameter railed and
+/// the raw reprojection was ~2.7× worse than the attainable in-bounds optimum.
+///
+/// This guards the fix: the solve must no longer rail `intersect`/`cam_d` to the
+/// degenerate corner (1.0 / 0.10) and must keep the mean reprojection well below
+/// the collapsed value. It does not pin the exact layout — the plane model is an
+/// approximation for this rig — only that the solve is sane and non-degenerate.
+#[test]
+fn regression_wide_overlap_phones_not_degenerate() {
+    let ds = load_dataset("xiaomi_phones");
+    assert_eq!(ds.n_points, ds.points.len());
+    let points = to_matched_points(&ds);
+
+    let config = CalibrationConfig {
+        optimizer: reco_calibrate::types::OptimizerConfig {
+            trim_fraction: 0.3,
+            seam_sigma: 0.08,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let (layout, _residual) =
+        optimizer::optimize(&points, &config).expect("optimizer should converge");
+
+    let railed = optimizer::railed_parameters(&layout);
+    eprintln!(
+        "xiaomi phones: cam_d={:.4} intersect={:.4} x_rz={:.2}deg z_rx={:.2}deg railed={:?}",
+        layout.camera_axis_offset,
+        layout.intersect,
+        layout.x_rz.to_degrees(),
+        layout.z_rx.to_degrees(),
+        railed
+    );
+
+    // The old collapse railed both of these to the corner (intersect -> 1.0,
+    // cam_d -> 0.10). Neither must happen now.
+    assert!(
+        !railed.contains(&"intersect"),
+        "intersect railed to a bound ({}) — degenerate solve returned",
+        layout.intersect
+    );
+    assert!(
+        !railed.contains(&"camera_axis_offset"),
+        "cam_d railed to a bound ({}) — degenerate solve returned",
+        layout.camera_axis_offset
+    );
+
+    // Raw (unweighted) mean reprojection: the old collapse sat at ~0.216, the
+    // attainable in-bounds optimum is ~0.07. Require clearly better than the
+    // collapse.
+    let params = reco_calibrate::geometry::OptParams {
+        x_ty: layout.x_ty,
+        intersect: layout.intersect,
+        cam_d: layout.camera_axis_offset,
+        x_rz: layout.x_rz,
+        z_rx: layout.z_rx,
+        z_rz: None,
+        x_rx: None,
+    };
+    let mean = reco_calibrate::geometry::reprojection_error(&points, &params) / points.len() as f64;
+    eprintln!("xiaomi phones: raw mean reprojection = {mean:.4}");
+    assert!(
+        mean < 0.20,
+        "raw mean reprojection {mean:.4} is in the degenerate-collapse range"
+    );
+}

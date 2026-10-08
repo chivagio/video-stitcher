@@ -7,7 +7,8 @@
   Ready: title + Start CTA + the seven pending stages + a 0% progress bar.
   Running: the live checklist + progress + heartbeat + Cancel CTA.
   Failed: the typed error + Try again / Back to import (no partial scorecard).
-  Result: the CALB-03 scorecard with Save profile… / Re-run calibration.
+  Result: the CALB-03 scorecard with Save profile… / Re-run calibration, the
+  opt-in lens refine, and a manual-calibration entry.
 -->
 <script lang="ts">
   import type { CalibrationOptions } from "../lib/types";
@@ -74,8 +75,8 @@
     advancedValid = valid;
   }
 
-  // Open the manual calibration flow (MANU-01). Always reachable from the ready
-  // state and the failure panel; no calibration `.json` is ever required.
+  // Open the manual calibration flow (MANU-01). Always reachable from the ready,
+  // result, and failure states; no calibration `.json` is ever required.
   function handleManualStart(): void {
     void manual.begin(0);
   }
@@ -115,6 +116,24 @@
       {#if calibration.intrinsicsRefinement !== null}
         <IntrinsicsReadout refinement={calibration.intrinsicsRefinement} />
       {/if}
+
+      <!-- Manual calibration entry (MANU-01). Kept reachable after a
+           successful auto-calibration too, not just from the ready state: the
+           pin/lens drag-handle flow is the finetune path when the automatic
+           solve is imperfect. -->
+      <section class="manual-section">
+        <ActionButton
+          variant="secondary"
+          title="Open the manual flow to finetune with correspondence pins and lens drag handles"
+          onClick={handleManualStart}
+        >
+          <Icon name="hand" />
+          Calibrate manually
+        </ActionButton>
+        <span class="manual-hint">
+          Finetune the solve by hand with correspondence pins and lens drag handles.
+        </span>
+      </section>
 
       <section class="roi-section">
         <button
@@ -277,6 +296,18 @@
     display: flex;
     align-items: center;
     gap: var(--space-md);
+  }
+
+  .manual-section {
+    display: flex;
+    align-items: center;
+    gap: var(--space-md);
+    flex-wrap: wrap;
+  }
+
+  .manual-hint {
+    color: var(--color-log-info);
+    font-size: var(--text-body);
   }
 
   /* Static text (never a flashing animation): `refining…` respects

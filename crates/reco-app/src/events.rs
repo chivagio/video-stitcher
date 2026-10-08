@@ -450,6 +450,11 @@ pub struct Scorecard {
     /// carried so the action's `aria-label` can name the current `k1` (UI-SPEC
     /// Accessibility). Equal to the left camera's `d[0]` at calibration time.
     pub k1: f64,
+    /// Plain-language warning when the solve settled against its parameter
+    /// bounds (a degenerate/degenerate-adjacent layout), or `None` when the
+    /// solve was well-posed. Authored in Rust so the webview renders it verbatim.
+    #[serde(default)]
+    pub layout_warning: Option<String>,
     /// Sync method and confidence.
     pub sync: SyncView,
 }
@@ -473,17 +478,24 @@ pub struct CalibrationOptions {
 
 /// One feature-match point for the debug inspector (CALB-08).
 ///
-/// `x_nx` / `y_nx` are normalized to `0.0..=1.0` on the paired undistorted
-/// frame (the left camera's coordinate space), so the overlay canvas scales
-/// them by its own width/height and never needs the pixel geometry. `error` is
-/// the per-point reprojection residual feeding the residual map's colour ramp
-/// (the run's residual when no per-point estimate is available).
+/// Each match carries the same physical feature as seen by **both** cameras,
+/// each normalized to `0.0..=1.0` on that camera's undistorted frame. The
+/// overlay canvas therefore draws `left_*` on the left thumbnail and `right_*`
+/// on the right thumbnail without needing any pixel geometry. (Previously only
+/// one camera's coordinate was carried and drawn on both thumbnails, which
+/// mirrored the points on the right image — the CALB-08 overlay defect.)
+/// `error` is the per-point reprojection residual feeding the residual map's
+/// colour ramp (the run's residual when no per-point estimate is available).
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DebugPoint {
-    /// Normalized x in the paired frame (`0.0..=1.0`).
-    pub x_nx: f64,
-    /// Normalized y in the paired frame (`0.0..=1.0`).
-    pub y_nx: f64,
+    /// Normalized x on the left camera frame (`0.0..=1.0`).
+    pub left_x_nx: f64,
+    /// Normalized y on the left camera frame (`0.0..=1.0`).
+    pub left_y_nx: f64,
+    /// Normalized x on the right camera frame (`0.0..=1.0`).
+    pub right_x_nx: f64,
+    /// Normalized y on the right camera frame (`0.0..=1.0`).
+    pub right_y_nx: f64,
     /// Reprojection-error proxy for this point (residual map colour).
     pub error: f64,
 }
@@ -2479,6 +2491,7 @@ mod tests {
                 source: "database".to_string(),
             }),
             k1: 0.0387,
+            layout_warning: Some("Solve settled against its limits (x_rz).".to_string()),
             sync: SyncView {
                 method: SyncMethod::Imu,
                 confidence: None,
@@ -2665,13 +2678,17 @@ mod tests {
             left_thumb: vec![0, 0, 0, 255, 255, 255, 255, 255],
             right_thumb: vec![0, 0, 0, 255, 255, 255, 255, 255],
             verified: vec![DebugPoint {
-                x_nx: 0.25,
-                y_nx: 0.5,
+                left_x_nx: 0.25,
+                left_y_nx: 0.5,
+                right_x_nx: 0.30,
+                right_y_nx: 0.5,
                 error: 0.01,
             }],
             rejected: vec![DebugPoint {
-                x_nx: 0.75,
-                y_nx: 0.5,
+                left_x_nx: 0.75,
+                left_y_nx: 0.5,
+                right_x_nx: 0.70,
+                right_y_nx: 0.5,
                 error: 0.2,
             }],
             residual_error: 0.01,

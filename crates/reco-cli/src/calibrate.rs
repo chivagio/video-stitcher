@@ -273,6 +273,28 @@ fn save_match_visualizations(
         right_img.save(format!("{dir}/matches_{i:02}_right.png"))?;
     }
     eprintln!("Match visualizations saved to {dir}/matches_*_{{left,right}}.png");
+
+    // Dump the raw matched points so the solve can be diagnosed offline
+    // (objective terms, bound-railing, mirroring) without re-decoding video.
+    let dump: Vec<_> = result
+        .per_frame
+        .iter()
+        .enumerate()
+        .map(|(i, fm)| {
+            serde_json::json!({
+                "frame": i,
+                "points": fm.points.iter().map(|p| serde_json::json!({
+                    "left": p.left,
+                    "right": p.right,
+                    "left_pixel_nx": p.left_pixel_nx,
+                    "right_pixel_nx": p.right_pixel_nx,
+                })).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    let path = format!("{dir}/matches.json");
+    std::fs::write(&path, serde_json::to_string_pretty(&dump)?)?;
+    eprintln!("Raw matched points dumped to {path}");
     Ok(())
 }
 
@@ -283,6 +305,17 @@ fn print_results(result: &reco_calibrate::CalibrationResult, output: &str, total
     eprintln!("  Total matches:   {}", result.total_matches);
     eprintln!("  Confidence:      {:.1}%", result.confidence * 100.0);
     eprintln!("  Residual error:  {:.6}", result.residual_error);
+    if let Some(q) = &result.quality
+        && q.is_degenerate_layout()
+    {
+        eprintln!(
+            "  WARNING: solve railed at solver bounds for: {}",
+            q.railed_parameters.join(", ")
+        );
+        eprintln!(
+            "           the layout is likely degenerate; check the preview before trusting it"
+        );
+    }
     eprintln!("\nPlacement parameters:");
     let l = &result.calibration.layout;
     eprintln!("  cameraAxisOffset: {:.4}", l.camera_axis_offset);

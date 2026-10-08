@@ -375,64 +375,122 @@ fn per_point_seam_weighted_errors_full(
     params: &OptParams,
     config: &SeamWeightConfig,
 ) -> Vec<f64> {
-    let camera = Vector3::new(params.cam_d, 0.0, params.cam_d);
-    let (x_pts, z_pts) = apply_transformations(points, params);
+    let weights = per_point_seam_weights_full(points, params.intersect, config);
+    per_point_reprojection_error(points, params)
+        .iter()
+        .zip(weights.iter())
+        .map(|(err, w)| w * err)
+        .collect()
+}
 
-    let left_cam_seam = 1.0 - params.intersect / 2.0;
-    let right_cam_seam = params.intersect / 2.0;
+/// Per-point seam-proximity weights (horizontal seam Gaussian × vertical
+/// center Gaussian).
+///
+/// The seam positions move with `intersect`, and the weights are deliberately
+/// **not** normalized (they sum to less than the point count). A weight near 1
+/// means the pair sits where a stitch seam falls; near 0 means it is far from
+/// any seam and matters little visually. Callers that must not be gamed by a
+/// layout that shrinks the total weight divide by the summed weight — see
+/// [`normalized_seam_weighted_reprojection_error`].
+fn per_point_seam_weights_full(
+    points: &[MatchedPoint],
+    intersect: f64,
+    config: &SeamWeightConfig,
+) -> Vec<f64> {
+    let left_cam_seam = 1.0 - intersect / 2.0;
+    let right_cam_seam = intersect / 2.0;
     // Clamp sigma to a minimum to prevent NaN from division by zero
     let sx = config.sigma_x.max(1e-6);
     let sy = config.sigma_y.max(1e-6);
     let inv_2sigma_sq = 1.0 / (2.0 * sx * sx);
     let inv_2sigma_y_sq = 1.0 / (2.0 * sy * sy);
 
-    x_pts
+    points
         .iter()
-        .zip(z_pts.iter())
-        .enumerate()
-        .map(|(idx, (x_pt, z_pt))| {
-            let dl = points[idx].left_pixel_nx - right_cam_seam;
-            let dr = points[idx].right_pixel_nx - left_cam_seam;
+        .map(|p| {
+            let dl = p.left_pixel_nx - right_cam_seam;
+            let dr = p.right_pixel_nx - left_cam_seam;
             let w_horiz =
                 0.5 * ((-dl * dl * inv_2sigma_sq).exp() + (-dr * dr * inv_2sigma_sq).exp());
 
-            let yl = points[idx].left[1] - config.y_center;
-            let yr = points[idx].right[1] - config.y_center;
+            let yl = p.left[1] - config.y_center;
+            let yr = p.right[1] - config.y_center;
             let w_vert =
                 0.5 * ((-yl * yl * inv_2sigma_y_sq).exp() + (-yr * yr * inv_2sigma_y_sq).exp());
 
-            let w = w_horiz * w_vert;
-            let mut err = 0.0;
-
-            let dir_x = x_pt - camera;
-            if dir_x.x.abs() > 1e-15 {
-                let t = -camera.x / dir_x.x;
-                if t > 0.0 {
-                    let hit = camera + t * dir_x;
-                    let dy = hit.y - z_pt.y;
-                    let dz = hit.z - z_pt.z;
-                    err += w * (dy * dy + dz * dz);
-                } else {
-                    err += w * 1e6;
-                }
-            }
-
-            let dir_z = z_pt - camera;
-            if dir_z.z.abs() > 1e-15 {
-                let t = -camera.z / dir_z.z;
-                if t > 0.0 {
-                    let hit = camera + t * dir_z;
-                    let dx = hit.x - x_pt.x;
-                    let dy = hit.y - x_pt.y;
-                    err += w * (dx * dx + dy * dy);
-                } else {
-                    err += w * 1e6;
-                }
-            }
-
-            err
+            w_horiz * w_vert
         })
         .collect()
+}
+
+/// Normalized seam-weighted mean reprojection error.
+///
+/// The seam-weighted error sum divided by the total weight, so the value is
+/// invariant to the overall weight scale. The older objective summed the
+/// *un-normalized* weighted errors, which the optimizer could minimize by moving
+/// the seam away from the observations: that shrinks every weight toward zero
+/// and collapses the cost to ~0 regardless of how wrong the layout is. On
+/// wide-overlap consumer footage this produced a degenerate, bound-railed solve.
+/// Dividing by the summed weight removes that loophole while keeping the
+/// seam-priority bias. Falls back to the unweighted mean when every weight
+/// vanishes. Retained as the building block for the trimmed variant the
+/// optimizer actually minimizes.
+pub fn normalized_seam_weighted_reprojection_error(
+    points: &[MatchedPoint],
+    params: &OptParams,
+    sigma: f64,
+) -> f64 {
+    trimmed_normalized_seam_weighted_reprojection_error(points, params, sigma, 0.0)
+}
+
+/// Normalized **trimmed** seam-weighted mean reprojection error — the layout
+/// optimizer objective.
+///
+/// Trims the worst `trim_fraction` of points by weighted error (robust to
+/// outlier matches, which the un-trimmed mean is not — drop the trim and the
+/// GoPro/XTU solves rail), then divides by the *kept* weight total so the result
+/// is invariant to the overall weight scale (drop the normalization and
+/// wide-overlap footage collapses, because shrinking the weights shrinks the
+/// cost). Keeping both is what makes one objective work across narrow and wide
+/// overlap rigs.
+pub fn trimmed_normalized_seam_weighted_reprojection_error(
+    points: &[MatchedPoint],
+    params: &OptParams,
+    sigma: f64,
+    trim_fraction: f64,
+) -> f64 {
+    if points.is_empty() {
+        return 0.0;
+    }
+    let weights = per_point_seam_weights_full(
+        points,
+        params.intersect,
+        &SeamWeightConfig::from_sigma(sigma),
+    );
+    let errors = per_point_reprojection_error(points, params);
+    let n = points.len();
+
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| {
+        let wa = weights[a] * errors[a];
+        let wb = weights[b] * errors[b];
+        wa.partial_cmp(&wb).unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    // Keep the best `1 - trim` share; at least one point so the value is always
+    // finite and informative.
+    let keep = (((1.0 - trim_fraction) * n as f64).ceil() as usize).clamp(1, n);
+    let mut numerator = 0.0;
+    let mut denominator = 0.0;
+    for &i in &order[..keep] {
+        numerator += weights[i] * errors[i];
+        denominator += weights[i];
+    }
+    if denominator <= 1e-12 {
+        numerator / keep as f64
+    } else {
+        numerator / denominator
+    }
 }
 
 /// Seam-weighted symmetric reprojection error (sum over all points).

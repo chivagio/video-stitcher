@@ -372,8 +372,10 @@ mod tests {
             left_thumb: vec![1, 2, 3, 4, 5, 6, 7, 8],
             right_thumb: vec![9, 10, 11, 12, 13, 14, 15, 16],
             verified: vec![DebugPoint {
-                x_nx: 0.25,
-                y_nx: 0.5,
+                left_x_nx: 0.25,
+                left_y_nx: 0.5,
+                right_x_nx: 0.30,
+                right_y_nx: 0.5,
                 error: 0.1,
             }],
             rejected: Vec::new(),

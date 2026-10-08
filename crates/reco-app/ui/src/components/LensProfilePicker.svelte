@@ -7,30 +7,41 @@
   The dropdown is an ARIA listbox with a labelled search input and full keyboard
   operation. Long names ellipsize in the trigger (full value via `title`) and
   wrap in the menu.
+
+  Data is read from the live store slot (`importStore.inputs[role]`), not the
+  `slot` prop: the prop can be a stale object across an import/replace, and the
+  candidate status/array updated on the store did not reach a stale prop (the
+  menu stayed on "Searching profiles…"). `role` is stable, so the derived slot is
+  always the authoritative one.
 -->
 <script lang="ts">
-  import type { InputSlot } from "../lib/import.svelte";
   import { importStore } from "../lib/import.svelte";
+  import type { InputSlot } from "../lib/import.svelte";
   import type { LensCandidate } from "../lib/types";
   import Icon from "./Icon.svelte";
   import ProvenanceTag from "./ProvenanceTag.svelte";
 
   let { slot }: { slot: InputSlot } = $props();
 
+  // The authoritative slot: index the live store by the stable role.
+  const role = $derived(slot.role);
+  const live = $derived(importStore.inputs[role]);
+  // The candidate catalog is a top-level store record so the dropdown re-renders
+  // when the async response lands (see `LensCatalog`).
+  const catalog = $derived(importStore.lensCatalog[role]);
+
   let open = $state(false);
   let query = $state("");
   let brand = $state<string | null>(null);
 
   const currentLabel = $derived(
-    slot.lens.value === null
+    live.lens.value === null
       ? "Auto-detect"
-      : `${slot.lens.value.camera} ${slot.lens.value.lens}`,
+      : `${live.lens.value.camera} ${live.lens.value.lens}`,
   );
 
   const brands = $derived(
-    Array.from(
-      new Set(slot.candidates.map((c) => c.camera.split(" ")[0])),
-    ).sort(),
+    Array.from(new Set(catalog.candidates.map((c) => c.camera.split(" ")[0]))).sort(),
   );
 
   /**
@@ -38,10 +49,10 @@
    *
    * The selected value arrives in a `lens_override_applied` payload and the
    * candidate in a separate `lens_candidates` payload, so object identity
-   * (`slot.lens.value === candidate`) is always false. Compare stable fields.
+   * (`live.lens.value === candidate`) is always false. Compare stable fields.
    */
   function isSelected(candidate: LensCandidate): boolean {
-    const v = slot.lens.value;
+    const v = live.lens.value;
     return (
       v !== null &&
       v.camera === candidate.camera &&
@@ -52,7 +63,7 @@
   }
 
   const filtered = $derived(
-    slot.candidates.filter((c) => {
+    catalog.candidates.filter((c) => {
       if (brand !== null && !c.camera.startsWith(brand)) return false;
       if (query.length > 0) {
         const hay = `${c.camera} ${c.lens}`.toLowerCase();
@@ -64,10 +75,31 @@
 
   function toggle(): void {
     open = !open;
-    if (open && slot.candidatesStatus === "idle") {
-      void importStore.requestLensCandidates(slot.role);
+    // Retry whenever the list is not already loaded for this slot. The request
+    // is one-shot per open only while it stays "idle": a response that never
+    // lands (or a request made while the worker was mid-import) would otherwise
+    // wedge the menu on "Searching profiles…" forever, since reopening never
+    // asked again.
+    if (open && !(catalog.status === "ready" && catalog.candidates.length > 0)) {
+      void importStore.requestLensCandidates(role);
     }
   }
+
+  // Explicit visibility deriveds instead of an `{#if}` chain: the structural
+  // block failed to re-run when the candidate status changed asynchronously
+  // (the menu stayed on "Searching profiles…"), while derived values bound to
+  // attributes update reliably.
+  const showEmpty = $derived(
+    catalog.status === "ready" && catalog.candidates.length === 0,
+  );
+  const showNoMatch = $derived(
+    catalog.status === "ready" &&
+      catalog.candidates.length > 0 &&
+      filtered.length === 0,
+  );
+  const showList = $derived(
+    catalog.status === "ready" && filtered.length > 0,
+  );
 
   function close(): void {
     open = false;
@@ -76,12 +108,12 @@
   }
 
   function select(candidate: LensCandidate): void {
-    void importStore.setLensOverride(slot.role, candidate);
+    void importStore.setLensOverride(role, candidate);
     close();
   }
 
   function useAutoDetect(): void {
-    void importStore.clearLensOverride(slot.role);
+    void importStore.clearLensOverride(role);
     close();
   }
 
@@ -113,8 +145,8 @@
       onclick={toggle}
     >
       <span class="lens-value">{currentLabel}</span>
-      {#if slot.lens.tag !== null}
-        <ProvenanceTag provenance={slot.lens.tag} />
+      {#if live.lens.tag !== null}
+        <ProvenanceTag provenance={live.lens.tag} />
       {/if}
       <Icon name="chevron-down" />
     </button>
@@ -150,47 +182,48 @@
         {/each}
       </div>
 
-      {#if slot.candidatesStatus === "loading"}
-        <p class="menu-note">Searching profiles…</p>
-      {:else if slot.candidatesStatus === "error"}
-        <p class="menu-note error">
-          Couldn't load lens profiles: {slot.candidatesError ?? "unknown error"}.
-          Search is local — try Load profile file… below.
-        </p>
-      {:else if slot.candidates.length === 0}
-        <p class="menu-note">
-          No matching profiles found — the engine will auto-detect.
-        </p>
-      {:else if filtered.length === 0}
-        <p class="menu-note">No profiles match "{query}".</p>
-      {:else}
-        <ul class="candidate-list" role="listbox" aria-label="Lens profiles">
-          {#each filtered as candidate (candidate.camera + candidate.lens + candidate.width)}
-            <li>
-              <button
-                type="button"
-                class="candidate"
-                role="option"
-                aria-selected={isSelected(candidate)}
-                title={`${candidate.camera} ${candidate.lens}`}
-                onclick={() => select(candidate)}
+      <p class="menu-note" hidden={catalog.status !== "loading"}>
+        Searching profiles…
+      </p>
+      <p class="menu-note error" hidden={catalog.status !== "error"}>
+        Couldn't load lens profiles: {catalog.error ?? "unknown error"}. Search is
+        local — try Load profile file… below.
+      </p>
+      <p class="menu-note" hidden={!showEmpty}>
+        No matching profiles found — the engine will auto-detect.
+      </p>
+      <p class="menu-note" hidden={!showNoMatch}>No profiles match "{query}".</p>
+      <ul
+        class="candidate-list"
+        role="listbox"
+        aria-label="Lens profiles"
+        hidden={!showList}
+      >
+        {#each filtered as candidate (candidate.camera + candidate.lens + candidate.width)}
+          <li>
+            <button
+              type="button"
+              class="candidate"
+              role="option"
+              aria-selected={isSelected(candidate)}
+              title={`${candidate.camera} ${candidate.lens}`}
+              onclick={() => select(candidate)}
+            >
+              <span class="candidate-name"
+                >{candidate.camera} {candidate.lens}</span
               >
-                <span class="candidate-name"
-                  >{candidate.camera} {candidate.lens}</span
-                >
-                <span class="candidate-res"
-                  >{candidate.width}×{candidate.height}</span
-                >
-              </button>
-            </li>
-          {/each}
-        </ul>
-      {/if}
+              <span class="candidate-res"
+                >{candidate.width}×{candidate.height}</span
+              >
+            </button>
+          </li>
+        {/each}
+      </ul>
 
       <button type="button" class="menu-action" onclick={loadFile}>
         <Icon name="folder-open" /> Load profile file…
       </button>
-      {#if slot.lens.value !== null}
+      {#if live.lens.value !== null}
         <button type="button" class="menu-action" onclick={useAutoDetect}>
           Use auto-detect
         </button>

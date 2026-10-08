@@ -255,6 +255,8 @@ export interface Scorecard {
   lens_profile: LensProfileView | null;
   /** The profile's solved `k1`, the value the opt-in refine action will refine. */
   k1: number;
+  /** Warning when the solve settled against its parameter bounds, else `null`. */
+  layout_warning: string | null;
   sync: SyncView;
 }
 
@@ -280,10 +282,14 @@ export interface CalibrationDiagnosis {
 
 /** One feature-match point for the debug inspector (mirror `events::DebugPoint`). */
 export interface DebugPoint {
-  /** Normalized x in the paired frame (`0..1`). */
-  x_nx: number;
-  /** Normalized y in the paired frame (`0..1`). */
-  y_nx: number;
+  /** Normalized x on the left camera frame (`0..1`). */
+  left_x_nx: number;
+  /** Normalized y on the left camera frame (`0..1`). */
+  left_y_nx: number;
+  /** Normalized x on the right camera frame (`0..1`). */
+  right_x_nx: number;
+  /** Normalized y on the right camera frame (`0..1`). */
+  right_y_nx: number;
   /** Reprojection-error proxy for this point (residual map colour). */
   error: number;
 }

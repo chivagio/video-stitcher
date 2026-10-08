@@ -721,16 +721,12 @@ impl CostFunction for LayoutCost<'_> {
             z_rz: None,
             x_rx: None,
         };
-        let err = if self.trim_fraction > 0.0 {
-            geometry::trimmed_seam_weighted_reprojection_error(
-                self.points,
-                &params,
-                self.sigma,
-                self.trim_fraction,
-            )
-        } else {
-            geometry::seam_weighted_reprojection_error(self.points, &params, self.sigma)
-        };
+        let err = geometry::trimmed_normalized_seam_weighted_reprojection_error(
+            self.points,
+            &params,
+            self.sigma,
+            self.trim_fraction,
+        );
         Ok(err + layout_bounds_penalty(p, &self.bounds))
     }
 }
