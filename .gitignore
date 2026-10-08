@@ -4,6 +4,9 @@ target/
 # Tauri generated schemas (build output, regenerated on build)
 crates/reco-app/gen/
 
+# Tauri Windows config overlay (generated in CI / by the signing flow; never committed)
+crates/reco-app/tauri.windows.conf.json
+
 # Video artifacts
 *.mp4
 reco-trace.json

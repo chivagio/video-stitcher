@@ -10,9 +10,16 @@ name: Release App (Tauri)
 # not notarized. The seven secret names are recorded in
 # `.planning/phases/01-walking-skeleton-native-surface-gate/01-CREDENTIALS.md` §4.
 #
-# This workflow does NOT bundle FFmpeg or ONNX Runtime into the installer:
-# `tauri.conf.json` declares no `bundle.resources`, and the app requires those
-# runtimes to be installed at runtime — see RUNTIME-PREREQUISITES.md (WR-03).
+# On Windows this workflow bundles the FFmpeg shared libraries (the same BtbN
+# n7.1 source `release.yml` uses) into both the NSIS/MSI installers — via a
+# CI-generated `crates/reco-app/tauri.windows.conf.json` `bundle.resources`
+# overlay — and the portable `reco-app-<ref>-windows-x86_64.zip`, so the
+# Windows release is self-contained. Those FFmpeg binaries are GPLv3, so the
+# bundled artifacts also ship FFmpeg's license text (`FFMPEG-LICENSE.txt`) and a
+# written source-offer notice (`FFMPEG-SOURCE-OFFER.txt`); see
+# RUNTIME-PREREQUISITES.md. Linux declares its FFmpeg/webkit runtime through
+# `bundle.linux.deb.depends` and macOS uses Homebrew — neither embeds FFmpeg
+# files, and their bundles are unaffected by the Windows overlay.
 # ONNX Runtime is statically linked into the binary by `ort-sys`'s own
 # `download-binaries` build path (the app enables the `ort` feature, not
 # `load-dynamic`), so there is no ORT download step here. FFmpeg import
@@ -92,8 +99,9 @@ jobs:
 
       # FFmpeg shared libraries for Windows — same BtbN n7.1 source the
       # existing `release.yml` uses so the app and CLI stay ABI-matched.
-      # These provide the build-time import libraries; this workflow does NOT
-      # copy the DLLs into the installer (see the header note / WR-03).
+      # These provide the build-time import libraries AND the runtime DLLs the
+      # "Prepare Windows bundle config" step below stages into the installer
+      # resources and the portable ZIP, so the release ships self-contained.
       - name: Install FFmpeg (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -113,6 +121,14 @@ jobs:
           $dir = (Get-ChildItem "$env:RUNNER_TEMP\ffmpeg" -Directory | Select-Object -First 1).FullName
           echo "FFMPEG_DIR=$dir" >> $env:GITHUB_ENV
           echo "FFMPEG_DLL_DIR=$dir\bin" >> $env:GITHUB_ENV
+          echo "FFMPEG_LICENSE=$dir\LICENSE.txt" >> $env:GITHUB_ENV
+          echo "FFMPEG_ASSET_NAME=$($asset.name)" >> $env:GITHUB_ENV
+          echo "FFMPEG_ASSET_URL=$($asset.browser_download_url)" >> $env:GITHUB_ENV
+          # The redistributed binaries are GPLv3, so the license text must ship
+          # with them; fail loudly rather than silently omit it.
+          if (-not (Test-Path "$dir\LICENSE.txt")) {
+            throw "FFmpeg LICENSE.txt not found at $dir\LICENSE.txt; cannot bundle the GPL license text"
+          }
           echo "Bundled FFmpeg: $($asset.name)"
 
       - name: Setup Node
@@ -167,10 +183,12 @@ jobs:
       # ------------------------------------------------------------------
       # Windows Authenticode signing (credential-gated)
       # ------------------------------------------------------------------
-      # Imports the OV code-signing cert into the runner store and writes a
-      # platform config overlay with its thumbprint, so the Tauri bundler signs
-      # the app exe + NSIS/MSI installers during `tauri build`. Skipped (and no
-      # overlay written) when WINDOWS_CERTIFICATE is absent → unsigned build.
+      # Imports the OV code-signing cert into the runner store and exports its
+      # thumbprint, so the "Prepare Windows bundle config" step can add the
+      # signing keys to the generated overlay and the Tauri bundler signs the
+      # app exe + NSIS/MSI installers during `tauri build`. Skipped when
+      # WINDOWS_CERTIFICATE is absent → unsigned build (the resources-only
+      # overlay is still written by the next step).
       - name: Import Windows code-signing certificate
         if: runner.os == 'Windows' && env.WINDOWS_CERTIFICATE != ''
         shell: pwsh
@@ -182,13 +200,72 @@ jobs:
           [IO.File]::WriteAllBytes($certPath, [Convert]::FromBase64String($env:CERTIFICATE))
           $pw = ConvertTo-SecureString -String $env:CERTIFICATE_PASSWORD -Force -AsPlainText
           $cert = Import-PfxCertificate -FilePath $certPath -CertStoreLocation Cert:\CurrentUser\My -Password $pw
-          $config = @{ bundle = @{ windows = @{
-            certificateThumbprint = $cert.Thumbprint
-            digestAlgorithm       = "sha256"
-            timestampUrl          = "http://timestamp.digicert.com"
-          } } } | ConvertTo-Json -Depth 5
-          Set-Content -Path "crates/reco-app/tauri.windows.conf.json" -Value $config
+          echo "WINDOWS_CERT_THUMBPRINT=$($cert.Thumbprint)" >> $env:GITHUB_ENV
           Remove-Item $certPath -Force
+
+      # ------------------------------------------------------------------
+      # Windows bundle config overlay (FFmpeg DLLs + GPL license/notice)
+      # ------------------------------------------------------------------
+      # Generated in CI only (never committed): maps the downloaded DLLs and the
+      # license/notice files into `bundle.resources`, so `tauri build` copies
+      # them next to `reco-app.exe` (Tauri's Windows resource_dir is the exe's
+      # directory, which is where Windows resolves the DLLs from). The overlay is
+      # merged over `tauri.conf.json` by json_patch::merge (JSON Merge Patch,
+      # RFC 7396), so the base RUNTIME-PREREQUISITES.md resource survives. The
+      # signing keys are added only when the cert was imported above.
+      - name: Prepare Windows bundle config (FFmpeg DLLs + GPL notices)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $noticeDir = "$env:RUNNER_TEMP\ffmpeg-notice"
+          New-Item -ItemType Directory -Path $noticeDir -Force | Out-Null
+          $noticePath = "$noticeDir\FFMPEG-SOURCE-OFFER.txt"
+          # A string array piped to Set-Content (not a here-string) so the YAML
+          # block-scalar indentation cannot leave a here-string terminator
+          # indented and break the script.
+          $notice = @(
+            "FFmpeg source offer",
+            "",
+            "This application redistributes FFmpeg shared libraries built by the",
+            "BtbN/FFmpeg-Builds project, obtained from the archive:",
+            "  $env:FFMPEG_ASSET_NAME",
+            "  $env:FFMPEG_ASSET_URL",
+            "",
+            "These FFmpeg libraries are licensed under the GNU General Public",
+            "License, version 3 (see FFMPEG-LICENSE.txt).",
+            "",
+            "The Corresponding Source for FFmpeg is available from the FFmpeg",
+            "project at https://ffmpeg.org/download.html; the build scripts used",
+            "to produce these binaries are available from BtbN/FFmpeg-Builds at",
+            "https://github.com/BtbN/FFmpeg-Builds.",
+            "",
+            "This notice accompanies the GPL-licensed binaries as required by the",
+            "GNU GPL: the license text is shipped as FFMPEG-LICENSE.txt and this",
+            "file names where the Corresponding Source is obtainable. It does not",
+            "claim that source is shipped with this distribution."
+          )
+          $notice | Set-Content -Path $noticePath -Encoding UTF8
+          echo "FFMPEG_NOTICE=$noticePath" >> $env:GITHUB_ENV
+
+          # Map each DLL's absolute path (backslashes normalized to '/') to its
+          # basename so every DLL lands at the resource root, i.e. next to the
+          # exe. Then the license text and the source-offer notice.
+          $resources = [ordered]@{}
+          foreach ($dll in Get-ChildItem "$env:FFMPEG_DLL_DIR\*.dll") {
+            $resources[($dll.FullName -replace '\\','/')] = $dll.Name
+          }
+          $resources[($env:FFMPEG_LICENSE -replace '\\','/')] = "FFMPEG-LICENSE.txt"
+          $resources[($noticePath -replace '\\','/')] = "FFMPEG-SOURCE-OFFER.txt"
+
+          $config = [ordered]@{ bundle = [ordered]@{ resources = $resources } }
+          if ($env:WINDOWS_CERT_THUMBPRINT) {
+            $config.bundle.windows = [ordered]@{
+              certificateThumbprint = $env:WINDOWS_CERT_THUMBPRINT
+              digestAlgorithm       = "sha256"
+              timestampUrl          = "http://timestamp.digicert.com"
+            }
+          }
+          ($config | ConvertTo-Json -Depth 10) | Set-Content -Path "crates/reco-app/tauri.windows.conf.json"
 
       # ------------------------------------------------------------------
       # Build the bundle (Tauri filters `bundle.targets` to the host OS, so the
@@ -198,6 +275,31 @@ jobs:
         working-directory: crates/reco-app
         run: npx tauri build
 
+      # ------------------------------------------------------------------
+      # Portable ZIP (Windows) — mirrors the `release.yml` CLI packaging: the
+      # exe plus the FFmpeg DLLs and the GPL license/notice, so a user can unzip
+      # and run with no manual DLL install.
+      # ------------------------------------------------------------------
+      - name: Package portable ZIP (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ref = "${{ github.ref_name }}" -replace '[\\/:*?"<>|]','-'
+          $staging = "reco-app-$ref-windows-x86_64"
+          New-Item -ItemType Directory -Path $staging -Force | Out-Null
+          $exe = "target\release\reco-app.exe"
+          if (-not (Test-Path $exe)) { $exe = "crates\reco-app\target\release\reco-app.exe" }
+          if (-not (Test-Path $exe)) { throw "reco-app.exe not found; did the Tauri build run?" }
+          Copy-Item $exe "$staging\"
+          Copy-Item LICENSE "$staging\"
+          Copy-Item RUNTIME-PREREQUISITES.md "$staging\"
+          if (Test-Path "$env:FFMPEG_DLL_DIR") {
+            Copy-Item "$env:FFMPEG_DLL_DIR\*.dll" "$staging\"
+          }
+          if (Test-Path "$env:FFMPEG_LICENSE") { Copy-Item "$env:FFMPEG_LICENSE" "$staging\FFMPEG-LICENSE.txt" }
+          if (Test-Path "$env:FFMPEG_NOTICE")  { Copy-Item "$env:FFMPEG_NOTICE"  "$staging\FFMPEG-SOURCE-OFFER.txt" }
+          Compress-Archive -Path $staging -DestinationPath "$staging.zip"
+
       - name: Upload bundle artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -205,4 +307,5 @@ jobs:
           path: |
             target/release/bundle/**/*
             crates/reco-app/target/release/bundle/**/*
+            reco-app-*-windows-x86_64.zip
           if-no-files-found: warn
