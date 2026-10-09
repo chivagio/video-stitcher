@@ -210,6 +210,20 @@ class ImportStore {
         this.profileError = null;
         break;
       }
+      case "manual_saved": {
+        // A completed manual calibration is already installed in the live
+        // session — `manual_save` adopts the result and records the path
+        // worker-side (MANU-07) — so this installs it here exactly as a loaded
+        // profile is installed. Without this acknowledgement `profilePath` (the
+        // only thing `hasResult` keys off) stayed null, so Preview stayed
+        // disabled and the operator had to round-trip the profile through a
+        // file and a restart to reach the same session.
+        this.profilePath = event.data.path;
+        this.profileStatus = "idle";
+        this.profileError = null;
+        this.resultInvalidated = false;
+        break;
+      }
       case "result_invalidated": {
         this.resultInvalidated = true;
         break;
@@ -448,9 +462,10 @@ class ImportStore {
   }
 
   /**
-   * Whether a valid result exists (fresh calibration or loaded profile) — the
-   * Preview step's enablement. A fresh run's result is wired in plan 03-06;
-   * a loaded profile populates it here.
+   * Whether a valid result exists (fresh calibration, loaded profile, or
+   * completed manual calibration) — the Preview step's enablement. A fresh
+   * run's result is wired in plan 03-06; a loaded profile and a manual save
+   * both populate `profilePath` here.
    */
   get hasResult(): boolean {
     return this.profilePath !== null && !this.resultInvalidated;

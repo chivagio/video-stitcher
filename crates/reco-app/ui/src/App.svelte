@@ -224,6 +224,14 @@
     screen = next;
   }
 
+  // Completion handoff from a finished calibration (auto or manual). An
+  // explicit action, never an automatic screen switch: the operator is
+  // mid-wizard and may want to save the profile or re-run first. Routing
+  // follows the rail convention — App owns `screen` and Preview is a step.
+  function handleGoToPreview(): void {
+    screen = "preview";
+  }
+
   // Calibrate CTA on the Import screen (plan 03-05 routing).
   function handleCalibrate(): void {
     screen = "calibrate";
@@ -377,6 +385,7 @@
     <CalibrateScreen
       onRequestCancel={handleRequestCancel}
       onBackToImport={() => (screen = "import")}
+      onGoToPreview={handleGoToPreview}
     />
   {:else if screen === "export"}
     <!-- Modal Export screen (EXPT-01/02/04). The native view is suspended by

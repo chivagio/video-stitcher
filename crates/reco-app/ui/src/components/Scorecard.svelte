@@ -5,8 +5,9 @@
   profile names ellipsize with the full value in `title`. The card scrolls
   within the screen if the window is short.
 
-  Actions: Save profile… (the profile-save path via the import store) and
-  Re-run calibration (owned by the screen, since the advanced options live there).
+  Actions: Save profile… (the profile-save path via the import store),
+  Re-run calibration (owned by the screen, since the advanced options live
+  there), and the non-forcing Go to Preview completion handoff.
 -->
 <script lang="ts">
   import type { ConfidenceBand, Scorecard, SyncMethod } from "../lib/types";
@@ -17,7 +18,9 @@
   let {
     scorecard,
     onRerun,
-  }: { scorecard: Scorecard; onRerun: () => void } = $props();
+    onGoToPreview,
+  }: { scorecard: Scorecard; onRerun: () => void; onGoToPreview: () => void } =
+    $props();
 
   const BAND_WORD: Record<ConfidenceBand, string> = {
     high: "High",
@@ -153,6 +156,11 @@
     </ActionButton>
     <ActionButton variant="secondary" onClick={onRerun}>
       <Icon name="refresh" /> Re-run calibration
+    </ActionButton>
+    <!-- Non-forcing completion handoff (text-only, secondary): the operator can
+         still save the profile or re-run first. -->
+    <ActionButton variant="secondary" onClick={onGoToPreview}>
+      Go to Preview
     </ActionButton>
   </div>
 

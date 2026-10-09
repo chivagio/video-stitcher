@@ -32,9 +32,11 @@
   let {
     onRequestCancel,
     onBackToImport,
+    onGoToPreview,
   }: {
     onRequestCancel: () => void;
     onBackToImport: () => void;
+    onGoToPreview: () => void;
   } = $props();
 
   // The advanced options are owned here so both the ready-state disclosure and
@@ -84,14 +86,18 @@
 
 <div class="calibrate-screen">
   {#if manual.open}
-    <ManualCalibrationFlow onExit={() => {}} />
+    <ManualCalibrationFlow onExit={() => {}} {onGoToPreview} />
   {:else}
   <div class="calibrate-column">
     {#if calibration.status === "done" && calibration.result !== null}
       <header class="screen-header">
         <h2 class="screen-title">Calibration result</h2>
       </header>
-      <Scorecard scorecard={calibration.result} onRerun={handleRerun} />
+      <Scorecard
+        scorecard={calibration.result}
+        onRerun={handleRerun}
+        {onGoToPreview}
+      />
 
       <!-- Opt-in lens refinement (INTR-03): never runs inside the wizard, so
            the trigger exists only here on the result state. -->

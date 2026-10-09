@@ -22,6 +22,8 @@
   /** Whether the selector has been defaulted for the current session. */
   let initialised = false;
 
+  let { onGoToPreview }: { onGoToPreview: () => void } = $props();
+
   const framesTotal = $derived(manual.framesTotal);
   const maxFrame = $derived(framesTotal > 0 ? framesTotal - 1 : 0);
   const validation = $derived(manual.validationFrames[selectedFrame] ?? null);
@@ -156,6 +158,15 @@
     <ActionButton variant="primary" onClick={() => void handleSave()}>
       <Icon name="save" /> Save calibration
     </ActionButton>
+    <!-- Non-forcing completion handoff. Only shown once the worker has
+         reported the save, which is exactly when it has installed the result
+         in the live session — so the action never offers a Preview the session
+         cannot render. Saving again and re-validating stay available. -->
+    {#if manual.savedPath !== null}
+      <ActionButton variant="secondary" onClick={onGoToPreview}>
+        Go to Preview
+      </ActionButton>
+    {/if}
   </div>
 </section>
 

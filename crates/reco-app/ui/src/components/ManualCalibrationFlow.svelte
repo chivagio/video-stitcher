@@ -27,7 +27,10 @@
     validate: "Validate",
   };
 
-  let { onExit }: { onExit: () => void } = $props();
+  let {
+    onExit,
+    onGoToPreview,
+  }: { onExit: () => void; onGoToPreview: () => void } = $props();
 
   // Step 1's Next is gated on an explicit offset confirmation when the audio
   // estimate is absent or low (MANU-02); every other step's Next is bounded by
@@ -86,7 +89,7 @@
     {:else if manual.step === "bend"}
       <BendStep />
     {:else if manual.step === "validate"}
-      <ValidateStep />
+      <ValidateStep {onGoToPreview} />
     {:else}
       <div class="step-placeholder">
         <p class="placeholder-text">
