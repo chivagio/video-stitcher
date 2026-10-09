@@ -1,9 +1,9 @@
 <!--
   FOV slider (UI-SPEC Component Inventory).
-  <input type="range"> 40°..coverage ceiling, step 1; value mirrors worker pose.
-  The ceiling comes from the worker (`max`), because the pose is clamped to it
-  and a wider control would silently do nothing above it.
-  Disabled until pose state is available.
+  <input type="range"> 20°..coverage ceiling, step 1; value mirrors worker pose.
+  The floor is the engine's `fov_min_degrees` and the ceiling comes from the
+  worker (`max`), because the pose is clamped to it and a wider control would
+  silently do nothing above it. Disabled until pose state is available.
 -->
 <script lang="ts">
   let {
@@ -26,10 +26,23 @@
   } = $props();
 
   /**
-   * `max` from coverage, floored at 40 so the reported ceiling can never
-   * produce an empty range (a coverage boundary of 0 would).
+   * The narrowest FOV the engine accepts, pinned to `PoseControl`'s configured
+   * `fov_min_degrees` default (20°, `crates/reco-control/src/pose_control.rs`).
+   * `set_target_fov` clamps every request into `[fov_min, fov_max]`, so 20° is
+   * genuinely reachable — a floor the engine refuses is a dead part of the
+   * control. The old hardcoded 40 advertised a minimum the engine never
+   * enforced: the mirror image of the FRICTION A12 ceiling lie (the control
+   * spanned 40..150 while `clamp_via_coverage` pinned the pose to 50.87° on
+   * the shipped clip). A narrower FOV is inside the coverage boundary by
+   * construction, so the floor needs no coverage reconciliation.
    */
-  const ceiling = $derived(Math.max(40, max));
+  const FLOOR = 20;
+
+  /**
+   * `max` from coverage, floored at the engine minimum so the reported ceiling
+   * can never produce an empty range (a coverage boundary of 0 would).
+   */
+  const ceiling = $derived(Math.max(FLOOR, max));
 
   function handleInput(e: Event): void {
     const v = Math.min(Number((e.target as HTMLInputElement).value), ceiling);
@@ -43,7 +56,7 @@
     id="fov-slider"
     type="range"
     class="fov-input"
-    min="40"
+    min={FLOOR}
     max={ceiling}
     step="1"
     {value}
