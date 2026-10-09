@@ -1095,6 +1095,44 @@ fn default_plane_layout() -> reco_core::calibration::PlaneLayout {
     }
 }
 
+/// Close the previously active checklist stage `Done`, then announce the next
+/// one as `Active` (CALB-01).
+///
+/// Stage completion is ONE transition, not two independent emissions: every
+/// stage that has started is closed `Done` exactly once, when the next stage
+/// starts, and the final stage is closed by the run's terminal arm (success
+/// marks it `Done`; failure marks only the current stage `Failed`, because
+/// every earlier one is already closed). Without this, a stage that has moved
+/// on stays `Active` forever — a row stuck on "In progress" with no error
+/// anywhere, which is indistinguishable from a working one.
+///
+/// `Done` carries an **empty** detail: the store keeps a stage's last detail
+/// line and only overwrites on a non-empty one, so the line the stage reported
+/// while it was running survives. The newly announced stage carries `detail`.
+///
+/// This is one shared seam rather than a copy per backend (FRICTION A9/A11 —
+/// a mock that reimplements the decision hides the defect at the real site):
+/// the real `on_progress` closure and `MockBackend::calibrate` both call it, so
+/// the mock cannot grow a divergent version of the decision and the
+/// mock-driven tests assert the production transition.
+///
+/// No `progress` emission belongs here — the callers keep their own
+/// `stage_fraction` / `progress(1.0)` calls.
+fn activate_stage(
+    events: &EventSink,
+    last_active: &mut Option<crate::events::CalibrationStage>,
+    stage: crate::events::CalibrationStage,
+    detail: &str,
+) {
+    if let Some(previous) = *last_active
+        && previous != stage
+    {
+        events.stage(previous, crate::events::StageStatus::Done, "");
+    }
+    *last_active = Some(stage);
+    events.stage(stage, crate::events::StageStatus::Active, detail);
+}
+
 /// The overall progress fraction for a stage (stage `n` of 7, 1-based).
 fn stage_fraction(stage: crate::events::CalibrationStage) -> f64 {
     use crate::events::CalibrationStage as S;
@@ -4551,9 +4589,14 @@ impl EngineBackend for GpuEngineBackend {
         // Clear a stale cancel from a previous run before starting.
         self.calibration_cancel.store(false, Ordering::SeqCst);
 
-        events.stage(
+        // The stage the checklist has most recently announced, closed `Done` on
+        // the next transition by `activate_stage` (CALB-01). Read by the
+        // terminal arms once the progress closure (which borrows it) is gone.
+        let mut last_active: Option<crate::events::CalibrationStage> = None;
+        activate_stage(
+            events,
+            &mut last_active,
             crate::events::CalibrationStage::Probing,
-            crate::events::StageStatus::Active,
             "Probing video metadata",
         );
         events.progress(0.0);
@@ -4585,11 +4628,7 @@ impl EngineBackend for GpuEngineBackend {
             if let Ok(mut guard) = detail.lock() {
                 *guard = (stage, progress.detail.clone());
             }
-            events.stage(
-                stage,
-                crate::events::StageStatus::Active,
-                progress.detail.clone(),
-            );
+            activate_stage(events, &mut last_active, stage, &progress.detail);
             events.progress(stage_fraction(stage));
         };
 
@@ -4602,6 +4641,12 @@ impl EngineBackend for GpuEngineBackend {
             &self.calibration_cancel,
         );
 
+        // The progress closure borrows `last_active` mutably; its borrow ends at
+        // the `&mut on_progress` handoff above, which is what lets the terminal
+        // arms below read which stage actually ran. No explicit `drop` belongs
+        // here (clippy `drop_non_drop`: a reference-capturing closure has no
+        // destructor).
+        //
         // Always stop and join the monitor before returning (T-03-09): it must
         // not outlive the run or accumulate.
         stop.store(true, Ordering::SeqCst);
@@ -4637,8 +4682,14 @@ impl EngineBackend for GpuEngineBackend {
                 self.adopt_calibration(calibration_result.calibration.clone());
                 // Pre-populate the field ROI editor from the fresh result (CALB-09).
                 self.emit_field_roi(events);
+                // The stage that last ran is the one to close: for a normal run
+                // `last_active == Some(Optimizing)` (identical to the previous
+                // hardcoded emission), and a run that ends mid-way marks the
+                // stage that actually ran `Done`, never one that never started.
+                let final_stage =
+                    last_active.unwrap_or(crate::events::CalibrationStage::Optimizing);
                 events.stage(
-                    crate::events::CalibrationStage::Optimizing,
+                    final_stage,
                     crate::events::StageStatus::Done,
                     "Calibration complete",
                 );
@@ -8202,6 +8253,10 @@ mod tests {
             self.record("calibrate");
             // Mirror the real backend: a fresh run clears a stale cancel.
             self.calibration_cancel.store(false, Ordering::SeqCst);
+            // Mirror the real backend: one shared transition closes each stage
+            // `Done` as the next one starts (FRICTION A9/A11), so this drives
+            // `activate_stage` rather than a mock-only copy of the decision.
+            let mut last_active: Option<crate::events::CalibrationStage> = None;
             for stage in [
                 crate::events::CalibrationStage::Probing,
                 crate::events::CalibrationStage::DetectingProfiles,
@@ -8211,8 +8266,16 @@ mod tests {
                 crate::events::CalibrationStage::FeatureMatching,
                 crate::events::CalibrationStage::Optimizing,
             ] {
-                events.stage(stage, crate::events::StageStatus::Active, "mock stage");
+                activate_stage(events, &mut last_active, stage, "mock stage");
             }
+            // Mirror the real backend's success arm: the final stage is closed
+            // `Done` here, not on transition.
+            let final_stage = last_active.unwrap_or(crate::events::CalibrationStage::Optimizing);
+            events.stage(
+                final_stage,
+                crate::events::StageStatus::Done,
+                "Calibration complete",
+            );
             events.progress(1.0);
             events.result(mock_scorecard());
             // Mirror the real backend: publish the bounded debug payload too
@@ -9330,6 +9393,148 @@ mod tests {
                 .any(|e| matches!(e, WorkerEvent::CalibrationResult { .. })),
             "calibration must emit a scorecard result"
         );
+    }
+
+    /// The `(stage, status, detail)` rows an `EventSink` has emitted so far.
+    ///
+    /// Drains the receiver, so each assert block observes exactly the rows the
+    /// call it follows produced.
+    fn stage_rows(
+        rx: &Receiver<WorkerEvent>,
+    ) -> Vec<(
+        crate::events::CalibrationStage,
+        crate::events::StageStatus,
+        String,
+    )> {
+        rx.try_iter()
+            .filter_map(|event| match event {
+                WorkerEvent::CalibrationStage {
+                    step,
+                    status,
+                    detail,
+                } => Some((step, status, detail)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn activate_stage_closes_the_previous_stage_and_keeps_its_detail() {
+        // The checklist contract lives in the one shared transition: the first
+        // call only announces, every later call closes the previously active
+        // stage `Done` (empty detail, so the store keeps the detail that stage
+        // reported while running) before announcing the new one, and a
+        // re-announced stage is NOT closed.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let events = EventSink::new(tx);
+        let mut last: Option<crate::events::CalibrationStage> = None;
+
+        activate_stage(
+            &events,
+            &mut last,
+            crate::events::CalibrationStage::Probing,
+            "probing detail",
+        );
+        let rows = stage_rows(&rx);
+        assert_eq!(
+            rows,
+            vec![(
+                crate::events::CalibrationStage::Probing,
+                crate::events::StageStatus::Active,
+                "probing detail".to_string()
+            )],
+            "the first stage only announces itself Active"
+        );
+        assert_eq!(last, Some(crate::events::CalibrationStage::Probing));
+
+        activate_stage(
+            &events,
+            &mut last,
+            crate::events::CalibrationStage::DetectingProfiles,
+            "detecting detail",
+        );
+        let rows = stage_rows(&rx);
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    crate::events::CalibrationStage::Probing,
+                    crate::events::StageStatus::Done,
+                    String::new()
+                ),
+                (
+                    crate::events::CalibrationStage::DetectingProfiles,
+                    crate::events::StageStatus::Active,
+                    "detecting detail".to_string()
+                ),
+            ],
+            "the previous stage is closed Done with an empty detail, then the new one announces"
+        );
+
+        activate_stage(
+            &events,
+            &mut last,
+            crate::events::CalibrationStage::DetectingProfiles,
+            "detecting detail again",
+        );
+        let rows = stage_rows(&rx);
+        assert_eq!(
+            rows,
+            vec![(
+                crate::events::CalibrationStage::DetectingProfiles,
+                crate::events::StageStatus::Active,
+                "detecting detail again".to_string()
+            )],
+            "a re-announced stage is not closed Done mid-stage"
+        );
+    }
+
+    #[test]
+    fn calibration_closes_each_stage_done_before_the_next_starts() {
+        // The mock and the real backend share `activate_stage`, so this asserts
+        // the production transition (FRICTION A9/A11) rather than a mock-only
+        // copy: every stage is closed `Done` when the next one starts, the final
+        // stage is closed by the success arm, and no row can sit on "In
+        // progress". The exact sequence is pinned so a skipped, duplicated, or
+        // unordered stage fails here instead of in front of an operator.
+        use crate::events::CalibrationStage as S;
+        use crate::events::StageStatus as T;
+        let expected = [
+            (S::Probing, T::Active),
+            (S::Probing, T::Done),
+            (S::DetectingProfiles, T::Active),
+            (S::DetectingProfiles, T::Done),
+            (S::AudioSync, T::Active),
+            (S::AudioSync, T::Done),
+            (S::ExtractingFrames, T::Active),
+            (S::ExtractingFrames, T::Done),
+            (S::Undistorting, T::Active),
+            (S::Undistorting, T::Done),
+            (S::FeatureMatching, T::Active),
+            (S::FeatureMatching, T::Done),
+            (S::Optimizing, T::Active),
+            (S::Optimizing, T::Done),
+        ];
+
+        let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (worker, events) = EngineWorker::spawn(MockBackend::new(Arc::clone(&ops)));
+        let handle = worker.handle();
+        handle
+            .send(WorkerCommand::StartCalibration {
+                options: crate::events::CalibrationOptions::default(),
+            })
+            .unwrap();
+        handle.send(WorkerCommand::Shutdown).unwrap();
+
+        let seen = drain_until_shutdown(&events);
+        let rows: Vec<(crate::events::CalibrationStage, crate::events::StageStatus)> = seen
+            .iter()
+            .filter_map(|e| match e {
+                WorkerEvent::CalibrationStage { step, status, .. } => Some((*step, *status)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rows, expected);
     }
 
     #[test]
