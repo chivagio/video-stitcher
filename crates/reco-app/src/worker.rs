@@ -4300,6 +4300,48 @@ pub fn dispatch_intent(
     reco_control::IntentTranslator::new(pose).dispatch(intent);
 }
 
+/// Which presenter the "Show preview window" action must target (PREV-05).
+///
+/// Pure so the Windows-shaped decision is unit-testable without a device: on
+/// every non-X11 target the chain head IS the separate-window presenter, and its
+/// chain slot is empty while it is installed — so "is the arm in its slot?" is
+/// not the same question as "is a preview window reachable?".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShowPreviewWindowTarget {
+    /// The active presenter is the separate-window one, so it owns the window
+    /// directly (its chain slot is empty because `install_presenter` took it).
+    ActivePresenter,
+    /// A weaker presenter is active and the separate window is parked in its
+    /// chain slot.
+    ParkedSeparateWindow,
+    /// No preview window is reachable at all. This **must** reach the command
+    /// loop as a typed failure: the previous code answered `Ok(())`, which the
+    /// loop logged as `preview window shown` while nothing was shown — the
+    /// silent no-op an inert Preview screen reported with no log line.
+    Unreachable {
+        /// Why no preview window could be reached.
+        reason: &'static str,
+    },
+}
+
+/// Resolve [`ShowPreviewWindowTarget`] from the active presenter and whether the
+/// separate-window arm occupies its chain slot.
+fn show_preview_window_target(
+    active_kind: crate::presenter::PresenterKind,
+    arm_in_slot: bool,
+) -> ShowPreviewWindowTarget {
+    if active_kind == crate::presenter::PresenterKind::SeparateWindow {
+        ShowPreviewWindowTarget::ActivePresenter
+    } else if arm_in_slot {
+        ShowPreviewWindowTarget::ParkedSeparateWindow
+    } else {
+        ShowPreviewWindowTarget::Unreachable {
+            reason: "the separate-window presenter is not built on this target, \
+                     so there is no preview window to show",
+        }
+    }
+}
+
 impl EngineBackend for GpuEngineBackend {
     fn import(&mut self, events: &EventSink) -> Result<(), WorkerError> {
         events.info("import started");
@@ -6520,20 +6562,56 @@ impl EngineBackend for GpuEngineBackend {
     }
 
     fn show_preview_window(&mut self, events: &EventSink) {
+        // The separate-window slot, resolved once. The `expect` is the existing
+        // invariant: the kind is a fixed chain entry.
+        let separate_idx = crate::presenter::PRESENTER_CHAIN
+            .iter()
+            .position(|k| *k == crate::presenter::PresenterKind::SeparateWindow)
+            .expect("separate window is in the chain");
+        let target =
+            show_preview_window_target(self.active_kind, self.presenters[separate_idx].is_some());
+        // A discriminator, emitted once per explicit operator action and never
+        // per tick. It names the active presenter and whether a preview window is
+        // reachable at all, so an inert Preview screen is attributable from the
+        // log alone: if this line is ABSENT the request never reached the worker
+        // (the Tauri invoke was rejected client-side, which the frontend used to
+        // swallow), and if it is present the worker ran and the outcome below is
+        // authoritative. Without it a rejected invoke and an unreachable window
+        // produce identical, empty output.
+        events.info(format!(
+            "show preview window requested (active: {}, preview window: {})",
+            self.active_kind.name(),
+            if matches!(target, ShowPreviewWindowTarget::Unreachable { .. }) {
+                "unreachable"
+            } else {
+                "reachable"
+            },
+        ));
         // Show the separate window wherever it lives in the chain (the active
-        // presenter or its parked slot). Every other presenter's impl is a no-op
-        // default, so this routes to the separate-window presenter without a
-        // downcast (PREV-05).
-        let attempt = if self.active_kind == crate::presenter::PresenterKind::SeparateWindow {
-            self.presenter.show_preview_window()
-        } else {
-            let idx = crate::presenter::PRESENTER_CHAIN
-                .iter()
-                .position(|k| *k == crate::presenter::PresenterKind::SeparateWindow)
-                .expect("separate window is in the chain");
-            match self.presenters[idx].as_mut() {
-                Some(p) => p.show_preview_window(),
-                None => Ok(()),
+        // presenter or its parked slot). Presenters that own no preview window
+        // now report a typed failure instead of a silent `Ok(())`, so this
+        // routes to the separate-window presenter without a downcast (PREV-05)
+        // and never claims success for a no-op.
+        let attempt = match target {
+            ShowPreviewWindowTarget::Unreachable { reason } => {
+                Err(crate::presenter::PresenterError::Unsupported {
+                    reason: reason.to_string(),
+                })
+            }
+            // The active presenter is the separate-window one, so it owns the
+            // window directly (its chain slot is empty because it is installed).
+            ShowPreviewWindowTarget::ActivePresenter => self.presenter.show_preview_window(),
+            // A weaker presenter is active: the separate window is parked in its
+            // slot. Its own impl answers a typed failure if it has no window.
+            ShowPreviewWindowTarget::ParkedSeparateWindow => {
+                match self.presenters[separate_idx].as_mut() {
+                    Some(p) => p.show_preview_window(),
+                    None => Err(crate::presenter::PresenterError::Unsupported {
+                        reason: "the separate-window presenter is not built on this target, \
+                                 so there is no preview window to show"
+                            .to_string(),
+                    }),
+                }
             }
         };
         match attempt {
@@ -13428,6 +13506,7 @@ mod tests {
 #[cfg(test)]
 mod gpu_tests {
     use super::refine_verified_lens;
+    use crate::worker::{ShowPreviewWindowTarget, show_preview_window_target};
     use std::path::PathBuf;
     use std::sync::atomic::AtomicBool;
 
@@ -13436,6 +13515,49 @@ mod gpu_tests {
     fn gpu_backend_imports_and_previews_one_frame() {
         // The device-owning path is exercised end-to-end by the binary; this
         // test documents the ignored hook for a GPU-capable runner.
+    }
+
+    /// The Windows-shaped chain (separate window → readback, no native arm)
+    /// reports a typed failure rather than a silent success when no preview
+    /// window is reachable (PREV-05).
+    ///
+    /// `GpuEngineBackend::show_preview_window` used to map a missing arm to
+    /// `Ok(())`, which the command loop turned into `preview window shown` — a
+    /// log line claiming a window appeared when none did. The device-owning path
+    /// needs a GPU, so it is exercised by the binary; the decision itself is
+    /// pure and pinned by `show_preview_window_target_*` below.
+    #[test]
+    fn show_preview_window_target_prefers_the_active_presenter() {
+        // The active presenter owns the window wherever it sits in the chain, so
+        // a chain head of SeparateWindow (every non-X11 target) is reachable
+        // even though its slot is empty while it is installed.
+        assert_eq!(
+            show_preview_window_target(crate::presenter::PresenterKind::SeparateWindow, false),
+            ShowPreviewWindowTarget::ActivePresenter
+        );
+    }
+
+    #[test]
+    fn show_preview_window_target_parks_a_weaker_active_presenter() {
+        // Readback is active: the separate window sits in its parked slot.
+        assert_eq!(
+            show_preview_window_target(crate::presenter::PresenterKind::Readback, true),
+            ShowPreviewWindowTarget::ParkedSeparateWindow
+        );
+    }
+
+    #[test]
+    fn show_preview_window_target_fails_when_nothing_can_show_a_window() {
+        // The regression: no active separate window and an empty arm slot. This
+        // must be a typed failure, never `Ok`, or the worker logs "preview
+        // window shown" while showing nothing.
+        assert!(
+            matches!(
+                show_preview_window_target(crate::presenter::PresenterKind::Readback, false),
+                ShowPreviewWindowTarget::Unreachable { .. }
+            ),
+            "an unreachable preview window must be a typed failure"
+        );
     }
 
     /// The real mismatched Xiaomi pair (11T Pro left + 14T Pro right).

@@ -19,6 +19,31 @@ import { listen } from "@tauri-apps/api/event";
 import type { Channel } from "@tauri-apps/api/core";
 import type { LogLine, PresenterKind } from "./types";
 import { WORKER_EVENT } from "./types";
+import { log } from "./log.svelte";
+
+/**
+ * Record a rejected presenter IPC call on the event log.
+ *
+ * The old code was `catch {}` with the comment "The worker will emit a Presenter
+ * event to correct the state". That premise only holds when the command is
+ * *accepted*: when the invoke itself fails (unknown command, argument
+ * deserialization, managed-state extraction, a closed channel) the worker never
+ * sees it and no event is ever emitted. Swallowing the rejection there turned
+ * every one of those into an indistinguishable "the button does nothing" — which
+ * is exactly what the inert Windows Preview screen reported, with no log line on
+ * either surface.
+ *
+ * The log store is the event-log contract's surface (UI-SPEC Event Log), so a
+ * rejected command lands where the operator already reads. `console.error`
+ * mirrors it to devtools. Returns the message so the caller can also expose it.
+ */
+function reportIpcFailure(action: string, error: unknown): string {
+  const reason = error instanceof Error ? error.message : String(error);
+  const message = `${action} failed: ${reason}`;
+  log.append({ level: "error", message });
+  console.error(`[presenter] ${message}`);
+  return message;
+}
 
 /** The presenter's authoritative state. */
 export interface PresenterState {
@@ -74,6 +99,10 @@ class PresenterStore {
   get isSeparateWindow(): boolean {
     return this.kind === "separate_window";
   }
+  /**
+   * The last presenter IPC failure, recorded so the UI is never inert without a
+   * reason. `null` once the last action was accepted. */
+  lastError = $state<string | null>(null);
 
   /** Unlisten function for the worker-event listener. */
   #unlisten: (() => void) | null = null;
@@ -115,8 +144,12 @@ class PresenterStore {
   async setPresenter(kind: PresenterKind): Promise<void> {
     try {
       await invoke("set_presenter", { kind });
-    } catch {
-      // The worker will emit a Presenter event to correct the state.
+      this.lastError = null;
+    } catch (error) {
+      // A rejected invoke means the worker never saw the command, so no
+      // Presenter event will arrive to correct the state. Report it rather than
+      // leaving the badge silently wrong.
+      this.lastError = reportIpcFailure(`presenter override to ${kind}`, error);
     }
   }
 
@@ -124,8 +157,11 @@ class PresenterStore {
   async attachReadback(onFrame: Channel<ArrayBuffer>): Promise<void> {
     try {
       await invoke("preview_attach_readback", { onFrame });
-    } catch {
-      // The worker will emit a Presenter event to correct the state.
+      this.lastError = null;
+    } catch (error) {
+      // The readback channel is what carries frames, so a rejected attach is a
+      // silent black canvas otherwise.
+      this.lastError = reportIpcFailure("readback channel attach", error);
     }
   }
 
@@ -133,8 +169,11 @@ class PresenterStore {
   async showPreviewWindow(): Promise<void> {
     try {
       await invoke("show_preview_window");
-    } catch {
-      // The worker will emit a Presenter event to correct the state.
+      this.lastError = null;
+    } catch (error) {
+      // The action's whole observable contract is a window appearing; a
+      // rejection must be visible, not swallowed.
+      this.lastError = reportIpcFailure("show preview window", error);
     }
   }
 

@@ -806,11 +806,17 @@ pub trait SurfacePresenter {
 
     /// Show this presenter's own preview window (PREV-05).
     ///
-    /// Only the separate-window presenter has one; every other impl uses the
-    /// default no-op, so the worker can route the "Show preview window" action
-    /// without a downcast.
+    /// Only the separate-window presenter has one, so the worker can route the
+    /// "Show preview window" action without a downcast. The default is a **typed
+    /// failure, not `Ok(())`**: a presenter that owns no preview window cannot
+    /// honour the request, and answering `Ok(())` made the worker log
+    /// `preview window shown` while nothing was shown — the silent no-op an inert
+    /// Preview screen reported as "the button does nothing". Callers must
+    /// surface it.
     fn show_preview_window(&self) -> Result<(), PresenterError> {
-        Ok(())
+        Err(PresenterError::Unsupported {
+            reason: "this presenter owns no preview window to show".to_string(),
+        })
     }
 
     /// Show or hide this presenter's native view (UI-SPEC Screen Router, E6).
@@ -848,6 +854,31 @@ pub fn viewport_config(rect: ViewportRect, blend_width: f32, rig_tilt: f32) -> V
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_presenter_with_no_preview_window_reports_failure_not_success() {
+        // Regression: the trait's default `show_preview_window` used to return
+        // `Ok(())`, so a presenter that owns no preview window (readback,
+        // fallback, X11 child view) answered "shown". The worker logged
+        // `preview window shown` while nothing was shown at all — an inert
+        // Preview screen with no log line to explain it. A missing window is a
+        // typed failure now, so the request is always attributable.
+        let rect = ViewportRect {
+            x: 0,
+            y: 0,
+            width: 1240,
+            height: 728,
+        };
+        let readback = crate::presenter::readback::ReadbackPresenter::new(rect);
+        let result = readback.show_preview_window();
+        let Err(PresenterError::Unsupported { reason }) = &result else {
+            panic!("a presenter with no preview window must fail the request: {result:?}");
+        };
+        assert!(
+            reason.contains("no preview window"),
+            "the failure must name the missing window, got: {reason}"
+        );
+    }
 
     #[test]
     fn strip_srgb_selects_linear_format() {
