@@ -6,6 +6,7 @@
 <script lang="ts">
   import { Channel } from "@tauri-apps/api/core";
   import { pose } from "../lib/pose.svelte";
+  import { presenter } from "../lib/presenter.svelte";
   import StateOverlay from "./StateOverlay.svelte";
   import type { PresenterKind } from "../lib/types";
 
@@ -215,6 +216,17 @@
       >
         Show preview window
       </button>
+      <!-- The invoke round-trip's only visible contract is a window appearing,
+        so a failure here must read on this surface: the System page log shows
+        backend records only and the event-log drawer toggle is inert, which is
+        why this screen used to report "does nothing" with no line anywhere.
+        A stuck "Requesting…" line means the invoke never settled (hung); a red
+        line means it was rejected client-side and the worker never ran. -->
+      {#if presenter.pendingAction === "show preview window"}
+        <p class="placeholder-status">Requesting preview window…</p>
+      {:else if presenter.lastError !== null}
+        <p class="placeholder-error" role="alert">{presenter.lastError}</p>
+      {/if}
     </div>
   {:else if isReadback}
     <div class="readback-banner">
@@ -320,6 +332,25 @@
 
   .placeholder-btn:hover {
     filter: brightness(1.1);
+  }
+
+  .placeholder-status {
+    margin: 0;
+    font-family: var(--font-ui);
+    font-size: var(--text-body);
+    line-height: var(--line-body);
+    color: var(--color-log-info);
+    max-width: 400px;
+  }
+
+  .placeholder-error {
+    margin: 0;
+    font-family: var(--font-ui);
+    font-size: var(--text-body);
+    line-height: var(--line-body);
+    color: var(--color-log-error);
+    max-width: 400px;
+    overflow-wrap: anywhere;
   }
 
   .readback-banner {

@@ -103,6 +103,14 @@ class PresenterStore {
    * The last presenter IPC failure, recorded so the UI is never inert without a
    * reason. `null` once the last action was accepted. */
   lastError = $state<string | null>(null);
+  /**
+   * The presenter action currently awaiting its invoke round-trip, if any.
+   * Set before the invoke and cleared when it settles — so a hung invoke (one
+   * that never resolves NOR rejects) stays visible instead of looking exactly
+   * like a button that does nothing. Rendered in the Preview placeholder, the
+   * one surface the operator is already looking at (the System page log shows
+   * backend records only and can never carry a client-side rejection). */
+  pendingAction = $state<string | null>(null);
 
   /** Unlisten function for the worker-event listener. */
   #unlisten: (() => void) | null = null;
@@ -142,6 +150,7 @@ class PresenterStore {
 
   /** Request a presenter override. */
   async setPresenter(kind: PresenterKind): Promise<void> {
+    this.pendingAction = `presenter override to ${kind}`;
     try {
       await invoke("set_presenter", { kind });
       this.lastError = null;
@@ -150,11 +159,14 @@ class PresenterStore {
       // Presenter event will arrive to correct the state. Report it rather than
       // leaving the badge silently wrong.
       this.lastError = reportIpcFailure(`presenter override to ${kind}`, error);
+    } finally {
+      this.pendingAction = null;
     }
   }
 
   /** Attach the webview readback channel to the readback presenter. */
   async attachReadback(onFrame: Channel<ArrayBuffer>): Promise<void> {
+    this.pendingAction = "readback channel attach";
     try {
       await invoke("preview_attach_readback", { onFrame });
       this.lastError = null;
@@ -162,11 +174,14 @@ class PresenterStore {
       // The readback channel is what carries frames, so a rejected attach is a
       // silent black canvas otherwise.
       this.lastError = reportIpcFailure("readback channel attach", error);
+    } finally {
+      this.pendingAction = null;
     }
   }
 
   /** Show the separate preview window. */
   async showPreviewWindow(): Promise<void> {
+    this.pendingAction = "show preview window";
     try {
       await invoke("show_preview_window");
       this.lastError = null;
@@ -174,6 +189,8 @@ class PresenterStore {
       // The action's whole observable contract is a window appearing; a
       // rejection must be visible, not swallowed.
       this.lastError = reportIpcFailure("show preview window", error);
+    } finally {
+      this.pendingAction = null;
     }
   }
 

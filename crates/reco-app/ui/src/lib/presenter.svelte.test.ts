@@ -30,6 +30,7 @@ describe("presenter store IPC failure reporting", () => {
     invokeMock.mockReset();
     presenter.destroy();
     presenter.lastError = null;
+    presenter.pendingAction = null;
     log.entries = [];
   });
 
@@ -67,5 +68,31 @@ describe("presenter store IPC failure reporting", () => {
 
     expect(presenter.lastError).toBeNull();
     expect(log.entries.filter((e) => e.level === "error")).toHaveLength(0);
+  });
+
+  it("marks the action pending while the invoke is in flight", async () => {
+    // A hung invoke (never settles) must stay visible: without this the
+    // placeholder looks exactly like a button that does nothing.
+    let resolveInvoke!: (value: unknown) => void;
+    invokeMock.mockImplementationOnce(
+      () => new Promise((resolve) => (resolveInvoke = resolve)),
+    );
+
+    const flight = presenter.showPreviewWindow();
+    expect(presenter.pendingAction).toBe("show preview window");
+
+    resolveInvoke(undefined);
+    await flight;
+    expect(presenter.pendingAction).toBeNull();
+    expect(presenter.lastError).toBeNull();
+  });
+
+  it("clears the pending mark when the invoke rejects", async () => {
+    invokeMock.mockRejectedValueOnce(new Error("channel closed"));
+
+    await presenter.showPreviewWindow();
+
+    expect(presenter.pendingAction).toBeNull();
+    expect(presenter.lastError).toContain("show preview window failed");
   });
 });
