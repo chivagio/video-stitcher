@@ -31,6 +31,7 @@ describe("presenter store IPC failure reporting", () => {
     presenter.destroy();
     presenter.lastError = null;
     presenter.pendingAction = null;
+    presenter.lastShowPreview = null;
     log.entries = [];
   });
 
@@ -94,5 +95,26 @@ describe("presenter store IPC failure reporting", () => {
 
     expect(presenter.pendingAction).toBeNull();
     expect(presenter.lastError).toContain("show preview window failed");
+  });
+
+  it("records the show-preview outcome persistently (accepted)", async () => {
+    // Unlike `pendingAction` (which clears in milliseconds and is missable),
+    // `lastShowPreview` stays rendered so a field report cannot miss it:
+    // "accepted" means the invoke resolved and the command is with the worker.
+    invokeMock.mockResolvedValueOnce(undefined);
+
+    await presenter.showPreviewWindow();
+
+    expect(presenter.lastShowPreview).toContain("show preview window");
+    expect(presenter.lastShowPreview).toContain("accepted");
+  });
+
+  it("records the show-preview outcome persistently (rejected)", async () => {
+    invokeMock.mockRejectedValueOnce(new Error("channel closed"));
+
+    await presenter.showPreviewWindow();
+
+    expect(presenter.lastShowPreview).toContain("show preview window");
+    expect(presenter.lastShowPreview).toContain("rejected");
   });
 });

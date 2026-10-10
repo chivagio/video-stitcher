@@ -12,6 +12,7 @@
 -->
 <script lang="ts">
   import { systemStore } from "../lib/system.svelte";
+  import { BUILD_ID } from "../lib/build";
   import ActionButton from "./ActionButton.svelte";
   import Icon from "./Icon.svelte";
   import InlineNotice from "./InlineNotice.svelte";
@@ -36,6 +37,9 @@
             GPU, encoders, camera devices, runtime prerequisites, and structured
             engine logs.
           </p>
+          <!-- Build id baked in at bundle time: a field report names the exact
+            source it runs, so "which binary ran" is never ambiguous again. -->
+          <p class="screen-build mono">Build {BUILD_ID}</p>
         </div>
         <ActionButton
           variant="secondary"
@@ -238,6 +242,12 @@
     margin: var(--space-xs) 0 0;
     color: var(--color-log-info);
     font-size: var(--text-body);
+  }
+
+  .screen-build {
+    margin: var(--space-xs) 0 0;
+    color: var(--color-log-info);
+    font-size: var(--text-label);
   }
 
   .panel {

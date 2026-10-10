@@ -241,6 +241,12 @@
         <p class="placeholder-status">Requesting preview window…</p>
       {:else if presenter.lastError !== null}
         <p class="placeholder-error" role="alert">{presenter.lastError}</p>
+      {:else if presenter.lastShowPreview !== null}
+        <!-- Persistent (not a flash): proves the store method ran and the
+          invoke settled. "accepted" + no worker line = the command was lost
+          between invoke-resolve and the worker drain; no line here at all =
+          the click never reached the store. -->
+        <p class="placeholder-status">{presenter.lastShowPreview}</p>
       {/if}
     </div>
   {:else if isReadback}

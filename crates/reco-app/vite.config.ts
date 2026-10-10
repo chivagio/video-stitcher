@@ -1,6 +1,33 @@
 import { defineConfig } from "vite";
+import { execSync } from "node:child_process";
 import { svelte } from "@sveltejs/vite-plugin-svelte";
 import tailwindcss from "@tailwindcss/vite";
+
+// The build id baked into the bundle (shown on the System screen): short
+// commit hash plus a `-dirty` suffix when the working tree has uncommitted
+// changes, so a Windows report can always name the exact source it runs.
+// Falls back to "unknown" when git is unavailable (never fails the build).
+function buildId(): string {
+  try {
+    const hash = execSync("git rev-parse --short HEAD", {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    let dirty = "";
+    try {
+      const status = execSync("git status --porcelain", {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+      }).trim();
+      if (status.length > 0) dirty = "-dirty";
+    } catch {
+      // Status unreadable: report the hash without a dirt flag.
+    }
+    return `${hash}${dirty}`;
+  } catch {
+    return "unknown";
+  }
+}
 
 // Phase 2 production preview shell build (UI-SPEC).
 //
@@ -19,6 +46,9 @@ export default defineConfig({
   root: "ui",
   base: "./",
   plugins: [svelte(), tailwindcss()],
+  define: {
+    __RECO_BUILD_ID__: JSON.stringify(buildId()),
+  },
   build: {
     outDir: "dist",
     emptyOutDir: true,

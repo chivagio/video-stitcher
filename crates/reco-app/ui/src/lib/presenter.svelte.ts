@@ -111,6 +111,16 @@ class PresenterStore {
    * one surface the operator is already looking at (the System page log shows
    * backend records only and can never carry a client-side rejection). */
   pendingAction = $state<string | null>(null);
+  /**
+   * The last "Show preview window" attempt and its client-side outcome,
+   * PERSISTENT (unlike `pendingAction`, which clears the instant the invoke
+   * settles and is therefore missable). Rendered in the Preview placeholder so
+   * the next Windows report cannot miss it: "accepted" means the invoke
+   * resolved and the command is with the worker (the worker's own
+   * `show preview window requested` line is the acknowledgement); "rejected"
+   * points at `lastError`. If this stays `null` after a click, the store
+   * method never ran at all — the click died in the DOM event path. */
+  lastShowPreview = $state<string | null>(null);
 
   /** Unlisten function for the worker-event listener. */
   #unlisten: (() => void) | null = null;
@@ -185,10 +195,12 @@ class PresenterStore {
     try {
       await invoke("show_preview_window");
       this.lastError = null;
+      this.lastShowPreview = `show preview window — accepted at ${new Date().toLocaleTimeString()}`;
     } catch (error) {
       // The action's whole observable contract is a window appearing; a
       // rejection must be visible, not swallowed.
       this.lastError = reportIpcFailure("show preview window", error);
+      this.lastShowPreview = `show preview window — rejected at ${new Date().toLocaleTimeString()} (see error)`;
     } finally {
       this.pendingAction = null;
     }
