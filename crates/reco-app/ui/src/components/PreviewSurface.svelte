@@ -87,6 +87,21 @@
 
   function handlePointerDown(e: PointerEvent): void {
     if (!webviewPoseActive || e.button !== 0) return;
+    // Interactive descendants own their pointer gestures. Capturing the press
+    // to the surface retargets its click to the surface (Chromium retargets
+    // ALL subsequent pointer events, including click, to the capture element),
+    // so a button inside the region — e.g. "Show preview window" — would press
+    // visibly yet never fire: no invoke, no worker line, no error, on any
+    // surface. That was the inert Windows Preview screen. Pan only when the
+    // press starts on non-interactive surface itself (the readback canvas
+    // still pans: a canvas is not interactive).
+    const target = e.target as EventTarget | null;
+    if (
+      target instanceof Element &&
+      target.closest("button, input, select, textarea, a, [role='button']")
+    ) {
+      return;
+    }
     panning = true;
     lastX = e.clientX;
     lastY = e.clientY;
