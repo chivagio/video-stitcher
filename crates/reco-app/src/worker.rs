@@ -4404,6 +4404,22 @@ impl EngineBackend for GpuEngineBackend {
         // hardcoded startup pair (D3-15). A single set input keeps the startup
         // source so the Phase 1/2 no-import path is unchanged.
         self.sync_operator_source()?;
+        // IMPT-01 + UI-SPEC Interaction rule 1: an import is a boundary at which
+        // the worker's authoritative projection CHANGES — the freshly resolved
+        // operator source replaces `loaded` (see `sync_operator_source`). The
+        // worker owns that projection and the frontend only mirrors it, so the
+        // worker re-asserts it here through the same single seam the mount
+        // reconcile uses, so the mock cannot drift from the contract (WR-02).
+        //
+        // Without this the UI is dead-ended: the event bridge is fire-and-forget
+        // with no replay, and the only other projection points are the startup
+        // import and the one-shot mount-time `republish_projection`, BOTH of
+        // which run before the operator picks a clip. The frontend transport
+        // store then keeps its initial "empty" status forever, which disables
+        // every transport action (`play()` early-returns on "empty") with no
+        // recovery path from the UI. `apply_project` restores a saved project
+        // through this same method, so opening one is covered too.
+        self.republish_projection(events);
         Ok(())
     }
 
@@ -7928,11 +7944,26 @@ mod tests {
         /// Mirrors the real backend: both roles set → the operator clips;
         /// either unset → the hardcoded startup pair (`None`).
         fn refresh_mock_preview_source(&mut self) {
-            self.preview_source = resolve_preview_source(
+            let resolved = resolve_preview_source(
                 self.input_paths[0].as_deref(),
                 self.input_paths[1].as_deref(),
                 self.mock_preview_sync_offset(),
             );
+            // Mirror `sync_operator_source`: a resolved operator source rebuilds
+            // the import-time transport from the imported clip, and dropping the
+            // last operator source (a cleared input) drops it too. With no
+            // operator source ever opened the startup import's transport is left
+            // untouched, so the no-import path is unchanged.
+            if resolved.is_some() {
+                self.loaded = Some(crate::transport::Transport::new(
+                    30.0,
+                    Some((30, 1)),
+                    self.total_frames,
+                ));
+            } else if self.preview_source.is_some() {
+                self.loaded = None;
+            }
+            self.preview_source = resolved;
         }
 
         fn record(&self, op: &'static str) {
@@ -8163,6 +8194,8 @@ mod tests {
             // Mirror the real backend: once both roles are set the preview
             // decodes the operator's clips, not the hardcoded startup pair.
             self.refresh_mock_preview_source();
+            // Mirror the real backend: an import is a projection boundary.
+            self.republish_projection(events);
             Ok(())
         }
 
@@ -11391,6 +11424,97 @@ mod tests {
             total,
             Some(5),
             "the republished position must carry the loaded clip's frame count"
+        );
+    }
+
+    #[test]
+    fn set_input_reprojects_the_transport_so_play_becomes_reachable() {
+        // Regression (the operator import path). The UI has no Import button
+        // (Phase 2's chrome is Play/Pause/Step/Loop): clips arrive as
+        // `set_input`, which rebuilds the worker's authoritative transport via
+        // `sync_operator_source`. The only projection points were the startup
+        // import and the one-shot mount-time `republish_projection`, and BOTH
+        // run before the operator picks a clip, while the event bridge is
+        // fire-and-forget with no replay. So the frontend transport store kept
+        // its initial "empty" status for the rest of the session — Play greyed
+        // out and `play()` a no-op — with no recovery path. An import must
+        // therefore re-assert the projection at its own boundary.
+        let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (worker, events) = EngineWorker::spawn(MockBackend::new(ops));
+        let handle = worker.handle();
+        handle
+            .send(WorkerCommand::SetInput {
+                role: crate::events::InputRole::Left,
+                path: "/media/a.mp4".to_string(),
+            })
+            .unwrap();
+        handle
+            .send(WorkerCommand::SetInput {
+                role: crate::events::InputRole::Right,
+                path: "/media/b.mp4".to_string(),
+            })
+            .unwrap();
+        handle.send(WorkerCommand::Shutdown).unwrap();
+
+        let seen = drain_until_shutdown(&events);
+        // No `Import` was ever posted, so every projection in this run comes from
+        // the import boundary itself.
+        let (state, loop_enabled) = seen
+            .iter()
+            .rev()
+            .find_map(|e| match e {
+                WorkerEvent::Transport {
+                    state,
+                    loop_enabled,
+                } => Some((*state, *loop_enabled)),
+                _ => None,
+            })
+            .expect("set_input must project the loaded transport");
+        assert_eq!(
+            state,
+            crate::transport::TransportState::Paused,
+            "the re-asserted transport must leave the frontend ready-but-not-playing"
+        );
+        assert!(!loop_enabled, "an import must not enable looping");
+
+        let total = seen
+            .iter()
+            .rev()
+            .find_map(|e| match e {
+                WorkerEvent::Position { total, .. } => Some(*total),
+                _ => None,
+            })
+            .expect("set_input must project the loaded position");
+        assert_eq!(
+            total,
+            Some(5),
+            "the projected position must carry the imported clip's frame count"
+        );
+    }
+
+    #[test]
+    fn a_partial_import_projects_no_transport() {
+        // The counterpart to the test above: a single role cannot resolve a
+        // preview source, so the boundary must not invent a clip. The frontend
+        // stays "empty" (transport actions unavailable) until BOTH roles land,
+        // which is the state "Nothing to preview" reports honestly.
+        let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (worker, events) = EngineWorker::spawn(MockBackend::new(ops));
+        let handle = worker.handle();
+        handle
+            .send(WorkerCommand::SetInput {
+                role: crate::events::InputRole::Left,
+                path: "/media/a.mp4".to_string(),
+            })
+            .unwrap();
+        handle.send(WorkerCommand::Shutdown).unwrap();
+
+        let seen = drain_until_shutdown(&events);
+        assert!(
+            !seen
+                .iter()
+                .any(|e| matches!(e, WorkerEvent::Transport { .. })),
+            "a half-complete import must not project a transport: {seen:?}"
         );
     }
 
