@@ -17,6 +17,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { untrack } from "svelte";
 import type {
   EncoderView,
   ExportPreset,
@@ -148,6 +149,48 @@ export function outputNamePreview(
   const base = inputPath ? inputPath.split(/[\\/]/).pop() ?? inputPath : "clip.mp4";
   const stem = base.replace(/\.[^.]+$/, "") || "clip";
   return `${stem}${VARIANT_SUFFIX[variant]}.mp4`;
+}
+
+/**
+ * Whether two probed metadata records carry the same values (EXPT-06).
+ *
+ * Compares field **values**, never object identity: the worker sends a fresh
+ * `InputMetadata` object for every probe, so an identity comparison would call
+ * two identical probes "changed" and re-derive settings that cannot differ.
+ */
+export function sameInputMetadata(
+  a: InputMetadata | null,
+  b: InputMetadata | null,
+): boolean {
+  if (a === b) return true;
+  if (a === null || b === null) return false;
+  return (Object.keys(a) as (keyof InputMetadata)[]).every(
+    (key) => a[key].value === b[key].value && a[key].provenance === b[key].provenance,
+  );
+}
+
+/**
+ * Whether two settings records are semantically identical (EXPT-01..06).
+ *
+ * `deriveSettings` and the `{ ...settings }` spreads rebuild a brand-new object
+ * on every pass, so identity always differs; this compares the typed fields the
+ * worker actually receives. Prevents a re-derivation that cannot change the
+ * resolved output path from re-arming the debounced preview.
+ */
+export function sameSettings(a: ExportSettings, b: ExportSettings): boolean {
+  return (
+    a.preset === b.preset &&
+    a.width === b.width &&
+    a.height === b.height &&
+    a.codec === b.codec &&
+    a.quality === b.quality &&
+    a.bitrate_kbps === b.bitrate_kbps &&
+    a.encoder_name === b.encoder_name &&
+    a.start_frame === b.start_frame &&
+    a.end_frame === b.end_frame &&
+    a.variant === b.variant &&
+    a.output_dir === b.output_dir
+  );
 }
 
 /** Format a millisecond duration as `M:SS` (bounded; never `H:MM:SS`). */
@@ -297,47 +340,77 @@ class ExportStore {
     }
   }
 
-  /** Seed the "Source match" derivation from the probed left-input metadata. */
-  setInputMetadata(meta: InputMetadata | null): void {
-    this.#inputMeta = meta;
-    this.settings = deriveSettings(this.preset, meta, {
+  /**
+   * The operator-chosen overrides preserved across a settings re-derivation.
+   *
+   * Read through `untrack` because every mutator can run inside a reactive
+   * `$effect` (App.svelte's metadata seeding effect calls `setInputMetadata`):
+   * subscribing to `settings` there would make that effect read *and* write the
+   * same signal, which Svelte reports as `effect_update_depth_exceeded` and
+   * which re-runs the effect in a tight loop until its depth guard trips.
+   */
+  #overrides(): ExportOverrides {
+    return untrack(() => ({
       encoder_name: this.settings.encoder_name,
       variant: this.settings.variant,
       output_dir: this.settings.output_dir,
       start_frame: this.settings.start_frame,
       end_frame: this.settings.end_frame,
-    });
-    this.schedulePathPreview();
+    }));
+  }
+
+  /**
+   * Apply a new settings record, skipping a no-op write and the debounced
+   * preview re-arm when nothing semantically changed.
+   *
+   * This is what keeps the path preview quiet between real setting changes:
+   * re-deriving identical settings cannot change the worker-resolved path, so
+   * asking it again would only add IPC and a log line.
+   */
+  #applySettings(next: ExportSettings, rearmPreview: boolean): void {
+    if (sameSettings(untrack(() => this.settings), next)) return;
+    this.settings = next;
+    if (rearmPreview) this.schedulePathPreview();
+  }
+
+  /**
+   * Seed the "Source match" derivation from the probed left-input metadata.
+   *
+   * Idempotent: an unchanged metadata record (a fresh object with the same
+   * probed values) leaves settings and the debounced preview alone. The seeding
+   * `$effect` in App.svelte re-runs on every reactive pass, so without this
+   * guard each pass would re-arm the 200 ms preview timer and the worker would
+   * be asked to resolve the same path forever.
+   */
+  setInputMetadata(meta: InputMetadata | null): void {
+    if (sameInputMetadata(this.#inputMeta, meta)) return;
+    this.#inputMeta = meta;
+    this.#applySettings(deriveSettings(untrack(() => this.preset), meta, this.#overrides()), true);
   }
 
   /** Choose a preset and re-derive its parameters (EXPT-01). */
   setPreset(preset: ExportPreset): void {
+    if (untrack(() => this.preset) === preset) return;
     this.preset = preset;
-    this.settings = deriveSettings(preset, this.#inputMeta, {
-      encoder_name: this.settings.encoder_name,
-      variant: this.settings.variant,
-      output_dir: this.settings.output_dir,
-      start_frame: this.settings.start_frame,
-      end_frame: this.settings.end_frame,
-    });
-    this.schedulePathPreview();
+    this.#applySettings(deriveSettings(preset, this.#inputMeta, this.#overrides()), true);
   }
 
   /** Set the encoder override, or `null` for Auto (EXPT-02). */
   setEncoderOverride(name: string | null): void {
-    this.settings = { ...this.settings, encoder_name: name };
+    const next = { ...untrack(() => this.settings), encoder_name: name };
+    this.#applySettings(next, false);
   }
 
   /** Choose the output variant (EXPT-05). */
   setVariant(variant: ExportVariant): void {
-    this.settings = { ...this.settings, variant };
-    this.schedulePathPreview();
+    const next = { ...untrack(() => this.settings), variant };
+    this.#applySettings(next, true);
   }
 
   /** Set the output directory, or `null` for the default. */
   setOutputDir(dir: string | null): void {
-    this.settings = { ...this.settings, output_dir: dir };
-    this.schedulePathPreview();
+    const next = { ...untrack(() => this.settings), output_dir: dir };
+    this.#applySettings(next, true);
   }
 
   /**
@@ -347,7 +420,8 @@ class ExportStore {
    * worker's `ExportSettings` uses, so a full clip is `(null, null)`.
    */
   setTrim(inFrame: number | null, outFrame: number | null): void {
-    this.settings = { ...this.settings, start_frame: inFrame, end_frame: outFrame };
+    const next = { ...untrack(() => this.settings), start_frame: inFrame, end_frame: outFrame };
+    this.#applySettings(next, false);
   }
 
   /**
